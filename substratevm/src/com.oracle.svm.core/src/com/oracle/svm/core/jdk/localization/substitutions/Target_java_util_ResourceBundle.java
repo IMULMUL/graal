@@ -24,21 +24,24 @@
  */
 package com.oracle.svm.core.jdk.localization.substitutions;
 
+import java.util.Locale;
+import java.util.Objects;
+import java.util.ResourceBundle;
+import java.util.ResourceBundle.Control;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Supplier;
+
+import com.oracle.svm.core.MissingRegistrationUtils;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.TargetElement;
-import com.oracle.svm.core.jdk.JDK11OrLater;
-import com.oracle.svm.core.jdk.Target_java_lang_Module;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
 import com.oracle.svm.core.jdk.localization.LocalizationSupport;
-import com.oracle.svm.core.jdk.localization.substitutions.modes.OptimizedLocaleMode;
-import org.graalvm.nativeimage.ImageSingletons;
+import com.oracle.svm.core.jdk.resources.MissingResourceRegistrationUtils;
 
-import java.util.Locale;
-import java.util.ResourceBundle;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import jdk.internal.loader.BootLoader;
 
 @TargetClass(java.util.ResourceBundle.class)
 @SuppressWarnings({"unused"})
@@ -47,56 +50,96 @@ final class Target_java_util_ResourceBundle {
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FromAlias)//
     private static ConcurrentMap<?, ?> cacheList = new ConcurrentHashMap<>();
 
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
     @Substitute
-    private static ResourceBundle getBundle(String baseName) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, Locale.getDefault());
+    private static ResourceBundle getBundleImpl(String baseName,
+                    Locale locale,
+                    Class<?> caller,
+                    ClassLoader loader,
+                    ResourceBundle.Control control) {
+        Module callerModule = getCallerModule(caller);
+
+        // get resource bundles for a named module only if loader is the module's class loader
+        if (callerModule.isNamed() && loader == getLoader(callerModule)) {
+            if (ResourceBundleMissingRegistrationSupport.shouldReport(baseName, locale, control)) {
+                MissingResourceRegistrationUtils.reportResourceBundleAccess(callerModule, baseName);
+            }
+            return MissingRegistrationUtils.runIgnoringMissingRegistrations(new Supplier<ResourceBundle>() {
+                @Override
+                public ResourceBundle get() {
+                    return getBundleImpl(callerModule, callerModule, baseName, locale, control);
+                }
+            });
+        }
+
+        // find resource bundles from unnamed module of given class loader
+        // Java agent can add to the bootclasspath e.g. via
+        // java.lang.instrument.Instrumentation and load classes in unnamed module.
+        // It may call RB::getBundle that will end up here with loader == null.
+        Module unnamedModule = loader != null
+                        ? loader.getUnnamedModule()
+                        : BootLoader.getUnnamedModule();
+
+        if (ResourceBundleMissingRegistrationSupport.shouldReport(baseName, locale, control)) {
+            MissingResourceRegistrationUtils.reportResourceBundleAccess(unnamedModule, baseName);
+        }
+        return MissingRegistrationUtils.runIgnoringMissingRegistrations(new Supplier<ResourceBundle>() {
+            @Override
+            public ResourceBundle get() {
+                return getBundleImpl(callerModule, unnamedModule, baseName, locale, control);
+            }
+        });
     }
 
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
     @Substitute
-    private static ResourceBundle getBundle(String baseName, ResourceBundle.Control control) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, Locale.getDefault());
+    private static ResourceBundle getBundleFromModule(Class<?> caller,
+                    Module module,
+                    String baseName,
+                    Locale locale,
+                    Control control) {
+        Objects.requireNonNull(module);
+        Module callerModule = getCallerModule(caller);
+        /*
+         * TODO GR-67556 - Implement proper module-aware LocalizationSupport bundle registration to
+         * ensure we show MissingResourceRegistrationError in all relevant situations.
+         */
+        if (ResourceBundleMissingRegistrationSupport.shouldReport(baseName, locale, control)) {
+            MissingResourceRegistrationUtils.reportResourceBundleAccess(module, baseName);
+        }
+        return MissingRegistrationUtils.runIgnoringMissingRegistrations(() -> getBundleImpl(callerModule, module, baseName, locale, control));
     }
 
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
-    @Substitute
-    private static ResourceBundle getBundle(String baseName, Locale locale) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, locale);
+    @Alias
+    private static native Module getCallerModule(Class<?> caller);
+
+    @Alias
+    private static native ClassLoader getLoader(Module module);
+
+    @Alias
+    static native ResourceBundle getBundleImpl(Module callerModule, Module module, String baseName, Locale locale, ResourceBundle.Control control);
+
+    @Alias
+    static native Control getDefaultControl(Module targetModule, String baseName);
+}
+
+/** Crema uses caller-independent JDK bundle lookup. */
+final class ResourceBundleMissingRegistrationSupport {
+    private ResourceBundleMissingRegistrationSupport() {
     }
 
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
-    @Substitute
-    private static ResourceBundle getBundle(String baseName, Locale targetLocale, ResourceBundle.Control control) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, targetLocale);
+    static boolean shouldReport(String baseName, Locale locale, Control control) {
+        return !RuntimeClassLoading.isSupported() &&
+                        !LocalizationSupport.isRegisteredBundleLookup(baseName, locale, control);
     }
+}
 
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
+@TargetClass(className = "java.util.ResourceBundle$1")
+final class Target_java_util_ResourceBundle_1 {
     @Substitute
-    private static ResourceBundle getBundle(String baseName, Locale locale, ClassLoader loader) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, locale);
-    }
-
-    @TargetElement(onlyWith = OptimizedLocaleMode.class)
-    @Substitute
-    private static ResourceBundle getBundle(String baseName, Locale targetLocale, ClassLoader loader, ResourceBundle.Control control) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, targetLocale);
-    }
-
-    /*
-     * Currently there is no support for the module system at run time. Module arguments are
-     * therefore ignored.
-     */
-
-    @TargetElement(onlyWith = {JDK11OrLater.class, OptimizedLocaleMode.class})
-    @Substitute
-    private static ResourceBundle getBundle(String baseName, Target_java_lang_Module module) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, Locale.getDefault());
-    }
-
-    @TargetElement(onlyWith = {JDK11OrLater.class, OptimizedLocaleMode.class})
-    @Substitute
-    private static ResourceBundle getBundle(String baseName, Locale targetLocale, Target_java_lang_Module module) {
-        return ImageSingletons.lookup(LocalizationSupport.class).asOptimizedSupport().getCached(baseName, targetLocale);
+    @SuppressWarnings("static-method")
+    public ResourceBundle getBundle(String baseName, Locale locale, Module module) {
+        // use the given module as the caller to bypass the access check
+        return MissingRegistrationUtils.runIgnoringMissingRegistrations(() -> Target_java_util_ResourceBundle.getBundleImpl(module, module,
+                        baseName, locale,
+                        Target_java_util_ResourceBundle.getDefaultControl(module, baseName)));
     }
 }

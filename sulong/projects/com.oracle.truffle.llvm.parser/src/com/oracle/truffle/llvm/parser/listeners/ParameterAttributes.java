@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,15 +29,15 @@
  */
 package com.oracle.truffle.llvm.parser.listeners;
 
-import java.util.ArrayList;
-import java.util.List;
-
 import com.oracle.truffle.llvm.parser.model.attributes.Attribute;
 import com.oracle.truffle.llvm.parser.model.attributes.AttributesCodeEntry;
 import com.oracle.truffle.llvm.parser.model.attributes.AttributesGroup;
 import com.oracle.truffle.llvm.parser.scanner.RecordBuffer;
 import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
 import com.oracle.truffle.llvm.runtime.types.Type;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class ParameterAttributes implements ParserListener {
 
@@ -51,8 +51,11 @@ public class ParameterAttributes implements ParserListener {
     private static final int WELL_KNOWN_INTEGER_ATTRIBUTE_KIND = 1;
     private static final int STRING_ATTRIBUTE_KIND = 3;
     private static final int STRING_VALUE_ATTRIBUTE_KIND = 4;
+    // unfortunately undocumented, see llvm/lib/Bitcode/Reader/BitcodeReader.cpp
     private static final int BYVAL_ATTRIBUTE_KIND = 5;
     private static final int TYPED_BYVAL_ATTRIBUTE_KIND = 6;
+    private static final int CONSTANT_RANGE_ATTRIBUTE_KIND = 7;
+    private static final int CONSTANT_RANGE_LIST_ATTRIBUTE_KIND = 8;
 
     // stores attributes defined in PARAMATTR_GRP_CODE_ENTRY
     private final List<AttributesGroup> attributes = new ArrayList<>();
@@ -257,6 +260,28 @@ public class ParameterAttributes implements ParserListener {
                     if (attr == Attribute.Kind.BYVAL) {
                         final Type valueType = types.get(buffer.read());
                         group.addAttribute(new Attribute.KnownTypedAttribute(Attribute.Kind.BYVAL, valueType));
+                    } else if (attr == Attribute.Kind.SRET || attr == Attribute.Kind.ELEMENTTYPE) {
+                        final Type typeParam = types.get(buffer.read());
+                        group.addAttribute(new Attribute.KnownTypedAttribute(attr, typeParam));
+                    }
+                    break;
+                }
+
+                case CONSTANT_RANGE_ATTRIBUTE_KIND: {
+                    // these attributes are not actually used by Sulong, skip over them
+                    Attribute.Kind.decode(buffer.read());
+                    long bitWidth = buffer.read();
+                    buffer.skipConstantRange(bitWidth);
+                    break;
+                }
+
+                case CONSTANT_RANGE_LIST_ATTRIBUTE_KIND: {
+                    // these attributes are not actually used by Sulong, skip over them
+                    Attribute.Kind.decode(buffer.read());
+                    long rangeSize = buffer.read();
+                    long bitWidth = buffer.read();
+                    for (int i = 0; i < rangeSize; i++) {
+                        buffer.skipConstantRange(bitWidth);
                     }
                     break;
                 }

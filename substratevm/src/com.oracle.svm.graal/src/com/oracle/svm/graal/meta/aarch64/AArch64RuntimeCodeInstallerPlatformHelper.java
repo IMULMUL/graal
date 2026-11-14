@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2020, 2020, Arm Limited. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -25,32 +25,46 @@
  */
 package com.oracle.svm.graal.meta.aarch64;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.svm.core.CodeSynchronizationOperations;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.code.AbstractRuntimeCodeInstaller.RuntimeCodeInstallerPlatformHelper;
-import com.oracle.svm.core.code.CodeInfo;
-import com.oracle.svm.core.code.CodeInfoAccess;
+import com.oracle.svm.core.code.RuntimeCodeCache;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
 import com.oracle.svm.core.thread.VMThreads;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.core.util.UserError;
 
-@AutomaticFeature
+@AutomaticallyRegisteredImageSingleton(value = RuntimeCodeInstallerPlatformHelper.class)
 @Platforms(Platform.AARCH64.class)
-class AArch64RuntimeCodeInstallerPlatformHelperFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(RuntimeCodeInstallerPlatformHelper.class, new AArch64RuntimeCodeInstallerPlatformHelper());
-    }
-}
-
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class AArch64RuntimeCodeInstallerPlatformHelper implements RuntimeCodeInstallerPlatformHelper {
+    AArch64RuntimeCodeInstallerPlatformHelper() {
+        RuntimeOptionKey<Boolean> writeableCodeOption = RuntimeCodeCache.Options.WriteableCodeCache;
+        if (writeableCodeOption.getValue()) {
+            throw UserError.abort("Enabling %s is not supported on this platform.", writeableCodeOption.getName());
+        }
+    }
+
+    /**
+     * According to the <a href="https://developer.arm.com/documentation/ddi0487/latest">ARM
+     * Architecture Reference Manual</a> (see Section B2.2.5), it is necessary to flush the
+     * instruction cache and to issue an ISB (instruction synchronization barrier) if new code was
+     * made executable.
+     */
+    @Override
+    public boolean needsInstructionCacheSynchronization() {
+        return true;
+    }
 
     @Override
-    public void performCodeSynchronization(CodeInfo codeInfo) {
-        CodeSynchronizationOperations.clearCache(CodeInfoAccess.getCodeStart(codeInfo).rawValue(), CodeInfoAccess.getCodeSize(codeInfo).rawValue());
+    public void performCodeSynchronization(long codeStart, long codeSize) {
+        CodeSynchronizationOperations.clearCache(codeStart, codeSize);
         VMThreads.ActionOnTransitionToJavaSupport.requestAllThreadsSynchronizeCode();
     }
 }

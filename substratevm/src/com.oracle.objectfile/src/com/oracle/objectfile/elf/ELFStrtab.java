@@ -39,6 +39,7 @@ import com.oracle.objectfile.elf.ELFObjectFile.ELFSection;
 public class ELFStrtab extends ELFSection implements Iterable<String> {
 
     StringSectionImpl impl;
+    private final boolean loadable;
 
     @Override
     public ElementImpl getImpl() {
@@ -50,12 +51,20 @@ public class ELFStrtab extends ELFSection implements Iterable<String> {
     }
 
     public ELFStrtab(ELFObjectFile owner, final String name, ELFObjectFile.SectionType type) {
+        this(owner, name, type, false);
+    }
+
+    public ELFStrtab(ELFObjectFile owner, final String name, ELFObjectFile.SectionType type, boolean loadable) {
         owner.super(name, type);
+        this.loadable = loadable;
+        if (loadable) {
+            flags.add(ELFObjectFile.ELFSectionFlag.ALLOC);
+        }
         impl = new StringSectionImpl(this) {
 
             @Override
             public boolean isLoadable() {
-                return name.equals(".dynstr"); // FIXME
+                return ELFStrtab.this.loadable;
             }
         };
     }
@@ -69,16 +78,6 @@ public class ELFStrtab extends ELFSection implements Iterable<String> {
     @Override
     public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
         return impl.getDependencies(decisions);
-    }
-
-    public Iterable<Iterable<String>> getContentProviders() {
-        return new Iterable<Iterable<String>>() {
-
-            @Override
-            public Iterator<Iterable<String>> iterator() {
-                return impl.contentProvidersIterator();
-            }
-        };
     }
 
     @Override

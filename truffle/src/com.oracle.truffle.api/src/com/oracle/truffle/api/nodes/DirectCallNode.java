@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,9 +40,10 @@
  */
 package com.oracle.truffle.api.nodes;
 
+import java.util.Objects;
+
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.RootCallTarget;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleRuntime;
 
 /**
@@ -70,6 +71,7 @@ public abstract class DirectCallNode extends Node {
 
     /** @since 0.8 or earlier */
     protected DirectCallNode(CallTarget callTarget) {
+        Objects.requireNonNull(callTarget);
         this.callTarget = callTarget;
     }
 
@@ -81,6 +83,40 @@ public abstract class DirectCallNode extends Node {
      * @since 0.23
      */
     public abstract Object call(Object... arguments);
+
+    /**
+     * Calls the inner {@link CallTarget} returned by {@link #getCurrentCallTarget()} with an
+     * explicit bytecode index.
+     * <p>
+     * This call node identifies the location of the call. Callers that do not have an explicit
+     * bytecode index should pass <code>-1</code>.
+     *
+     * @param bytecodeIndex the bytecode index associated with this call, or <code>-1</code> if no
+     *            explicit bytecode index is available
+     * @param arguments the arguments that should be passed to the callee
+     * @return the return result of the call
+     * @since 25.6
+     */
+    public abstract Object call(int bytecodeIndex, Object[] arguments);
+
+    /**
+     * Calls the current root node with an explicit root type, bytecode index, and arguments.
+     * <p>
+     * A concrete {@code rootType} allows the host compiler to optimize the call boundary further,
+     * including inlining into {@link RootNode#execute}. Pass a compile-time-constant class literal
+     * assignable from the current root node.
+     * <p>
+     * This call node identifies the location of the call. Callers that do not have an explicit
+     * bytecode index should pass {@code -1}.
+     *
+     * @param rootType the expected type of the current root node
+     * @param bytecodeIndex the bytecode index associated with this call, or {@code -1} if no
+     *            explicit bytecode index is available
+     * @param arguments the arguments that should be passed to the callee
+     * @return the return result of the call
+     * @since 25.6
+     */
+    public abstract Object call(Class<? extends RootNode> rootType, int bytecodeIndex, Object[] arguments);
 
     /**
      * Returns the originally supplied {@link CallTarget} when this call node was created. Please
@@ -201,9 +237,13 @@ public abstract class DirectCallNode extends Node {
         return String.format("%s(target=%s)", getClass().getSimpleName(), getCurrentCallTarget());
     }
 
-    /** @since 0.8 or earlier */
+    /**
+     * Creates cached direct call node using bytecode index <code>-1</code>.
+     *
+     * @since 0.8 or earlier
+     */
     public static DirectCallNode create(CallTarget target) {
-        return Truffle.getRuntime().createDirectCallNode(target);
+        return NodeAccessor.RUNTIME.createDirectCallNode(target);
     }
 
 }

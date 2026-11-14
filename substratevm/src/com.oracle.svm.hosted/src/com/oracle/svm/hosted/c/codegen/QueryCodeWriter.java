@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.hosted.c.codegen;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereUnexpectedInput;
 import static com.oracle.svm.hosted.c.query.QueryResultFormat.DELIMINATOR;
 
 import java.nio.file.Path;
@@ -32,17 +32,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import com.oracle.svm.hosted.c.info.RawPointerToInfo;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.CContext;
+import org.graalvm.nativeimage.impl.InternalPlatform;
 
 import com.oracle.svm.hosted.c.DirectivesExtension;
 import com.oracle.svm.hosted.c.info.ConstantInfo;
 import com.oracle.svm.hosted.c.info.ElementInfo;
 import com.oracle.svm.hosted.c.info.EnumConstantInfo;
+import com.oracle.svm.hosted.c.info.EnumInfo;
 import com.oracle.svm.hosted.c.info.InfoTreeVisitor;
 import com.oracle.svm.hosted.c.info.NativeCodeInfo;
 import com.oracle.svm.hosted.c.info.PointerToInfo;
+import com.oracle.svm.hosted.c.info.RawPointerToInfo;
 import com.oracle.svm.hosted.c.info.RawStructureInfo;
 import com.oracle.svm.hosted.c.info.SizableInfo.ElementKind;
 import com.oracle.svm.hosted.c.info.SizableInfo.SignednessValue;
@@ -52,14 +54,13 @@ import com.oracle.svm.hosted.c.info.StructInfo;
 import com.oracle.svm.hosted.c.query.QueryResultFormat;
 
 public class QueryCodeWriter extends InfoTreeVisitor {
-
+    private static final String C_SOURCE_FILE_EXTENSION = ".c";
     private static final String formatFloat = "%.15e";
     private static final String formatString = QueryResultFormat.STRING_MARKER + "%s" + QueryResultFormat.STRING_MARKER;
 
     private final CSourceCodeWriter writer;
 
     private final List<Object> elementForLineNumber;
-    private final boolean isWindows;
 
     private final String formatSInt64;
     private final String formatUInt64;
@@ -71,8 +72,8 @@ public class QueryCodeWriter extends InfoTreeVisitor {
     public QueryCodeWriter(Path tempDirectory) {
         writer = new CSourceCodeWriter(tempDirectory);
         elementForLineNumber = new ArrayList<>();
-        isWindows = Platform.includedIn(Platform.WINDOWS.class);
 
+        boolean isWindows = Platform.includedIn(InternalPlatform.WINDOWS_BASE.class);
         String formatL64 = "%" + (isWindows ? "ll" : "l");
         formatSInt64 = formatL64 + "d";
         formatUInt64 = formatL64 + "u";
@@ -90,8 +91,7 @@ public class QueryCodeWriter extends InfoTreeVisitor {
     public Path write(NativeCodeInfo nativeCodeInfo) {
         nativeCodeInfo.accept(this);
 
-        String srcFileExtension = CSourceCodeWriter.C_SOURCE_FILE_EXTENSION;
-        String sourceFileName = nativeCodeInfo.getName().replaceAll("\\W", "_") + srcFileExtension;
+        String sourceFileName = nativeCodeInfo.getName().replaceAll("\\W", "_") + C_SOURCE_FILE_EXTENSION;
         return writer.writeFile(sourceFileName);
     }
 
@@ -122,16 +122,6 @@ public class QueryCodeWriter extends InfoTreeVisitor {
         writer.includeFiles(Arrays.asList("<stdio.h>", "<stddef.h>", "<memory.h>"));
         writer.writeCStandardHeaders();
         writer.appendln();
-
-        /* Workaround missing bool type in old cl.exe. */
-        if (isWindows) {
-            writer.appendln("#ifndef bool");
-            writer.appendln("#define bool char");
-            writer.appendln("#define false ((bool)0)");
-            writer.appendln("#define true  ((bool)1)");
-            writer.appendln("#endif");
-            writer.appendln("");
-        }
 
         /* Inject CContext specific C header file snippet. */
         if (directives instanceof DirectivesExtension) {
@@ -188,7 +178,7 @@ public class QueryCodeWriter extends InfoTreeVisitor {
                 printString(constantInfo.getValueInfo(), constantInfo.getName());
                 break;
             default:
-                throw shouldNotReachHere();
+                throw shouldNotReachHereUnexpectedInput(constantInfo.getKind()); // ExcludeFromJacocoGeneratedReport
         }
     }
 
@@ -289,7 +279,7 @@ public class QueryCodeWriter extends InfoTreeVisitor {
 
     @Override
     protected void visitPointerToInfo(PointerToInfo pointerToInfo) {
-        String sizeOfExpr = sizeOf(pointerToInfo);
+        String sizeOfExpr;
         if (pointerToInfo.getKind() == ElementKind.POINTER && pointerToInfo.getName().startsWith("struct ")) {
             /* Eliminate need for struct forward declarations */
             sizeOfExpr = "sizeof(void *)";
@@ -303,8 +293,8 @@ public class QueryCodeWriter extends InfoTreeVisitor {
             writer.indents().appendln("{");
             writer.indent();
             writer.indents().appendln("int is_unsigned;");
-            writer.indents().appendln(uInt64 + " all_bits_set = -1;");
-            writer.indents().appendln(pointerToInfo.getName() + " fieldHolder = all_bits_set;");
+            writer.indents().appendln(uInt64 + " all_bits_set = (" + uInt64 + ") -1;");
+            writer.indents().appendln(pointerToInfo.getName() + " fieldHolder = (" + pointerToInfo.getName() + ") all_bits_set;");
             writer.indents().appendln("is_unsigned = fieldHolder > 0;");
             printIsUnsigned(pointerToInfo.getSignednessInfo(), "is_unsigned");
             writer.outdent();
@@ -315,6 +305,24 @@ public class QueryCodeWriter extends InfoTreeVisitor {
     @Override
     protected void visitRawPointerToInfo(RawPointerToInfo pointerToInfo) {
         /* Nothing to do, do not visit children. */
+    }
+
+    @Override
+    protected void visitEnumInfo(EnumInfo enumInfo) {
+        assert enumInfo.getKind() == ElementKind.INTEGER;
+        printUnsignedLong(enumInfo.getSizeInfo(), sizeOf(enumInfo));
+
+        registerElementForCurrentLine(enumInfo.getAnnotatedElement());
+        writer.indents().appendln("{");
+        writer.indent();
+        writer.indents().appendln(uInt64 + " all_bits_set = -1;");
+        writer.indents().appendln(enumInfo.getName() + " enumHolder = all_bits_set;");
+        writer.indents().appendln("int is_unsigned = enumHolder > 0;");
+        printIsUnsigned(enumInfo.getSignednessInfo(), "is_unsigned");
+        writer.outdent();
+        writer.indents().appendln("}");
+
+        super.visitEnumInfo(enumInfo);
     }
 
     @Override

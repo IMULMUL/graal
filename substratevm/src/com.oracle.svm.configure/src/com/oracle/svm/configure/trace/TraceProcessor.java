@@ -25,66 +25,54 @@
 package com.oracle.svm.configure.trace;
 
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.io.Reader;
+import java.io.StringWriter;
 import java.util.List;
-import java.util.Map;
 
-import com.oracle.svm.configure.config.ProxyConfiguration;
-import com.oracle.svm.configure.config.ResourceConfiguration;
-import com.oracle.svm.configure.config.SerializationConfiguration;
-import com.oracle.svm.configure.config.TypeConfiguration;
-import com.oracle.svm.core.util.json.JSONParser;
+import org.graalvm.collections.EconomicMap;
+
+import com.oracle.svm.configure.config.ConfigurationSet;
+import com.oracle.svm.shared.util.LogUtils;
+
+import jdk.graal.compiler.util.json.JsonParser;
 
 public class TraceProcessor extends AbstractProcessor {
     private final AccessAdvisor advisor;
     private final JniProcessor jniProcessor;
     private final ReflectionProcessor reflectionProcessor;
     private final SerializationProcessor serializationProcessor;
+    private final ClassLoadingProcessor classLoadingProcessor;
+    private final ForeignProcessor foreignProcessor;
 
-    public TraceProcessor(AccessAdvisor accessAdvisor, TypeConfiguration jniConfiguration, TypeConfiguration reflectionConfiguration,
-                    ProxyConfiguration proxyConfiguration, ResourceConfiguration resourceConfiguration, SerializationConfiguration serializationConfiguration) {
+    private int warningsCount = 0;
+    private static final int MAX_NUM_WARNINGS_PRINT = 100;
+
+    public TraceProcessor(AccessAdvisor accessAdvisor) {
         advisor = accessAdvisor;
-        jniProcessor = new JniProcessor(this.advisor, jniConfiguration, reflectionConfiguration);
-        reflectionProcessor = new ReflectionProcessor(this.advisor, reflectionConfiguration, proxyConfiguration, resourceConfiguration);
-        serializationProcessor = new SerializationProcessor(this.advisor, serializationConfiguration);
-    }
-
-    public TypeConfiguration getJniConfiguration() {
-        return jniProcessor.getConfiguration();
-    }
-
-    public TypeConfiguration getReflectionConfiguration() {
-        return reflectionProcessor.getConfiguration();
-    }
-
-    public ProxyConfiguration getProxyConfiguration() {
-        return reflectionProcessor.getProxyConfiguration();
-    }
-
-    public ResourceConfiguration getResourceConfiguration() {
-        return reflectionProcessor.getResourceConfiguration();
-    }
-
-    public SerializationConfiguration getSerializationConfiguration() {
-        return serializationProcessor.getSerializationConfiguration();
+        jniProcessor = new JniProcessor(this.advisor);
+        reflectionProcessor = new ReflectionProcessor(this.advisor);
+        serializationProcessor = new SerializationProcessor(this.advisor);
+        classLoadingProcessor = new ClassLoadingProcessor();
+        foreignProcessor = new ForeignProcessor();
     }
 
     @SuppressWarnings("unchecked")
-    public void process(Reader reader) throws IOException {
+    public void process(Reader reader, ConfigurationSet configurationSet) throws IOException {
         setInLivePhase(false);
-        JSONParser parser = new JSONParser(reader);
-        List<Map<String, ?>> trace = (List<Map<String, ?>>) parser.parse();
-        processTrace(trace);
+        JsonParser parser = new JsonParser(reader);
+        List<EconomicMap<String, Object>> trace = (List<EconomicMap<String, Object>>) parser.parse();
+        processTrace(trace, configurationSet);
     }
 
-    private void processTrace(List<Map<String, ?>> trace) {
-        for (Map<String, ?> entry : trace) {
-            processEntry(entry);
+    private void processTrace(List<EconomicMap<String, Object>> trace, ConfigurationSet configurationSet) {
+        for (EconomicMap<String, Object> entry : trace) {
+            processEntry(entry, configurationSet);
         }
     }
 
     @Override
-    public void processEntry(Map<String, ?> entry) {
+    public void processEntry(EconomicMap<String, Object> entry, ConfigurationSet configurationSet) {
         try {
             String tracer = (String) entry.get("tracer");
             switch (tracer) {
@@ -94,28 +82,36 @@ public class TraceProcessor extends AbstractProcessor {
                         setInLivePhase(entry.get("phase").equals("live"));
                     } else if (event.equals("initialization")) {
                         // not needed for now, but contains version for breaking changes
+                    } else if (event.equals("track_reflection_metadata")) {
+                        reflectionProcessor.setTrackReflectionMetadata((boolean) entry.get("track"));
                     } else {
-                        logWarning("Unknown meta event, ignoring: " + event);
+                        warning("Unknown meta event, ignoring: " + event);
                     }
                     break;
                 }
                 case "jni":
-                    jniProcessor.processEntry(entry);
+                    jniProcessor.processEntry(entry, configurationSet);
                     break;
                 case "reflect":
-                    reflectionProcessor.processEntry(entry);
+                    reflectionProcessor.processEntry(entry, configurationSet);
                     break;
                 case "serialization":
-                    serializationProcessor.processEntry(entry);
+                    serializationProcessor.processEntry(entry, configurationSet);
+                    break;
+                case "classloading":
+                    classLoadingProcessor.processEntry(entry, configurationSet);
+                    break;
+                case "foreign":
+                    foreignProcessor.processEntry(entry, configurationSet);
                     break;
                 default:
-                    logWarning("Unknown tracer, ignoring: " + tracer);
+                    warning("Unknown tracer, ignoring: " + tracer);
                     break;
             }
         } catch (Exception e) {
-            StackTraceElement stackTraceElement = e.getStackTrace()[0];
-            logWarning("Error processing trace entry: " + e.toString() +
-                            " (at " + stackTraceElement.getClassName() + ":" + stackTraceElement.getLineNumber() + ") : " + entry.toString());
+            StringWriter stackTrace = new StringWriter();
+            e.printStackTrace(new PrintWriter(stackTrace));
+            warning("Error processing trace entry " + entry.toString() + ": " + stackTrace);
         }
     }
 
@@ -125,5 +121,17 @@ public class TraceProcessor extends AbstractProcessor {
         jniProcessor.setInLivePhase(live);
         reflectionProcessor.setInLivePhase(live);
         super.setInLivePhase(live);
+    }
+
+    private void warning(String msg) {
+        warningsCount++;
+        if (warningsCount <= MAX_NUM_WARNINGS_PRINT) {
+            LogUtils.warning(msg);
+        }
+        if (warningsCount == MAX_NUM_WARNINGS_PRINT) {
+            LogUtils.warning("********************************************************************");
+            LogUtils.warning("TraceProcessor has printed " + warningsCount + " warnings, further ones are omitted.");
+            LogUtils.warning("********************************************************************");
+        }
     }
 }

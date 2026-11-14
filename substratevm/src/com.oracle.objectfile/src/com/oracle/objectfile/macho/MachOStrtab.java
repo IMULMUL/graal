@@ -25,7 +25,6 @@
 
 package com.oracle.objectfile.macho;
 
-import java.util.Iterator;
 import java.util.Map;
 
 import com.oracle.objectfile.BuildDependency;
@@ -34,7 +33,6 @@ import com.oracle.objectfile.LayoutDecisionMap;
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.objectfile.ObjectFile.Element;
 import com.oracle.objectfile.StringSectionImpl;
-import com.oracle.objectfile.macho.MachOObjectFile.LinkEditSegment64Command;
 import com.oracle.objectfile.macho.MachOObjectFile.Segment64Command;
 
 public class MachOStrtab extends MachOObjectFile.LinkEditElement {
@@ -65,16 +63,6 @@ public class MachOStrtab extends MachOObjectFile.LinkEditElement {
     @Override
     public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
         return impl.getDependencies(decisions);
-    }
-
-    public Iterable<String> getContentProvider() {
-        return new Iterable<String>() {
-
-            @Override
-            public Iterator<String> iterator() {
-                return impl.iterator();
-            }
-        };
     }
 
     public void setContentProvider(Iterable<String> contentProvider) {
@@ -108,8 +96,7 @@ public class MachOStrtab extends MachOObjectFile.LinkEditElement {
 
     @Override
     public boolean isLoadable() {
-        // FIXME: nicer way of testing
-        return segment instanceof LinkEditSegment64Command;
+        return segment.isLinkEditSegment();
     }
 
 }

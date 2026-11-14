@@ -24,8 +24,8 @@
  */
 package org.graalvm.tools.lsp.server.types;
 
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -94,7 +94,7 @@ public class DocumentSymbol extends JSONBase {
 
     /**
      * The range enclosing this symbol not including leading/trailing whitespace but everything else
-     * like comments. This information is typically used to determine if the the clients cursor is
+     * like comments. This information is typically used to determine if the client's cursor is
      * inside the symbol to reveal in the symbol in the UI.
      */
     public Range getRange() {
@@ -108,7 +108,7 @@ public class DocumentSymbol extends JSONBase {
 
     /**
      * The range that should be selected and revealed when this symbol is being picked, e.g the name
-     * of a function. Must be contained by the the `range`.
+     * of a function. Must be contained by the `range`.
      */
     public Range getSelectionRange() {
         return new Range(jsonData.getJSONObject("selectionRange"));

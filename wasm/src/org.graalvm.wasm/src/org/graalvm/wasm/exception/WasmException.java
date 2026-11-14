@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,9 @@
  */
 package org.graalvm.wasm.exception;
 
+import java.util.Locale;
+
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.ExceptionType;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -48,8 +51,6 @@ import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.Node;
-
-import static com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
 @ExportLibrary(InteropLibrary.class)
 @SuppressWarnings("static-method")
@@ -81,12 +82,26 @@ public final class WasmException extends AbstractTruffleException {
 
     @TruffleBoundary
     public static WasmException format(Failure failure, String format, Object... args) {
-        return create(failure, String.format(format, args));
+        return create(failure, String.format(Locale.ROOT, format, args));
     }
 
     @TruffleBoundary
     public static WasmException format(Failure failure, Node location, String format, Object... args) {
-        return create(failure, location, String.format(format, args));
+        return create(failure, location, String.format(Locale.ROOT, format, args));
+    }
+
+    @TruffleBoundary
+    public static WasmException format(Failure failure, Node location, String format, Object arg) {
+        return create(failure, location, String.format(Locale.ROOT, format, arg));
+    }
+
+    @TruffleBoundary
+    public static WasmException format(Failure failure, Node location, String format, int arg) {
+        return create(failure, location, String.format(Locale.ROOT, format, arg));
+    }
+
+    public static ExceptionProvider provider() {
+        return ExceptionProviders.POLYGLOT_EXCEPTION_PROVIDER;
     }
 
     @ExportMessage

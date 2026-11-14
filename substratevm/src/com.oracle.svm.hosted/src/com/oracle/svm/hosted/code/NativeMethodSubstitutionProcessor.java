@@ -24,19 +24,19 @@
  */
 package com.oracle.svm.hosted.code;
 
-import java.lang.annotation.Annotation;
-
-import org.graalvm.compiler.graph.Node.NodeIntrinsic;
-import org.graalvm.compiler.nodes.graphbuilderconf.InvocationPlugin;
-import org.graalvm.compiler.nodes.spi.Replacements;
-import org.graalvm.compiler.word.Word.Operation;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.word.impl.Word.Operation;
 
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaMethod;
+import com.oracle.svm.shared.option.HostedOptionValues;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
+import jdk.graal.compiler.graph.Node.NodeIntrinsic;
+import jdk.graal.compiler.nodes.graphbuilderconf.InvocationPlugin;
+import jdk.graal.compiler.nodes.spi.Replacements;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -46,8 +46,6 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * {@link SubstitutionProcessor#chainUpInOrder(SubstitutionProcessor...) chain} of them.
  */
 public class NativeMethodSubstitutionProcessor extends SubstitutionProcessor {
-    private static final Class<?>[] FILTER_ANNOTATIONS = {NodeIntrinsic.class, Operation.class, CConstant.class};
-
     private final SubstitutionProcessor processor;
     private final Replacements replacements;
 
@@ -66,23 +64,23 @@ public class NativeMethodSubstitutionProcessor extends SubstitutionProcessor {
             assert !(method instanceof WrappedJavaMethod) : "Must not see AnalysisMethod or HostedMethod here";
             return method;
         }
-        for (Annotation annotation : method.getAnnotations()) {
-            for (Class<?> c : FILTER_ANNOTATIONS) {
-                if (annotation.annotationType() == c) {
-                    return method;
-                }
-            }
-            assert annotation.annotationType() != CFunction.class : "CFunction must have been handled by another SubstitutionProcessor";
+        assert !GuestAnnotationAccess.isAnnotationPresent(method, CFunction.class) : "CFunction must have been handled by another SubstitutionProcessor";
+        if (GuestAnnotationAccess.isAnnotationPresent(method, NodeIntrinsic.class) || GuestAnnotationAccess.isAnnotationPresent(method, Operation.class) ||
+                        GuestAnnotationAccess.isAnnotationPresent(method, CConstant.class)) {
+            return method;
         }
-        boolean isHandledByPlugin = replacements.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null;
+        boolean isHandledByPlugin = isHandledByPlugin(method);
         if (isHandledByPlugin) {
             return method;
         }
         return processor.lookup(method);
     }
 
-    @Override
-    public ResolvedJavaMethod resolve(ResolvedJavaMethod method) {
-        return processor.resolve(method);
+    private boolean isHandledByPlugin(ResolvedJavaMethod method) {
+        InvocationPlugin plugin = replacements.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method, HostedOptionValues.singleton().get());
+        if (plugin instanceof InvocationPlugin.ConditionalInvocationPlugin conditionalInvocationPlugin) {
+            return conditionalInvocationPlugin.isApplicable(replacements.getProviders().getLowerer().getTarget().arch);
+        }
+        return plugin != null;
     }
 }

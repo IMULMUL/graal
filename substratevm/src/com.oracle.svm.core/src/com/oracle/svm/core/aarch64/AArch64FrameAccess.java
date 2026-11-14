@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,51 +24,58 @@
  */
 package com.oracle.svm.core.aarch64;
 
-import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.nativeimage.ImageSingletons;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.SubstrateControlFlowIntegrity;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.core.graal.nodes.aarch64.AArch64PACNode;
+import com.oracle.svm.core.graal.nodes.aarch64.AArch64XPACNode;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-@AutomaticFeature
+@AutomaticallyRegisteredImageSingleton(FrameAccess.class)
 @Platforms(Platform.AARCH64.class)
-class AMD64FrameAccessFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(FrameAccess.class, new AArch64FrameAccess());
-    }
-}
-
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
 public class AArch64FrameAccess extends FrameAccess {
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public CodePointer readReturnAddress(Pointer sourceSp) {
-        /* Read the return address, which is stored immediately below the stack pointer. */
-        return (CodePointer) sourceSp.readWord(-returnAddressSize());
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected int getReturnAddressSize() {
+        return SubstrateTarget.getWordSize();
     }
 
     @Override
-    public void writeReturnAddress(Pointer sourceSp, CodePointer newReturnAddress) {
-        sourceSp.writeWord(-returnAddressSize(), newReturnAddress);
-    }
-
-    @Fold
-    @Override
-    public int savedBasePointerSize() {
-        // The base pointer is always saved with stp instruction on method entry
-        return wordSize();
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public CodePointer unsafeReadReturnAddress(Pointer sourceSp) {
+        CodePointer returnAddress = super.unsafeReadReturnAddress(sourceSp);
+        return stripAddress(returnAddress);
     }
 
     @Override
-    @Fold
-    public int stackPointerAdjustmentOnCall() {
-        // A call on AArch64 does not touch the SP.
-        return 0;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public CodePointer encodeReturnAddress(Pointer sourceSp, CodePointer returnAddress) {
+        if (SubstrateControlFlowIntegrity.enabled()) {
+            return AArch64PACNode.signAddress(returnAddress, sourceSp);
+        }
+        return returnAddress;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static CodePointer stripAddress(CodePointer returnAddress) {
+        /* Remove the pointer authentication code (PAC), if present. */
+        if (SubstrateControlFlowIntegrity.enabled()) {
+            return AArch64XPACNode.stripAddress(returnAddress);
+        }
+        return returnAddress;
     }
 }

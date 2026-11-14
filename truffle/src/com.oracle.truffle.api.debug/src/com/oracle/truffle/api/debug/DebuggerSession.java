@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,7 +45,6 @@ import java.net.URI;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -56,11 +55,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import com.oracle.truffle.api.Assumption;
+import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
@@ -74,7 +76,6 @@ import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.frame.FrameInstance.FrameAccess;
 import com.oracle.truffle.api.frame.FrameInstanceVisitor;
-import com.oracle.truffle.api.frame.FrameSlot;
 import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.EventBinding;
@@ -84,9 +85,9 @@ import com.oracle.truffle.api.instrumentation.ExecutionEventNodeFactory;
 import com.oracle.truffle.api.instrumentation.InstrumentableNode;
 import com.oracle.truffle.api.instrumentation.ProbeNode;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
-import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter.Builder;
 import com.oracle.truffle.api.instrumentation.StandardTags.RootTag;
+import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.nodes.ExecutableNode;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
@@ -171,7 +172,10 @@ import com.oracle.truffle.api.source.SourceSection;
  * </ul>
  * </p>
  * <p>
- * Usage example: {@link DebuggerSessionSnippets#example}
+ * Usage example:
+ *
+ * {@snippet file = "com/oracle/truffle/api/debug/DebuggerSession.java" region =
+ * "DebuggerSessionSnippets#example"}
  *
  * @since 0.17
  */
@@ -196,20 +200,19 @@ public final class DebuggerSession implements Closeable {
     private final boolean hasExpressionElement;
     private final boolean hasRootElement;
     private final List<Breakpoint> breakpoints = Collections.synchronizedList(new ArrayList<>());
-    // We keep a set of unresolved breakpoints to call just those for resolution.
-    private final Collection<Breakpoint> breakpointsUnresolved = ConcurrentHashMap.newKeySet();
-    private volatile boolean breakpointsUnresolvedEmpty = true;
 
     private EventBinding<? extends ExecutionEventNodeFactory> syntaxElementsBinding;
     final Set<EventBinding<? extends ExecutionEventNodeFactory>> allBindings = Collections.synchronizedSet(new HashSet<>());
 
     private final ConcurrentHashMap<Thread, SuspendedEvent> currentSuspendedEventMap = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Thread, SteppingStrategy> strategyMap = new ConcurrentHashMap<>();
+    private final NewThreadStrategyProvider newThreadStrategy = new NewThreadStrategyProvider();
     private volatile boolean suspendNext;
     private volatile boolean suspendAll;
     private final StableBoolean stepping = new StableBoolean(false);
     private final StableBoolean ignoreLanguageContextInitialization = new StableBoolean(false);
     private volatile boolean includeInternal = false;
+    private volatile boolean includeAvailableSourceSectionsOnly = false;
     private volatile boolean showHostStackFrames = false;
     private Predicate<Source> sourceFilter;
     @CompilationFinal private volatile Assumption suspensionFilterUnchanged = Truffle.getRuntime().createAssumption("Unchanged suspension filter");
@@ -219,6 +222,7 @@ public final class DebuggerSession implements Closeable {
     private final DebuggerExecutionLifecycle executionLifecycle;
     final ThreadLocal<ThreadSuspension> threadSuspensions = new ThreadLocal<>();
     private final DebugSourcesResolver sources;
+    private final ThreadLocal<Set<Integer>> steppingEnabledSlots = new ThreadLocal<>();
 
     private final int sessionId;
 
@@ -304,7 +308,7 @@ public final class DebuggerSession implements Closeable {
      * @since 0.30
      */
     public Map<String, ? extends DebugValue> getExportedSymbols() {
-        return new AbstractMap<String, DebugValue>() {
+        return new AbstractMap<>() {
             private final DebugValue polyglotBindings = new DebugValue.HeapValue(DebuggerSession.this, "polyglot", debugger.getEnv().getPolyglotBindings());
 
             @Override
@@ -318,10 +322,9 @@ public final class DebuggerSession implements Closeable {
 
             @Override
             public DebugValue get(Object key) {
-                if (!(key instanceof String)) {
+                if (!(key instanceof String name)) {
                     return null;
                 }
-                String name = (String) key;
                 return polyglotBindings.getProperty(name);
             }
         };
@@ -354,11 +357,13 @@ public final class DebuggerSession implements Closeable {
         synchronized (this) {
             boolean oldIncludeInternal = this.includeInternal;
             this.includeInternal = steppingFilter.isInternalIncluded();
+            boolean oldIncludeOnlyAvailableSourceSections = this.includeAvailableSourceSectionsOnly;
+            this.includeAvailableSourceSectionsOnly = steppingFilter.isIncludeAvailableSourceSectionsOnly();
             Predicate<Source> oldSourceFilter = this.sourceFilter;
             this.sourceFilter = steppingFilter.getSourcePredicate();
             this.suspensionFilterUnchanged.invalidate();
             this.suspensionFilterUnchanged = Truffle.getRuntime().createAssumption("Unchanged suspension filter");
-            if (oldIncludeInternal != this.includeInternal || oldSourceFilter != this.sourceFilter) {
+            if (oldIncludeInternal != this.includeInternal || oldIncludeOnlyAvailableSourceSections != this.includeAvailableSourceSectionsOnly || oldSourceFilter != this.sourceFilter) {
                 removeBindings();
                 addBindings(this.includeInternal, this.sourceFilter);
             }
@@ -426,69 +431,112 @@ public final class DebuggerSession implements Closeable {
         if (event != null) {
             throw new IllegalStateException("Suspended already");
         }
-        RootNode nodeRoot = null;
+        RootNode nodeRoot;
         if (node != null) {
             nodeRoot = node.getRootNode();
             if (nodeRoot == null) {
                 throw new IllegalArgumentException(String.format("The node %s does not have a root.", node));
             }
+        } else {
+            nodeRoot = null;
         }
-        FrameInstance frameInstance = Truffle.getRuntime().getCurrentFrame();
-        if (frameInstance == null) {
-            return false;
-        }
-        RootNode root = ((RootCallTarget) frameInstance.getCallTarget()).getRootNode();
-        if (!includeInternal) {
-            if (root.isInternal()) {
-                // In an internal code, we need to iterate stack to find non-internal location
-                frameInstance = Truffle.getRuntime().iterateFrames(new FrameInstanceVisitor<FrameInstance>() {
-                    int startDepth = 1;
 
-                    @Override
-                    public FrameInstance visitFrame(FrameInstance fi) {
-                        if (startDepth-- > 0) {
-                            return null;
-                        }
-                        if (!((RootCallTarget) fi.getCallTarget()).getRootNode().isInternal()) {
-                            return fi;
-                        }
-                        return null;
-                    }
-                });
-                if (frameInstance == null) {
-                    return false;
-                } else {
-                    root = ((RootCallTarget) frameInstance.getCallTarget()).getRootNode();
+        SuspendContextAndFrame result = Truffle.getRuntime().iterateFrames((frameInstance) -> {
+            RootNode root = ((RootCallTarget) frameInstance.getCallTarget()).getRootNode();
+            if (nodeRoot == null && !includeInternal && root.isInternal()) {
+                return null;
+            }
+            if (nodeRoot != null && nodeRoot != root) {
+                if (!includeInternal && root.isInternal()) {
+                    return null;
+                }
+                throw new IllegalArgumentException(String.format("The node %s belongs to a root %s, which is different from the current root %s.", node, nodeRoot, root));
+            }
+            Node callNode = frameInstance.getInstrumentableCallNode();
+            if (callNode == null) {
+                callNode = node;
+                if (callNode == null) {
+                    // We have no idea where in the function we are.
+                    callNode = root;
                 }
             }
+            if (node != null && node != callNode) {
+                throw new IllegalArgumentException(String.format("The node %s does not match the current known call node %s.", node, callNode));
+            }
+            Node icallNode = InstrumentableNode.findInstrumentableParent(callNode);
+            if (icallNode != null) {
+                callNode = icallNode;
+            }
+            MaterializedFrame frame = frameInstance.getFrame(FrameAccess.MATERIALIZE).materialize();
+            SuspendedContext context = SuspendedContext.create(callNode, null);
+            return new SuspendContextAndFrame(context, frame);
+        });
+        if (result == null) {
+            return false;
         }
-        if (nodeRoot != null && nodeRoot != root) {
-            throw new IllegalArgumentException(String.format("The node %s belongs to a root %s, which is different from the current root %s.", node, nodeRoot, root));
+        doSuspend(result.context, SuspendAnchor.BEFORE, result.frame, null, false);
+        return true;
+    }
+
+    // Session-specific stepping control.
+    void restoreSteppingOnCurrentThread() {
+        CompilerAsserts.neverPartOfCompilation();
+        assert debugger.getEnv().getEnteredContext() != null : "Need to be called on a context thread";
+        int count = debugger.getSteppingDisabledCount();
+        if (count == 0) {
+            // There is nothing to restore
+            return;
         }
-        Node callNode = frameInstance.getCallNode();
-        if (callNode == null) {
-            callNode = node;
-            if (callNode == null) {
-                // We have no idea where in the function we are.
-                callNode = root;
+        Set<Integer> enabledSlots = steppingEnabledSlots.get();
+        if (enabledSlots == null) {
+            enabledSlots = new HashSet<>();
+            steppingEnabledSlots.set(enabledSlots);
+        }
+        enabledSlots.add(count);
+    }
+
+    // Session-specific stepping control, delegates to Debugger.getSteppingDisabledCount().
+    boolean isSteppingEnabledOnCurrentThread() {
+        CompilerAsserts.neverPartOfCompilation();
+        assert debugger.getEnv().getEnteredContext() != null : "Need to be called on a context thread";
+        int count = debugger.getSteppingDisabledCount();
+        if (count == 0) {
+            return true;
+        }
+        Set<Integer> enabledSlots = steppingEnabledSlots.get();
+        return enabledSlots != null && enabledSlots.contains(count);
+    }
+
+    // Clear session-specific stepping control
+    void clearDisabledSteppingOnCurrentThread(int count) {
+        CompilerAsserts.neverPartOfCompilation();
+        assert debugger.getEnv().getEnteredContext() != null : "Need to be called on a context thread";
+        assert count > 0 : "Wrong count = " + count;
+        Set<Integer> enabledSlots = steppingEnabledSlots.get();
+        if (enabledSlots != null) {
+            enabledSlots.remove(count);
+            if (enabledSlots.isEmpty()) {
+                steppingEnabledSlots.remove();
             }
         }
-        if (node != null && node != callNode) {
-            throw new IllegalArgumentException(String.format("The node %s does not match the current known call node %s.", node, callNode));
+    }
+
+    static final class SuspendContextAndFrame {
+
+        final SuspendedContext context;
+        final MaterializedFrame frame;
+
+        SuspendContextAndFrame(SuspendedContext context, MaterializedFrame frame) {
+            this.context = context;
+            this.frame = frame;
         }
-        Node icallNode = InstrumentableNode.findInstrumentableParent(callNode);
-        if (icallNode != null) {
-            callNode = icallNode;
-        }
-        MaterializedFrame frame = frameInstance.getFrame(FrameAccess.READ_WRITE).materialize();
-        SuspendedContext context = SuspendedContext.create(callNode, null);
-        doSuspend(context, SuspendAnchor.BEFORE, frame, null);
-        return true;
     }
 
     /**
      * Suspends the current or the next execution of a given thread. Will throw an
      * {@link IllegalStateException} if the session is already closed.
+     *
+     * Note that if a stepping strategy is currently active, we preserve the stepping state.
      *
      * @since 20.0
      */
@@ -499,8 +547,23 @@ public final class DebuggerSession implements Closeable {
         if (closed) {
             throw new IllegalStateException("session closed");
         }
+        // If there's an ongoing step request, we want to preserve that, so we use the preserve
+        // and halt strategy for suspend requests.
+        this.strategyMap.compute(t, DebuggerSession::addSuspendThreadStrategy);
+        updateStepping();
+    }
 
-        setSteppingStrategy(t, SteppingStrategy.createAlwaysHalt(), true);
+    private static SteppingStrategy addSuspendThreadStrategy(@SuppressWarnings("unused") Thread t, SteppingStrategy s) {
+        if (s == null || s.isContinue() || s.isConsumed()) {
+            return SteppingStrategy.createAlwaysHalt();
+        } else {
+            if (s.isAlwaysHalt()) {
+                // The current strategy suspends already
+                return s;
+            } else {
+                return SteppingStrategy.createPreserveAndHalt(s);
+            }
+        }
     }
 
     /**
@@ -519,13 +582,9 @@ public final class DebuggerSession implements Closeable {
         }
 
         suspendAll = true;
-        // iterating concurrent hashmap should be save
+        // iterating concurrent hashmap should be safe
         for (Thread t : strategyMap.keySet()) {
-            SteppingStrategy s = strategyMap.get(t);
-            assert s != null;
-            if (s.isDone() || s.isConsumed()) {
-                setSteppingStrategy(t, SteppingStrategy.createAlwaysHalt(), false);
-            }
+            suspend(t);
         }
         updateStepping();
     }
@@ -543,7 +602,12 @@ public final class DebuggerSession implements Closeable {
             throw new IllegalStateException("session closed");
         }
 
-        clearStrategies();
+        suspendAll = false;
+        suspendNext = false;
+        for (Thread t : strategyMap.keySet()) {
+            resume(t);
+        }
+        updateStepping();
     }
 
     /**
@@ -561,23 +625,78 @@ public final class DebuggerSession implements Closeable {
             throw new IllegalStateException("session closed");
         }
 
-        setSteppingStrategy(t, SteppingStrategy.createContinue(), true);
+        this.strategyMap.computeIfPresent(t, DebuggerSession::removeSuspendThreadStrategy);
+        updateStepping();
     }
 
-    private synchronized void setSteppingStrategy(Thread thread, SteppingStrategy strategy, boolean updateStepping) {
-        if (closed) {
-            return;
-        }
-        assert strategy != null;
-        SteppingStrategy oldStrategy = this.strategyMap.put(thread, strategy);
-        if (oldStrategy != strategy) {
-            if (Debugger.TRACE) {
-                trace("set stepping for thread: %s with strategy: %s", thread, strategy);
+    /**
+     * Remove strategy that {@link SteppingStrategy#isAlwaysHalt() suspends a thread} from the
+     * provided {@code strategy}.
+     */
+    private static SteppingStrategy removeSuspendThreadStrategy(@SuppressWarnings("unused") Thread t, SteppingStrategy strategy) {
+        return removeSteppingStrategy(strategy, SteppingStrategy::isAlwaysHalt);
+    }
+
+    /**
+     * Remove strategy that {@link SteppingStrategy#isSingleStep() is a single step} from the
+     * provided {@code strategy}.
+     */
+    private static SteppingStrategy removeSingleSteppingStrategy(@SuppressWarnings("unused") Thread t, SteppingStrategy strategy) {
+        return removeSteppingStrategy(strategy, SteppingStrategy::isSingleStep);
+    }
+
+    /**
+     * Remove a strategy that passes the {@code strategyTest} from the provided {@code strategy}.
+     * The implementation checks the nested strategies and removes those stepping strategies that
+     * passes the {@code strategyTest}.
+     */
+    private static SteppingStrategy removeSteppingStrategy(SteppingStrategy strategy, Predicate<SteppingStrategy> strategyTest) {
+        if (strategy.isComposable()) {
+            List<SteppingStrategy> nestedStrategies = strategy.getNestedStrategies();
+            int i = 0;
+            while (i < nestedStrategies.size()) {
+                SteppingStrategy s = nestedStrategies.get(i);
+                if (s.isComposable()) {
+                    s = removeSteppingStrategy(s, strategyTest);
+                    nestedStrategies.set(i, s);
+                }
+                if (!s.isComposable() && strategyTest.test(s) || s.isContinue()) {
+                    nestedStrategies.remove(i--);
+                }
+                i++;
             }
-            if (updateStepping) {
-                updateStepping();
+            if (nestedStrategies.isEmpty()) {
+                return SteppingStrategy.createContinue();
+            } else if (nestedStrategies.size() == 1) {
+                return nestedStrategies.get(0);
+            } else {
+                SteppingStrategy newStrategy = SteppingStrategy.createComposed(nestedStrategies.get(0), nestedStrategies.get(1));
+                for (i = 2; i < nestedStrategies.size(); i++) {
+                    newStrategy.add(nestedStrategies.get(i));
+                }
+                return newStrategy;
             }
+        } else if (strategyTest.test(strategy)) {
+            return SteppingStrategy.createContinue();
+        } else {
+            return strategy;
         }
+    }
+
+    /**
+     * Dispose stepping on the given thread. All pending steps prepared on a {@link SuspendedEvent}
+     * on the provided thread are disposed. If no stepping were prepared, this method has no effect.
+     * If this is called in combination with {@link #resume(Thread)} or {@link #resumeAll()}, be
+     * sure to {@link #disposeStepping(Thread) dispose stepping} first and then resume.
+     *
+     * @since 25.1
+     */
+    public void disposeStepping(Thread t) {
+        if (Debugger.TRACE) {
+            trace("dispose stepping on %s", t);
+        }
+        this.strategyMap.computeIfPresent(t, DebuggerSession::removeSingleSteppingStrategy);
+        updateStepping();
     }
 
     private synchronized void clearStrategies() {
@@ -591,12 +710,10 @@ public final class DebuggerSession implements Closeable {
         return strategyMap.get(value);
     }
 
-    private void updateStepping() {
-        assert Thread.holdsLock(this);
-
+    private synchronized void updateStepping() {
+        // synchronized not to race with clearStrategies()
         boolean needsStepping = suspendNext || suspendAll;
         if (!needsStepping) {
-            // iterating concurrent hashmap should be save
             for (Thread t : strategyMap.keySet()) {
                 SteppingStrategy s = strategyMap.get(t);
                 assert s != null;
@@ -636,7 +753,6 @@ public final class DebuggerSession implements Closeable {
                     @Override
                     public ExecutionEventNode create(EventContext context) {
                         if (context.hasTag(RootTag.class)) {
-                            resolveUnresolvedBreakpoints(context.getInstrumentedNode());
                             return new RootSteppingDepthNode(context);
                         } else {
                             return new SteppingNode(context);
@@ -644,17 +760,6 @@ public final class DebuggerSession implements Closeable {
                     }
                 }, hasExpressionElement, syntaxTags);
                 allBindings.add(syntaxElementsBinding);
-            } else {
-                // Create binding for breakpoints resolution
-                this.syntaxElementsBinding = createBinding(includeInternalCode, sFilter, new ExecutionEventNodeFactory() {
-                    @Override
-                    public ExecutionEventNode create(EventContext context) {
-                        if (context.hasTag(RootTag.class)) {
-                            resolveUnresolvedBreakpoints(context.getInstrumentedNode());
-                        }
-                        return null;
-                    }
-                }, false, RootTag.class);
             }
         }
     }
@@ -663,6 +768,7 @@ public final class DebuggerSession implements Closeable {
                     Class<?>... tags) {
         Builder builder = SourceSectionFilter.newBuilder().tagIs(tags);
         builder.includeInternal(includeInternalCode);
+        builder.sourceSectionAvailableOnly(includeAvailableSourceSectionsOnly);
         if (sFilter != null) {
             builder.sourceIs(new SourceSectionFilter.SourcePredicate() {
                 @Override
@@ -693,6 +799,24 @@ public final class DebuggerSession implements Closeable {
 
     Set<SourceElement> getSourceElements() {
         return sourceElements;
+    }
+
+    /**
+     * Creates a {@link DebugValue} object that wraps a primitive value. Strings and boxed Java
+     * primitive types are considered primitive. Throws {@link IllegalArgumentException} if the
+     * value is not primitive.
+     *
+     * @param primitiveValue a primitive value
+     * @param language guest language this value is value is associated with. Some value attributes
+     *            depend on the language, like {@link DebugValue#getMetaObject()}. Can be
+     *            <code>null</code>.
+     * @return a {@link DebugValue} that wraps the primitive value.
+     * @throws IllegalArgumentException if the value is not a boxed Java primitive or a String.
+     * @since 21.2
+     */
+    public DebugValue createPrimitiveValue(Object primitiveValue, LanguageInfo language) throws IllegalArgumentException {
+        DebugValue.checkPrimitive(primitiveValue);
+        return new DebugValue.HeapValue(this, language, null, primitiveValue);
     }
 
     /**
@@ -752,23 +876,6 @@ public final class DebuggerSession implements Closeable {
     }
 
     /**
-     * Set whether breakpoints are active in this session. This has no effect on breakpoints
-     * enabled/disabled state. Breakpoints need to be active to actually break the execution. The
-     * breakpoints are active by default.
-     *
-     * @param active <code>true</code> to make all breakpoints active, <code>false</code> to make
-     *            all breakpoints inactive.
-     * @since 0.24
-     * @deprecated Use {@link #setBreakpointsActive(Breakpoint.Kind, boolean)} instead.
-     */
-    @Deprecated
-    public void setBreakpointsActive(boolean active) {
-        for (Breakpoint.Kind kind : Breakpoint.Kind.VALUES) {
-            setBreakpointsActive(kind, active);
-        }
-    }
-
-    /**
      * Set whether breakpoints of the given kind are active in this session. This has no effect on
      * breakpoints enabled/disabled state. Breakpoints need to be active to actually break the
      * execution. The breakpoints are active by default.
@@ -793,23 +900,6 @@ public final class DebuggerSession implements Closeable {
                 CompilerDirectives.transferToInterpreter();
                 throw new IllegalStateException("Unhandled breakpoint kind: " + breakpointKind);
         }
-    }
-
-    /**
-     * Test whether breakpoints are active in this session. Breakpoints do not break execution when
-     * not active.
-     *
-     * @since 0.24
-     * @deprecated Use {@link #isBreakpointsActive(Breakpoint.Kind)} instead.
-     */
-    @Deprecated
-    public boolean isBreakpointsActive() {
-        for (Breakpoint.Kind kind : Breakpoint.Kind.VALUES) {
-            if (isBreakpointsActive(kind)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -859,15 +949,7 @@ public final class DebuggerSession implements Closeable {
                 return;
             }
         }
-        if (!global) {
-            if (breakpoint.isResolvable() && !breakpoint.isResolved()) {
-                this.breakpointsUnresolved.add(breakpoint);
-                this.breakpointsUnresolvedEmpty = breakpointsUnresolved.isEmpty();
-            }
-        }
         if (!breakpoint.install(this, !global)) {
-            this.breakpointsUnresolved.remove(breakpoint);
-            this.breakpointsUnresolvedEmpty = breakpointsUnresolved.isEmpty();
             return;
         }
         if (!global) { // Do not keep global breakpoints in the list
@@ -876,27 +958,6 @@ public final class DebuggerSession implements Closeable {
         if (Debugger.TRACE) {
             trace("installed session breakpoint %s", breakpoint);
         }
-    }
-
-    private void resolveUnresolvedBreakpoints(Node node) {
-        if (breakpointsUnresolvedEmpty) {
-            return;
-        }
-        SourceSection sourceSection = node.getSourceSection();
-        if (sourceSection != null) {
-            Source source = sourceSection.getSource();
-            for (Breakpoint breakpoint : breakpointsUnresolved) {
-                if (breakpoint.isEnabled()) {
-                    breakpoint.doResolve(source);
-                }
-            }
-        }
-    }
-
-    void breakpointResolved(Breakpoint breakpoint) {
-        assert breakpoint.isResolved();
-        breakpointsUnresolved.remove(breakpoint);
-        breakpointsUnresolvedEmpty = breakpointsUnresolved.isEmpty();
     }
 
     synchronized void disposeBreakpoint(Breakpoint breakpoint) {
@@ -1039,20 +1100,19 @@ public final class DebuggerSession implements Closeable {
         }
 
         SteppingStrategy s = getSteppingStrategy(currentThread);
+        if (s == null) {
+            // a new Thread just appeared
+            s = notifyNewThread(currentThread);
+        }
+
         if (suspendNext) {
             synchronized (this) {
                 // double checked locking to avoid more than one suspension
                 if (suspendNext) {
-                    s = SteppingStrategy.createAlwaysHalt();
-                    setSteppingStrategy(currentThread, s, true);
+                    s = this.strategyMap.compute(currentThread, DebuggerSession::addSuspendThreadStrategy);
                     suspendNext = false;
                 }
             }
-        }
-
-        if (s == null) {
-            // a new Thread just appeared
-            s = notifyNewThread(currentThread);
         }
 
         Map<Breakpoint, Throwable> breakpointFailures = null;
@@ -1065,7 +1125,7 @@ public final class DebuggerSession implements Closeable {
             breakpointFailures.put(fb, conditionFailure.getConditionFailure());
         }
 
-        Object newReturnValue = processBreakpointsAndStep(context, nodes, s, source, frame, suspendAnchor,
+        Object newReturnValue = processBreakpointsAndStep(context, nodes, s, source, frame, suspendAnchor, false,
                         inputValuesProvider, returnValue, exception, breakpointFailures,
                         new Supplier<SuspendedContext>() {
                             @Override
@@ -1079,11 +1139,7 @@ public final class DebuggerSession implements Closeable {
     private static void clearFrame(RootNode root, MaterializedFrame frame) {
         FrameDescriptor descriptor = frame.getFrameDescriptor();
         if (root.getFrameDescriptor() == descriptor) {
-            // Clear only those frames that correspond to the current root
-            Object value = descriptor.getDefaultValue();
-            for (FrameSlot slot : descriptor.getSlots()) {
-                frame.setObject(slot, value);
-            }
+            Debugger.ACCESSOR.runtimeSupport().getFrameExtensionsSafe().resetFrame(frame);
         }
     }
 
@@ -1100,7 +1156,7 @@ public final class DebuggerSession implements Closeable {
         // Fake the caller context
         Caller caller = findCurrentCaller(this, includeInternal);
         SuspendedContext context = SuspendedContext.create(caller.node, ((SteppingStrategy.Unwind) s).unwind);
-        doSuspend(context, SuspendAnchor.AFTER, caller.frame, insertableNode);
+        doSuspend(context, SuspendAnchor.BEFORE, caller.frame, insertableNode, true);
     }
 
     static Caller findCurrentCaller(DebuggerSession session, boolean includeInternal) {
@@ -1113,15 +1169,25 @@ public final class DebuggerSession implements Closeable {
                 if (!SuspendedEvent.isEvalRootStackFrame(session, frameInstance) && (depth++ == 0)) {
                     return null;
                 }
-                Node callNode = frameInstance.getCallNode();
-                while (callNode != null && !SourceSectionFilter.ANY.includes(callNode)) {
-                    callNode = callNode.getParent();
-                }
+
+                Node callNode = frameInstance.getInstrumentableCallNode();
+                RootNode rootNode;
                 if (callNode == null) {
-                    return null;
+                    // GR-52192 temporary workaround for Espresso, where a meaningful call node
+                    // cannot always be set as encapsulated node reference.
+                    rootNode = ((RootCallTarget) frameInstance.getCallTarget()).getRootNode();
+                    callNode = rootNode;
+                } else {
+                    while (callNode != null && !SourceSectionFilter.ANY.includes(callNode)) {
+                        callNode = callNode.getParent();
+                    }
+                    rootNode = callNode != null ? callNode.getRootNode() : null;
+                    if (rootNode == null) {
+                        // can't handle disconnected call nodes
+                        return null;
+                    }
                 }
-                RootNode root = callNode.getRootNode();
-                if (root == null || !includeInternal && root.isInternal()) {
+                if (!includeInternal && rootNode.isInternal()) {
                     return null;
                 }
                 return new Caller(frameInstance, callNode);
@@ -1196,7 +1262,7 @@ public final class DebuggerSession implements Closeable {
             breakpointFailures.put(fb, conditionFailure.getConditionFailure());
         }
 
-        Object newReturnValue = processBreakpointsAndStep(context, nodes, strategy, source, caller.frame, suspendAnchor, null, returnValue, exception, breakpointFailures,
+        Object newReturnValue = processBreakpointsAndStep(context, nodes, strategy, source, caller.frame, suspendAnchor, true, null, returnValue, exception, breakpointFailures,
                         new Supplier<SuspendedContext>() {
                             @Override
                             public SuspendedContext get() {
@@ -1208,7 +1274,7 @@ public final class DebuggerSession implements Closeable {
 
     @SuppressWarnings("all") // The parameter breakpointFailures should not be assigned
     private Object processBreakpointsAndStep(EventContext context, List<DebuggerNode> nodes, SteppingStrategy s, DebuggerNode source, MaterializedFrame frame,
-                    SuspendAnchor suspendAnchor, InputValuesProvider inputValuesProvider, Object returnValue, DebugException exception,
+                    SuspendAnchor suspendAnchor, boolean atCaller, InputValuesProvider inputValuesProvider, Object returnValue, DebugException exception,
                     Map<Breakpoint, Throwable> breakpointFailures, Supplier<SuspendedContext> contextSupplier) {
         List<Breakpoint> breaks = null;
         for (DebuggerNode node : nodes) {
@@ -1247,13 +1313,22 @@ public final class DebuggerSession implements Closeable {
             breakpointFailures = Collections.emptyMap();
         }
 
-        boolean hitStepping = s.step(this, source.getContext(), suspendAnchor);
+        SuspendedContext suspendedContext = contextSupplier.get();
+        // When we're at a caller, we use a special check SteppingStrategy.isStopAfterCall()
+        // instead of SteppingStrategy.isActive(). The step is in a special state when it stepped
+        // out of a function call and StepConfig.match() is not applied when the step got out of
+        // its range.
+        boolean hitStepping = (atCaller ? s.isStopAfterCall() : s.isActive(context, suspendAnchor)) && s.step(this, source.getContext(), suspendAnchor);
         boolean hitBreakpoint = !breaks.isEmpty();
+        boolean singleStepCompleted = hitStepping ? s.isSingleStepCompleted() : false;
+
         Object newReturnValue = returnValue;
-        if (hitStepping || hitBreakpoint) {
+        if (hitStepping) {
             s.consume();
-            newReturnValue = doSuspend(contextSupplier.get(), suspendAnchor, frame, source, inputValuesProvider, returnValue, exception, breaks,
-                            breakpointFailures);
+        }
+        if (hitStepping || hitBreakpoint) {
+            newReturnValue = doSuspend(suspendedContext, suspendAnchor, frame, source, inputValuesProvider, returnValue, exception, breaks,
+                            breakpointFailures, s, singleStepCompleted, s.isUnwind());
         } else {
             if (Debugger.TRACE) {
                 trace("ignored suspended reason: strategy(%s) from source:%s context:%s location:%s", s, source, source.getContext(), source.getSuspendAnchors());
@@ -1265,20 +1340,22 @@ public final class DebuggerSession implements Closeable {
         return newReturnValue;
     }
 
-    private Object doSuspend(SuspendedContext context, SuspendAnchor suspendAnchor, MaterializedFrame frame, InsertableNode insertableNode) {
-        return doSuspend(context, suspendAnchor, frame, insertableNode, null, null, null, Collections.emptyList(), Collections.emptyMap());
+    private void doSuspend(SuspendedContext context, SuspendAnchor suspendAnchor, MaterializedFrame frame, InsertableNode insertableNode, boolean isUnwind) {
+        SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
+        doSuspend(context, suspendAnchor, frame, insertableNode, null, null, null, Collections.emptyList(), Collections.emptyMap(), steppingStrategy, false, isUnwind);
     }
 
     private Object doSuspend(SuspendedContext context, SuspendAnchor suspendAnchor, MaterializedFrame frame,
                     InsertableNode insertableNode, InputValuesProvider inputValuesProvider, Object returnValue, DebugException exception,
-                    List<Breakpoint> breaks, Map<Breakpoint, Throwable> conditionFailures) {
+                    List<Breakpoint> breaks, Map<Breakpoint, Throwable> conditionFailures, SteppingStrategy currentStrategy, boolean singleStepCompleted, boolean isUnwind) {
         CompilerAsserts.neverPartOfCompilation();
         Thread currentThread = Thread.currentThread();
 
         SuspendedEvent suspendedEvent;
         Object newReturnValue;
         try {
-            suspendedEvent = new SuspendedEvent(this, currentThread, context, frame, suspendAnchor, insertableNode, inputValuesProvider, returnValue, exception, breaks, conditionFailures);
+            suspendedEvent = new SuspendedEvent(this, currentThread, context, frame, suspendAnchor, insertableNode, inputValuesProvider, returnValue, exception, breaks, conditionFailures,
+                            singleStepCompleted, isUnwind);
             if (exception != null) {
                 exception.setSuspendedEvent(suspendedEvent);
             }
@@ -1303,22 +1380,15 @@ public final class DebuggerSession implements Closeable {
             return newReturnValue;
         }
 
-        SteppingStrategy strategy = suspendedEvent.getNextStrategy();
-        if (!strategy.isKill()) {
-            // suspend(...) has been called during SuspendedEvent notification. this is only
-            // possible in non-legacy mode.
-            SteppingStrategy currentStrategy = getSteppingStrategy(currentThread);
-            if (currentStrategy != null && !currentStrategy.isConsumed()) {
-                strategy = currentStrategy;
-            }
-        }
-        strategy.initialize(context, suspendAnchor);
-
+        AddStrategyUpdater addStrategy = new AddStrategyUpdater(suspendedEvent.getNextStrategy());
+        SteppingStrategy strategy = strategyMap.compute(currentThread, addStrategy);
         if (Debugger.TRACE) {
-            trace("end suspend with strategy %s at %s location %s", strategy, context, suspendAnchor);
+            trace("end suspend with strategy %s -> %s at %s location %s", currentStrategy, strategy, context, suspendAnchor);
         }
-
-        setSteppingStrategy(currentThread, strategy, true);
+        if (addStrategy.initializeNewStrategy) {
+            strategy.initialize(context, suspendAnchor);
+        }
+        updateStepping();
         if (strategy.isKill()) {
             performKill(context.getInstrumentedNode());
         } else if (strategy.isUnwind()) {
@@ -1327,6 +1397,53 @@ public final class DebuggerSession implements Closeable {
             throw unwind;
         }
         return newReturnValue;
+    }
+
+    /**
+     * This is used to update the {@link strategyMap} with a new {@link SteppingStrategy}. Depending
+     * on the existing strategy, we need to either replace, or merge the new strategy in.
+     */
+    private static class AddStrategyUpdater implements BiFunction<Thread, SteppingStrategy, SteppingStrategy> {
+
+        private final SteppingStrategy newStrategy;
+        private boolean initializeNewStrategy;
+
+        AddStrategyUpdater(SteppingStrategy newStrategy) {
+            this.newStrategy = newStrategy;
+        }
+
+        @Override
+        public SteppingStrategy apply(Thread t, SteppingStrategy existingStrategy) {
+            SteppingStrategy result;
+            if (existingStrategy == null || existingStrategy.isContinue() || existingStrategy.isConsumed()) {
+                result = newStrategy;
+                initializeNewStrategy = true;
+            } else if (newStrategy == null) {
+                result = existingStrategy;
+            } else {
+                result = mergeStrategies(existingStrategy);
+                initializeNewStrategy = true;
+            }
+            if (result == null) {
+                result = SteppingStrategy.createContinue();
+            }
+            return result;
+        }
+
+        private SteppingStrategy mergeStrategies(SteppingStrategy existingStrategy) {
+            assert existingStrategy != null;
+            assert newStrategy != null;
+            if (existingStrategy.isAlwaysHalt()) {
+                // AlwaysHalt, but not consumed yet. Bind the new strategy with a halt:
+                if (newStrategy.isContinue()) {
+                    return SteppingStrategy.createAlwaysHalt();
+                } else {
+                    return SteppingStrategy.createPreserveAndHalt(newStrategy);
+                }
+            } else {
+                return newStrategy;
+            }
+        }
     }
 
     private void performKill(Node location) {
@@ -1373,31 +1490,42 @@ public final class DebuggerSession implements Closeable {
 
     private List<DebuggerNode> collectDebuggerNodes(Node iNode, SuspendAnchor suspendAnchor) {
         List<DebuggerNode> nodes = new ArrayList<>();
-        for (EventBinding<?> binding : allBindings) {
-            DebuggerNode node = (DebuggerNode) debugger.getInstrumenter().lookupExecutionEventNode(iNode, binding);
-            if (node != null && node.isActiveAt(suspendAnchor)) {
-                nodes.add(node);
+        synchronized (allBindings) {
+            // allBindings is a synchronized set, but we still need to synchronize
+            // iteration against manipulations, to avoid ConcurrentModificationExceptions
+            for (EventBinding<?> binding : allBindings) {
+                DebuggerNode node = (DebuggerNode) debugger.getInstrumenter().lookupExecutionEventNode(iNode, binding);
+                if (node != null && node.isActiveAt(suspendAnchor)) {
+                    nodes.add(node);
+                }
             }
         }
         return nodes;
     }
 
     private synchronized SteppingStrategy notifyNewThread(Thread currentThread) {
-        SteppingStrategy s = getSteppingStrategy(currentThread);
-        // double checked locking
-        if (s == null) {
-            if (suspendAll) {
-                // all suspended
-                s = SteppingStrategy.createAlwaysHalt();
-            } else {
-                // not suspended continue execution for this thread
-                s = SteppingStrategy.createContinue();
-            }
-            setSteppingStrategy(currentThread, s, true);
-        }
+        SteppingStrategy s = strategyMap.computeIfAbsent(currentThread, newThreadStrategy);
         assert s != null;
         return s;
 
+    }
+
+    /**
+     * When a new thread is detected, this stepping strategy is applied. When {@code suspendAll} is
+     * set, it assures that the thread is suspended.
+     */
+    private final class NewThreadStrategyProvider implements Function<Thread, SteppingStrategy> {
+
+        @Override
+        public SteppingStrategy apply(Thread t) {
+            if (suspendAll) {
+                // all suspended
+                return SteppingStrategy.createAlwaysHalt();
+            } else {
+                // not suspended continue execution for this thread
+                return SteppingStrategy.createContinue();
+            }
+        }
     }
 
     /**
@@ -1449,7 +1577,7 @@ public final class DebuggerSession implements Closeable {
             throw new IllegalArgumentException("Cannot evaluate in context using a without an associated TruffleLanguage.");
         }
 
-        final Source source = Source.newBuilder(info.getId(), code, "eval in context").internal(true).build();
+        final Source source = Source.newBuilder(info.getId(), code, "eval in context").internal(false).build();
         ExecutableNode fragment = ev.getSession().getDebugger().getEnv().parseInline(source, node, frame);
         if (fragment != null) {
             ev.getInsertableNode().setParentOf(fragment);
@@ -1458,7 +1586,20 @@ public final class DebuggerSession implements Closeable {
             if (!info.isInteractive()) {
                 throw new IllegalStateException("Can not evaluate in a non-interactive language.");
             }
-            return Debugger.ACCESSOR.evalInContext(source, node, frame);
+            try {
+                CallTarget target = ev.getSession().getDebugger().getEnv().parse(source);
+                if (target instanceof RootCallTarget) {
+                    RootNode exec = ((RootCallTarget) target).getRootNode();
+                    return exec.execute(frame);
+                } else {
+                    throw new IllegalStateException("" + target);
+                }
+            } catch (Exception ex) {
+                if (ex instanceof RuntimeException) {
+                    throw (RuntimeException) ex;
+                }
+                throw new RuntimeException(ex);
+            }
         }
     }
 
@@ -1471,7 +1612,7 @@ public final class DebuggerSession implements Closeable {
         final MaterializedFrame frame;
 
         Caller(FrameInstance frameInstance) {
-            this.node = frameInstance.getCallNode();
+            this.node = frameInstance.getInstrumentableCallNode();
             this.frame = frameInstance.getFrame(FrameAccess.MATERIALIZE).materialize();
         }
 
@@ -1531,6 +1672,38 @@ public final class DebuggerSession implements Closeable {
         }
 
         @Override
+        protected void onYield(VirtualFrame frame, Object value) {
+            if (stepping.get()) {
+                doYield(frame.materialize());
+                doStepAfter(frame.materialize(), value);
+            }
+        }
+
+        @TruffleBoundary
+        private void doYield(MaterializedFrame frame) {
+            SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
+            if (steppingStrategy != null) {
+                steppingStrategy.setYieldBreak(frame, context.getInstrumentedSourceSection());
+            }
+        }
+
+        @Override
+        protected void onResume(VirtualFrame frame) {
+            if (stepping.get()) {
+                doYieldResume(frame.materialize());
+                doStepBefore(frame.materialize());
+            }
+        }
+
+        @TruffleBoundary
+        private void doYieldResume(MaterializedFrame frame) {
+            SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
+            if (steppingStrategy != null) {
+                steppingStrategy.setYieldResume(context, frame);
+            }
+        }
+
+        @Override
         protected void onInputValue(VirtualFrame frame, EventContext inputContext, int inputIndex, Object inputValue) {
             if (stepping.get() && hasExpressionElement) {
                 saveInputValue(frame, inputIndex, inputValue);
@@ -1540,8 +1713,14 @@ public final class DebuggerSession implements Closeable {
         @TruffleBoundary
         private void doStepBefore(MaterializedFrame frame) {
             SuspendAnchor anchor = SuspendAnchor.BEFORE;
-            SteppingStrategy steppingStrategy;
-            if (suspendNext || suspendAll || (steppingStrategy = getSteppingStrategy(Thread.currentThread())) != null && steppingStrategy.isActiveOnStepTo(context, anchor)) {
+            boolean doCallback;
+            if (suspendNext || suspendAll) {
+                doCallback = isSteppingEnabledOnCurrentThread();
+            } else {
+                SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
+                doCallback = steppingStrategy != null && isSteppingEnabledOnCurrentThread() && steppingStrategy.isActiveOnStepTo(context, anchor);
+            }
+            if (doCallback) {
                 notifyCallback(context, this, frame, anchor, null, null, null, null);
             }
         }
@@ -1550,7 +1729,7 @@ public final class DebuggerSession implements Closeable {
         protected final Object doStepAfter(MaterializedFrame frame, Object result) {
             SuspendAnchor anchor = SuspendAnchor.AFTER;
             SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
-            if (steppingStrategy != null && steppingStrategy.isActiveOnStepTo(context, anchor)) {
+            if (steppingStrategy != null && isSteppingEnabledOnCurrentThread() && steppingStrategy.isActiveOnStepTo(context, anchor)) {
                 return notifyCallback(context, this, frame, anchor, this, result, null, null);
             }
             return result;
@@ -1665,6 +1844,32 @@ public final class DebuggerSession implements Closeable {
             }
         }
 
+        @Override
+        protected void onYield(VirtualFrame frame, Object value) {
+            if (stepping.get()) {
+                doReturn(frame.materialize(), value);
+            }
+        }
+
+        @Override
+        protected void onResume(VirtualFrame frame) {
+            if (stepping.get()) {
+                doYieldResume(frame.materialize());
+                if (hasRootElement) {
+                    super.onEnter(frame);
+                }
+            }
+        }
+
+        @TruffleBoundary
+        private void doYieldResume(MaterializedFrame frame) {
+            SteppingStrategy steppingStrategy = getSteppingStrategy(Thread.currentThread());
+            if (steppingStrategy != null) {
+                steppingStrategy.setYieldResume(context, frame);
+                steppingStrategy.notifyCallEntry();
+            }
+        }
+
         @TruffleBoundary
         private void doReturn() {
             SteppingStrategy steppingStrategy = strategyMap.get(Thread.currentThread());
@@ -1738,9 +1943,9 @@ class DebuggerSessionSnippets {
 
     @SuppressFBWarnings("")
     public void example() {
-        // @formatter:off
+        // @formatter:off // @replace regex='.*' replacement=''
         TruffleInstrument.Env instrumentEnv = null;
-        // BEGIN: DebuggerSessionSnippets#example
+        // @start region="DebuggerSessionSnippets#example"
         try (DebuggerSession session = Debugger.find(instrumentEnv).
                         startSession(new SuspendedCallback() {
             public void onSuspend(SuspendedEvent event) {
@@ -1754,7 +1959,7 @@ class DebuggerSessionSnippets {
             // install line breakpoint
             session.install(Breakpoint.newBuilder(someCode).lineIs(3).build());
         }
-        // END: DebuggerSessionSnippets#example
-        // @formatter:on
+        // @end region="DebuggerSessionSnippets#example"
+        // @formatter:on // @replace regex='.*' replacement=''
     }
 }

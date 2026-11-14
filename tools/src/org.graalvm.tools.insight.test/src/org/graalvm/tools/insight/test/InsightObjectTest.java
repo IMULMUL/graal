@@ -25,6 +25,7 @@
 package org.graalvm.tools.insight.test;
 
 import com.oracle.truffle.api.exception.AbstractTruffleException;
+import com.oracle.truffle.api.instrumentation.StandardTags;
 import com.oracle.truffle.api.instrumentation.test.InstrumentationTestLanguage;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
@@ -44,6 +45,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import org.graalvm.polyglot.Context;
@@ -580,6 +582,57 @@ public class InsightObjectTest {
     }
 
     @Test
+    public void readWriteVariables() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            Value agent = InsightObjectFactory.readInsight(c, null);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+
+            // @formatter:off
+            Source sampleScript = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(do_mul,\n" +
+                "    ARGUMENT(a),\n" +
+                "    ARGUMENT(b),\n" +
+                "    EXPRESSION\n" +
+                "  ),\n" +
+                "  DEFINE(mul,\n" +
+                "    ARGUMENT(a),\n" +
+                "    ARGUMENT(b),\n" +
+                "    CALL_WITH(do_mul, 1, READ_VAR(a), READ_VAR(b))\n" +
+                "  ),\n" +
+                "  CALL(mul, CONSTANT(6), CONSTANT(7))\n" +
+                ")",
+                "readWriteVars.px"
+            ).build();
+            // @formatter:on
+
+            Set<String> actions = new TreeSet<>();
+            final InsightAPI.OnEventHandler captureNames = (ctx, frame) -> {
+                final Map<String, Object> attrs = ctx.attributes();
+                if (attrs != null) {
+                    var readName = attrs.get(StandardTags.ReadVariableTag.NAME);
+                    if (readName != null) {
+                        actions.add("read:" + readName);
+                    }
+                    var writeName = attrs.get(StandardTags.WriteVariableTag.NAME);
+                    if (writeName != null) {
+                        actions.add("write:" + writeName);
+                    }
+                }
+            };
+            final InsightAPI.OnConfig cfg = createConfig(false, false, false, "mul.*", null);
+            cfg.reads = true;
+            cfg.writes = true;
+            agentAPI.on("enter", captureNames, cfg);
+            c.eval(sampleScript);
+            agentAPI.off("enter", captureNames);
+
+            Assert.assertArrayEquals("Reads and writes recorded", new Object[]{"read:a", "read:b", "write:a", "write:b"}, actions.toArray());
+        }
+    }
+
+    @Test
     public void accessFrameVariables() throws Exception {
         try (Context c = InsightObjectFactory.newContext()) {
             Value agent = InsightObjectFactory.readInsight(c, null);
@@ -770,6 +823,53 @@ public class InsightObjectTest {
     }
 
     @Test
+    public void closeOfInsightHandleIsChecked() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            AutoCloseable[] handle = {null};
+            Value agent = InsightObjectFactory.readInsight(c, null, handle);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+
+            // @formatter:off
+            Source sampleScript = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(meaning,\n" +
+                "    EXPRESSION(\n" +
+                "      CONSTANT(6),\n" +
+                "      CONSTANT(7)\n" +
+                "    )\n" +
+                "  ),\n" +
+                "  CALL(meaning)\n" +
+                ")",
+                "sample.px"
+            ).build();
+            // @formatter:on
+
+            final InsightAPI.OnEventHandler return42 = (ctx, frame) -> {
+                try {
+                    ctx.returnValue(Collections.emptyMap());
+                } catch (RuntimeException ex) {
+                    assertTrue("Expecting TruffleException: " + ex, ex instanceof AbstractTruffleException);
+                }
+                ctx.returnNow(42);
+            };
+            agentAPI.on("return", return42, createConfig(true, false, false, "meaning.*", null));
+            Value fourtyTwo = c.eval(sampleScript);
+            assertEquals(42, fourtyTwo.asInt());
+            handle[0].close();
+            Value sixSeven = c.eval(sampleScript);
+            assertEquals("Hook is no longer active", "(6+7)", sixSeven.asString());
+
+            try {
+                agentAPI.on("enter", return42, createConfig(true, false, false, "meaning.*", null));
+                fail("Expecting exception");
+            } catch (PolyglotException ex) {
+                assertEquals("insight: The script has already been closed", ex.getMessage());
+            }
+        }
+    }
+
+    @Test
     public void unknownLanguageCall() throws Exception {
         try (Context c = InsightObjectFactory.newContext()) {
             Instrument insight = c.getEngine().getInstruments().get(Insight.ID);
@@ -797,6 +897,7 @@ public class InsightObjectTest {
 
             @SuppressWarnings("unchecked")
             Object script = insight.lookup(Function.class).apply(insightScript);
+            assertNotNull("Handle returned", script);
 
             try {
                 Value fourtyTwo = c.eval(sampleScript);
@@ -897,6 +998,209 @@ public class InsightObjectTest {
             c.eval(s3);
             assertEquals("Third added", 3, stackTraces.size());
             assertEquals("s1.px", stackTraces.get(2).source().name());
+        }
+    }
+
+    @Test
+    public void onEnterAtSourcePathTest() throws Exception {
+        onEnterAtTest(false);
+    }
+
+    @Test
+    public void onEnterAtURITest() throws Exception {
+        onEnterAtTest(true);
+    }
+
+    private static void onEnterAtTest(boolean atURI) throws Exception {
+        for (int line = 3; line <= 7; line++) {
+            try (Context c = InsightObjectFactory.newContext()) {
+                Value agent = InsightObjectFactory.readInsight(c, null);
+                InsightAPI agentAPI = agent.as(InsightAPI.class);
+                Assert.assertNotNull("Agent API obtained", agentAPI);
+
+                // @formatter:off
+                Source sampleScript = Source.newBuilder(InstrumentationTestLanguage.ID,
+                    "ROOT(\n" +
+                    "  DEFINE(foo,\n" +
+                    "\n" +
+                    "    LOOP(10, STATEMENT(EXPRESSION,EXPRESSION)),\n" +
+                    "\n" +
+                    "    LOOP(10, STATEMENT(EXPRESSION,EXPRESSION))\n" +
+                    "  ),\n" +
+                    "  CALL(foo)\n" +
+                    ")",
+                    "sample.px"
+                ).build();
+                // @formatter:on
+
+                AtomicInteger hitCount = new AtomicInteger();
+                String[] functionName = {null};
+                final InsightAPI.OnEventHandler listener = (ctx, frame) -> {
+                    hitCount.incrementAndGet();
+                    functionName[0] = ctx.name();
+                };
+                if (atURI) {
+                    agentAPI.on("enter", listener, InsightObjectFactory.createConfig(false, true, false, null, null, sampleScript.getURI().toString(), line, null));
+                } else {
+                    agentAPI.on("enter", listener, InsightObjectFactory.createConfig(false, true, false, null, "sample.px", null, line, null));
+                }
+
+                c.eval(sampleScript);
+
+                assertEquals("Statements hit (line " + line + ")", 10, hitCount.get());
+                assertEquals("Function foo has been called", "foo", functionName[0]);
+
+                agentAPI.off("enter", listener);
+            }
+        }
+    }
+
+    @Test
+    public void onEnterAtNoSourceTest() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            Value agent = InsightObjectFactory.readInsight(c, null);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+            try {
+                agentAPI.on("enter", (ctx, frame) -> {
+                }, InsightObjectFactory.createConfig(false, true, false, null, null, null, 1, null));
+                fail();
+            } catch (PolyglotException ex) {
+                assertEquals("java.lang.IllegalArgumentException: Neither sourceURI nor sourcePath is defined. A source specification is expected.", ex.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void onEnterAtBothSourceTest() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            Value agent = InsightObjectFactory.readInsight(c, null);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+            try {
+                agentAPI.on("enter", (ctx, frame) -> {
+                }, InsightObjectFactory.createConfig(false, true, false, null, "sample.px", "file:///sample.px", 1, null));
+                fail();
+            } catch (PolyglotException ex) {
+                assertEquals("java.lang.IllegalArgumentException: Both sourceURI and sourcePath is defined. Only one source specification is expected.", ex.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void onEnter2FilesTest() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            Value agent = InsightObjectFactory.readInsight(c, null);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+
+            // @formatter:off
+            Source sampleScript1 = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(foo,\n" +
+                "    LOOP(10, STATEMENT(EXPRESSION,EXPRESSION))\n" +
+                "  ),\n" +
+                "  CALL(foo)\n" +
+                ")",
+                "sample1.px"
+            ).build();
+            // @formatter:on
+
+            AtomicInteger hitCount = new AtomicInteger();
+            StringBuilder functionNames = new StringBuilder();
+            final InsightAPI.OnEventHandler listener = (ctx, frame) -> {
+                hitCount.incrementAndGet();
+                if (!functionNames.toString().endsWith(ctx.name())) {
+                    if (functionNames.length() > 0) {
+                        functionNames.append(", ");
+                    }
+                    functionNames.append(ctx.name());
+                }
+            };
+            // One listener for both sources
+            agentAPI.on("enter", listener, InsightObjectFactory.createConfig(false, true, false, null, "sample.\\.px", null, 3, null));
+
+            c.eval(sampleScript1);
+
+            // @formatter:off
+            Source sampleScript2 = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(foo2,\n" +
+                "    LOOP(2, STATEMENT(EXPRESSION,EXPRESSION))\n" +
+                "  ),\n" +
+                "  CALL(foo2)\n" +
+                ")",
+                "sample2.px"
+            ).build();
+            // @formatter:on
+
+            c.eval(sampleScript2);
+
+            assertEquals("Statements hit", 12, hitCount.get());
+            assertEquals("Functions were called", "foo, foo2", functionNames.toString());
+
+            agentAPI.off("enter", listener);
+        }
+    }
+
+    @Test
+    public void onEnter2FilesTest2() throws Exception {
+        try (Context c = InsightObjectFactory.newContext()) {
+            Value agent = InsightObjectFactory.readInsight(c, null);
+            InsightAPI agentAPI = agent.as(InsightAPI.class);
+            Assert.assertNotNull("Agent API obtained", agentAPI);
+
+            // @formatter:off
+            Source sampleScript1 = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(foo,\n" +
+                "    LOOP(10, STATEMENT(EXPRESSION,EXPRESSION))\n" +
+                "  ),\n" +
+                "  CALL(foo)\n" +
+                ")",
+                "sample1.px"
+            ).build();
+            // @formatter:on
+
+            // One listener per source
+            AtomicInteger hitCount = new AtomicInteger();
+            final InsightAPI.OnEventHandler listener1 = (ctx, frame) -> {
+                assertEquals("foo", ctx.name());
+                hitCount.incrementAndGet();
+            };
+            agentAPI.on("enter", listener1, InsightObjectFactory.createConfig(false, true, false, null, "sample1\\.px", null, 3, null));
+            final InsightAPI.OnEventHandler listener2 = (ctx, frame) -> {
+                assertEquals("foo2", ctx.name());
+                hitCount.incrementAndGet();
+            };
+            agentAPI.on("enter", listener2, InsightObjectFactory.createConfig(false, true, false, null, "sample2\\.px", null, 3, null));
+
+            c.eval(sampleScript1);
+
+            // @formatter:off
+            Source sampleScript2 = Source.newBuilder(InstrumentationTestLanguage.ID,
+                "ROOT(\n" +
+                "  DEFINE(foo2,\n" +
+                "    LOOP(2, STATEMENT(EXPRESSION,EXPRESSION))\n" +
+                "  ),\n" +
+                "  CALL(foo2)\n" +
+                ")",
+                "sample2.px"
+            ).build();
+            // @formatter:on
+
+            c.eval(sampleScript2);
+
+            assertEquals("Statements hit", 12, hitCount.get());
+
+            agentAPI.off("enter", listener1);
+            c.eval(sampleScript1);
+            c.eval(sampleScript2);
+            assertEquals("Statements hit", 14, hitCount.get());
+            agentAPI.off("enter", listener2);
+            c.eval(sampleScript1);
+            c.eval(sampleScript2);
+            assertEquals("Statements hit", 14, hitCount.get());
         }
     }
 

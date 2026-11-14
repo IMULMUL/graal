@@ -24,20 +24,20 @@
  */
 package com.oracle.svm.core.graal.aarch64;
 
-import org.graalvm.compiler.asm.aarch64.AArch64Address;
-import org.graalvm.compiler.asm.aarch64.AArch64Assembler;
-import org.graalvm.compiler.asm.aarch64.AArch64MacroAssembler;
-import org.graalvm.compiler.asm.aarch64.AArch64MacroAssembler.ScratchRegister;
-import org.graalvm.compiler.lir.LIRInstructionClass;
-import org.graalvm.compiler.lir.aarch64.AArch64LIRInstruction;
-import org.graalvm.compiler.lir.asm.CompilationResultBuilder;
-
 import com.oracle.svm.core.ReservedRegisters;
-import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.nodes.SafepointCheckNode;
+import com.oracle.svm.core.thread.RecurringCallbackSupport;
 import com.oracle.svm.core.thread.Safepoint;
-import com.oracle.svm.core.thread.ThreadingSupportImpl;
+import com.oracle.svm.core.thread.SafepointCheckCounter;
+import com.oracle.svm.core.thread.SafepointSlowpath;
 
+import jdk.graal.compiler.asm.aarch64.AArch64Address;
+import jdk.graal.compiler.asm.aarch64.AArch64Assembler;
+import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
+import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler.ScratchRegister;
+import jdk.graal.compiler.lir.LIRInstructionClass;
+import jdk.graal.compiler.lir.aarch64.AArch64LIRInstruction;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.vm.ci.code.Register;
 
 /**
@@ -46,28 +46,39 @@ import jdk.vm.ci.code.Register;
 public class AArch64SafepointCheckOp extends AArch64LIRInstruction {
 
     public static final LIRInstructionClass<AArch64SafepointCheckOp> TYPE = LIRInstructionClass.create(AArch64SafepointCheckOp.class);
+    static final int COUNTER_SIZE = 32;
 
-    protected AArch64SafepointCheckOp() {
+    public AArch64SafepointCheckOp() {
         super(TYPE);
+    }
+
+    static AArch64Address counterAddress() {
+        return AArch64Address.createImmediateAddress(COUNTER_SIZE, AArch64Address.AddressingMode.IMMEDIATE_UNSIGNED_SCALED,
+                        ReservedRegisters.singleton().getThreadRegister(),
+                        SafepointCheckCounter.getThreadLocalOffset());
     }
 
     @Override
     public void emitCode(CompilationResultBuilder crb, AArch64MacroAssembler masm) {
-        assert SubstrateOptions.MultiThreaded.getValue();
-        int safepointSize = 32; // safepoint is an integer
-        AArch64Address safepointAddress = AArch64Address.createImmediateAddress(safepointSize, AArch64Address.AddressingMode.IMMEDIATE_UNSIGNED_SCALED,
-                        ReservedRegisters.singleton().getThreadRegister(),
-                        Math.toIntExact(Safepoint.getThreadLocalSafepointRequestedOffset()));
+        AArch64Address safepointAddress = counterAddress();
         try (ScratchRegister scratchRegister = masm.getScratchRegister()) {
             Register scratch = scratchRegister.getRegister();
-            masm.ldr(safepointSize, scratch, safepointAddress);
-            masm.subs(safepointSize, scratch, scratch, 1);
-            if (ThreadingSupportImpl.isRecurringCallbackSupported()) {
-                masm.str(safepointSize, scratch, safepointAddress);
+            masm.ldr(COUNTER_SIZE, scratch, safepointAddress);
+            if (RecurringCallbackSupport.isEnabled()) {
+                /* Before subtraction, the counter is compared against 1. */
+                masm.subs(COUNTER_SIZE, scratch, scratch, 1);
+                masm.str(COUNTER_SIZE, scratch, safepointAddress);
+            } else {
+                /* Counter is compared against 0. */
+                masm.compare(COUNTER_SIZE, scratch, 0);
             }
         }
     }
 
+    /**
+     * The slow path should be entered when the counter is <= 0. See classes {@link Safepoint} and
+     * {@link SafepointSlowpath} for more details about safepoint orchestration.
+     */
     public AArch64Assembler.ConditionFlag getConditionFlag() {
         return AArch64Assembler.ConditionFlag.LE;
     }

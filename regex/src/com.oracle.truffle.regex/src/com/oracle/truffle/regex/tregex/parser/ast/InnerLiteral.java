@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,8 @@
  */
 package com.oracle.truffle.regex.tregex.parser.ast;
 
-import com.oracle.truffle.regex.tregex.string.AbstractString;
+import com.oracle.truffle.api.strings.TruffleString;
+import com.oracle.truffle.regex.tregex.string.AbstractStringBuffer;
 
 /**
  * Represents a literal string inside the regular expression that can be searched for before
@@ -48,40 +49,43 @@ import com.oracle.truffle.regex.tregex.string.AbstractString;
  */
 public class InnerLiteral {
 
-    private final AbstractString literal;
-    private final AbstractString mask;
+    private final TruffleString literal;
+    private final TruffleString.WithMask mask;
     private final int maxPrefixSize;
+    private final int encodedLength;
 
-    public InnerLiteral(AbstractString literal, AbstractString mask, int maxPrefixSize) {
-        this.literal = literal;
-        this.mask = mask;
+    public InnerLiteral(AbstractStringBuffer literal, AbstractStringBuffer mask, int maxPrefixSize) {
         this.maxPrefixSize = maxPrefixSize;
+        this.encodedLength = literal.length();
+        this.literal = literal.asTString();
+        this.mask = mask == null ? null : mask.asTStringMask(this.literal);
     }
 
-    /**
-     * The literal string.
-     */
-    public AbstractString getLiteral() {
+    public TruffleString getLiteral() {
         return literal;
     }
 
     /**
      * An optional mask for matching the string in ignore-case mode.
      */
-    public AbstractString getMask() {
+    public TruffleString.WithMask getMask() {
         return mask;
     }
 
-    public Object getMaskContent() {
-        return mask == null ? null : mask.content();
+    public boolean hasMask() {
+        return mask != null;
     }
 
     /**
      * The maximum number of code points the regular expression may match before matching this
      * literal. Example: the inner literal of {@code /a?b/} is {@code "b"}, with a max prefix size
-     * of {@code 1}.
+     * of {@code 1}. If there are loops in the prefix, returns {@code -1}.
      */
     public int getMaxPrefixSize() {
         return maxPrefixSize;
+    }
+
+    public int getEncodedLength() {
+        return encodedLength;
     }
 }

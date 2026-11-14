@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,23 +24,23 @@
  */
 package com.oracle.truffle.tools.dap.test;
 
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
-
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.graalvm.polyglot.Context;
@@ -48,6 +48,9 @@ import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.Instrument;
 import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONException;
+import org.graalvm.shadowed.org.json.JSONObject;
 import org.junit.Assert;
 
 public final class DAPTester {
@@ -62,30 +65,61 @@ public final class DAPTester {
     private final Context context;
     private Future<Value> lastValue;
 
-    private DAPTester(DAPSessionHandler handler, Engine engine) {
+    private DAPTester(DAPSessionHandler handler, Context context) {
         this.handler = handler;
-        this.context = Context.newBuilder().engine(engine).allowAllAccess(true).build();
+        this.context = context;
     }
 
     public static DAPTester start(boolean suspend) throws IOException {
+        return start(suspend, null);
+    }
+
+    public static DAPTester start(boolean suspend, Consumer<Context> prolog) throws IOException {
+        return start(suspend, prolog, Collections.emptyList());
+    }
+
+    public static DAPTester start(boolean suspend, Consumer<Context> prolog, List<URI> sourcePath) throws IOException {
+        return start(suspend, prolog, sourcePath, Collections.emptyMap());
+    }
+
+    public static DAPTester start(boolean suspend, Consumer<Context> prolog, List<URI> sourcePath, Map<String, String> options) throws IOException {
         final ProxyOutputStream err = new ProxyOutputStream(System.err);
         Engine engine = Engine.newBuilder().err(err).build();
+        Context context = Context.newBuilder().engine(engine).options(options).allowAllAccess(true).build();
+        Runnable runProlog;
+        if (prolog != null) {
+            runProlog = () -> prolog.accept(context);
+        } else {
+            runProlog = null;
+        }
         Instrument testInstrument = engine.getInstruments().get(DAPTestInstrument.ID);
         DAPSessionHandlerProvider sessionHandlerProvider = testInstrument.lookup(DAPSessionHandlerProvider.class);
-        DAPSessionHandler sessionHandler = sessionHandlerProvider.getSessionHandler(suspend, false, false);
-        return new DAPTester(sessionHandler, engine);
+        DAPSessionHandler sessionHandler = sessionHandlerProvider.getSessionHandler(suspend, false, false, runProlog, sourcePath);
+        return new DAPTester(sessionHandler, context);
+    }
+
+    Context getContext() {
+        return context;
     }
 
     public void finish() throws IOException {
+        finish(true);
+    }
+
+    public void finish(boolean success) throws IOException {
         if (!lastValue.isDone()) {
             try {
-                lastValue.get(1, TimeUnit.SECONDS);
-            } catch (TimeoutException ex) {
-                if (handler.getInputStream().available() > 0) {
-                    Assert.fail("Additional message available: " + getMessage());
+                lastValue.get();
+                if (!success) {
+                    throw new AssertionError("Finished successfully, but expected to fail.");
                 }
-                Assert.fail("Last eval(...) has not finished yet");
-            } catch (InterruptedException | ExecutionException ex) {
+            } catch (InterruptedException ex) {
+                throw new AssertionError("Last eval(...) has not finished yet", ex);
+            } catch (ExecutionException ex) {
+                // Guest language execution failed
+                if (success) {
+                    throw new AssertionError(ex);
+                }
             }
         }
         if (handler.getInputStream().available() > 0) {
@@ -94,8 +128,23 @@ public final class DAPTester {
     }
 
     public Future<Value> eval(Source source) {
+        return eval(source, true);
+    }
+
+    public Future<Value> eval(Source source, boolean logException) {
         lastValue = CompletableFuture.supplyAsync(() -> {
-            return context.eval(source);
+            try {
+                return context.eval(source);
+            } catch (Throwable t) {
+                // Async exceptions are not visible till we check the future.
+                // We might never check the future
+                // if we're blocked by waiting for an expected output,
+                // which does not come due to the exception.
+                if (logException) {
+                    t.printStackTrace(System.err);
+                }
+                throw t;
+            }
         }, executor);
         return lastValue;
     }
@@ -111,7 +160,7 @@ public final class DAPTester {
         return new String(readMessageBytes(handler.getInputStream()));
     }
 
-    private static byte[] readMessageBytes(InputStream in) throws IOException {
+    static byte[] readMessageBytes(InputStream in) throws IOException {
         StringBuilder line = new StringBuilder();
         int contentLength = -1;
         while (true) {
@@ -131,7 +180,7 @@ public final class DAPTester {
                 } else {
                     // Two consecutive newlines start the message content
                     if (contentLength < 0) {
-                        throw new IOException("Error while processing an incomming message: Missing header " + CONTENT_LENGTH_HEADER + " in input.");
+                        throw new IOException("Error while processing an incoming message: Missing header " + CONTENT_LENGTH_HEADER + " in input.");
                     } else {
                         // Read the message
                         byte[] buffer = new byte[contentLength];
@@ -154,7 +203,15 @@ public final class DAPTester {
     }
 
     public boolean compareReceivedMessages(String... messages) throws Exception {
-        List<JSONObject> expectedObjects = Arrays.stream(messages).map(message -> new JSONObject(message)).collect(Collectors.toList());
+        List<JSONObject> expectedObjects = Arrays.stream(messages).map(message -> {
+            JSONObject json;
+            try {
+                json = new JSONObject(message);
+            } catch (JSONException jex) {
+                throw new RuntimeException(message, jex);
+            }
+            return json;
+        }).collect(Collectors.toList());
         int size = expectedObjects.size();
         while (size > 0) {
             final String receivedMessage = getMessage();
@@ -166,7 +223,7 @@ public final class DAPTester {
                     break;
                 }
             }
-            Assert.assertFalse("Unexpected message received: " + receivedMessage, expectedObjects.size() == size);
+            Assert.assertFalse("Unexpected message received:\n" + receivedMessage + "\nExpected message:\n" + expectedObjects, expectedObjects.size() == size);
             size = expectedObjects.size();
         }
         return true;
@@ -216,6 +273,18 @@ public final class DAPTester {
             }
         }
         return true;
+    }
+
+    public static String getFilePath(File file) {
+        String path;
+        try {
+            path = file.getCanonicalPath();
+        } catch (IOException ex) {
+            path = file.getAbsolutePath();
+        }
+        // We need to escape backlash for correct JSON:
+        path = path.replace("\\", "\\\\");
+        return path;
     }
 
     private static final class ProxyOutputStream extends OutputStream {

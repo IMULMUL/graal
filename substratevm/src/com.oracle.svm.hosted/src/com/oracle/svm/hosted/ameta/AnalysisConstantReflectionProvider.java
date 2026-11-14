@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,266 +24,387 @@
  */
 package com.oracle.svm.hosted.ameta;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
+import java.util.Objects;
+import java.util.function.ObjIntConsumer;
 
-import org.graalvm.compiler.serviceprovider.GraalUnsafeAccess;
-import org.graalvm.compiler.word.Word;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.WordBase;
 
+import com.oracle.graal.pointsto.ObjectScanner;
+import com.oracle.graal.pointsto.heap.HostedValuesProvider;
+import com.oracle.graal.pointsto.heap.ImageHeapArray;
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapInstance;
+import com.oracle.graal.pointsto.heap.ImageHeapObjectArray;
+import com.oracle.graal.pointsto.heap.ImageHeapPrimitiveArray;
+import com.oracle.graal.pointsto.heap.ImageHeapRelocatableConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapScanner;
+import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.graal.pointsto.util.AnalysisError;
-import com.oracle.svm.core.RuntimeAssertionsSupport;
-import com.oracle.svm.core.annotate.InjectAccessors;
+import com.oracle.svm.core.classinitialization.TypeReachedProvider;
 import com.oracle.svm.core.graal.meta.SharedConstantReflectionProvider;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.meta.ReadableJavaField;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.hosted.classinitialization.SimulateClassInitializerSupport;
+import com.oracle.svm.hosted.meta.PatchedWordConstant;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
 
+import jdk.vm.ci.code.CodeUtil;
 import jdk.vm.ci.meta.Constant;
-import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MemoryAccessProvider;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 @Platforms(Platform.HOSTED_ONLY.class)
-public class AnalysisConstantReflectionProvider extends SharedConstantReflectionProvider {
+public class AnalysisConstantReflectionProvider extends SharedConstantReflectionProvider implements TypeReachedProvider {
     private final AnalysisUniverse universe;
-    private final ConstantReflectionProvider originalConstantReflection;
+    protected final UniverseMetaAccess metaAccess;
+    private final AnalysisMethodHandleAccessProvider methodHandleAccess;
     private final ClassInitializationSupport classInitializationSupport;
+    private SimulateClassInitializerSupport simulateClassInitializerSupport;
+    private final FieldValueInterceptionSupport fieldValueInterceptionSupport = FieldValueInterceptionSupport.singleton();
 
-    public AnalysisConstantReflectionProvider(AnalysisUniverse universe, ConstantReflectionProvider originalConstantReflection, ClassInitializationSupport classInitializationSupport) {
+    public AnalysisConstantReflectionProvider(AnalysisUniverse universe, UniverseMetaAccess metaAccess, ClassInitializationSupport classInitializationSupport) {
         this.universe = universe;
-        this.originalConstantReflection = originalConstantReflection;
+        this.metaAccess = metaAccess;
+        this.methodHandleAccess = new AnalysisMethodHandleAccessProvider(universe);
         this.classInitializationSupport = classInitializationSupport;
     }
 
     @Override
-    public MemoryAccessProvider getMemoryAccessProvider() {
-        return EmptyMemoryAcessProvider.SINGLETON;
+    public boolean canRepresentAsImageHeapOffset(JavaConstant constant) {
+        /*
+         * Relocatable constants are placeholders patched during execution startup rather than
+         * ordinary image heap constants whose offsets can be patched after image heap layout.
+         */
+        return constant instanceof ImageHeapConstant && !(constant instanceof ImageHeapRelocatableConstant);
     }
 
     @Override
-    public final JavaConstant readFieldValue(ResolvedJavaField field, JavaConstant receiver) {
-        return readValue((AnalysisField) field, receiver);
+    public int getImageHeapOffset(JavaConstant constant) {
+        throw VMError.shouldNotReachHere("Image heap offsets are only available during JIT compilation at run time: " + getClass().getName());
     }
 
-    public JavaConstant readValue(AnalysisField field, JavaConstant receiver) {
-        JavaConstant value;
-        if (classInitializationSupport.shouldInitializeAtRuntime(field.getDeclaringClass())) {
-            if (field.isStatic()) {
-                value = readUninitializedStaticValue(field);
-            } else {
-                /*
-                 * Classes that are initialized at run time must not have instances in the image
-                 * heap. Invoking instance methods would miss the class initialization checks. Image
-                 * generation should have been aborted earlier with a user-friendly message, this is
-                 * just a safeguard.
-                 */
-                throw VMError.shouldNotReachHere("Cannot read instance field of a class that is initialized at run time: " + field.format("%H.%n"));
-            }
+    @Override
+    public Boolean constantEquals(Constant x, Constant y) {
+        VMError.guarantee(!(x instanceof JavaConstant constant) || isExpectedJavaConstant(constant));
+        VMError.guarantee(!(y instanceof JavaConstant constant) || isExpectedJavaConstant(constant));
+        if (x == y) {
+            return true;
         } else {
-            value = universe.lookup(ReadableJavaField.readFieldValue(originalConstantReflection, field.wrapped, universe.toHosted(receiver)));
-        }
-
-        return interceptValue(field, value);
-    }
-
-    /*
-     * Static fields of classes that are initialized at run time have the default (uninitialized)
-     * value in the image heap. But there is one important exception:
-     *
-     * Fields that are static final and either primitive or of type String are initialized using the
-     * ConstantValue attribute of the class file, not using a class initializer. While we have class
-     * initializers available at run time, we no longer have the class files. So we need to preserve
-     * the values from the ConstantValue attribute in a different form. The easiest way is to just
-     * have these values as the default value of the static field in the image heap.
-     *
-     * Unfortunately, JVMCI does not allow us to access the default value: since the class is still
-     * uninitialized in the image generator, the JVMCI methods to read the field do not return a
-     * value. But the Java HotSpot VM actually already has the fields initialized to the values
-     * defined in the ConstantValue attributes. So reading the field via Unsafe actually produces
-     * the correct value that we want.
-     *
-     * Another complication are classes that are re-initialized at run time, i.e., initialized both
-     * during image generation and at run time. We must not return a value for a field that is
-     * initialized by a class initializer (that could be an arbitrary and wrong value from the image
-     * generator). Fortunately, the ConstantValue attribute is only used for static final fields of
-     * primitive types or the String type. By limiting the Unsafe read to these narrow cases, it is
-     * pretty likely (although not guaranteed) that we are not returning an unintended value for a
-     * class that is re-initialized at run time.
-     */
-    private static JavaConstant readUninitializedStaticValue(AnalysisField field) {
-        JavaKind kind = field.getJavaKind();
-
-        boolean canHaveConstantValueAttribute = kind.isPrimitive() || field.getType().toJavaName(true).equals("java.lang.String");
-        if (!canHaveConstantValueAttribute || !field.isFinal()) {
-            return JavaConstant.defaultForKind(kind);
-        }
-
-        assert Modifier.isStatic(field.getModifiers());
-
-        /* On HotSpot the base of a static field is the Class object. */
-        Object base = field.getDeclaringClass().getJavaClass();
-        long offset = field.wrapped.getOffset();
-
-        /*
-         * We cannot rely on the reflectionField because it can be null if there is some incomplete
-         * classpath issue or the field is either missing or hidden from reflection. However we can
-         * still use it to double check our assumptions.
-         */
-        Field reflectionField = field.getJavaField();
-        if (reflectionField != null) {
-            assert kind == JavaKind.fromJavaClass(reflectionField.getType());
-
-            Object reflectionFieldBase = GraalUnsafeAccess.getUnsafe().staticFieldBase(reflectionField);
-            long reflectionFieldOffset = GraalUnsafeAccess.getUnsafe().staticFieldOffset(reflectionField);
-
-            AnalysisError.guarantee(reflectionFieldBase == base && reflectionFieldOffset == offset);
-        }
-
-        switch (kind) {
-            case Boolean:
-                return JavaConstant.forBoolean(GraalUnsafeAccess.getUnsafe().getBoolean(base, offset));
-            case Byte:
-                return JavaConstant.forByte(GraalUnsafeAccess.getUnsafe().getByte(base, offset));
-            case Char:
-                return JavaConstant.forChar(GraalUnsafeAccess.getUnsafe().getChar(base, offset));
-            case Short:
-                return JavaConstant.forShort(GraalUnsafeAccess.getUnsafe().getShort(base, offset));
-            case Int:
-                return JavaConstant.forInt(GraalUnsafeAccess.getUnsafe().getInt(base, offset));
-            case Long:
-                return JavaConstant.forLong(GraalUnsafeAccess.getUnsafe().getLong(base, offset));
-            case Float:
-                return JavaConstant.forFloat(GraalUnsafeAccess.getUnsafe().getFloat(base, offset));
-            case Double:
-                return JavaConstant.forDouble(GraalUnsafeAccess.getUnsafe().getDouble(base, offset));
-            case Object:
-                Object value = GraalUnsafeAccess.getUnsafe().getObject(base, offset);
-                assert value == null || value instanceof String : "String is currently the only specified object type for the ConstantValue class file attribute";
-                return SubstrateObjectConstant.forObject(value);
-            default:
-                throw VMError.shouldNotReachHere();
+            return x.equals(y);
         }
     }
 
-    public JavaConstant interceptValue(AnalysisField field, JavaConstant value) {
-        JavaConstant result = value;
-        if (result != null) {
-            result = filterInjectedAccessor(field, result);
-            result = replaceObject(result);
-            result = interceptAssertionStatus(field, result);
-            result = interceptWordType(field, result);
+    @Override
+    public int identityHashCode(JavaConstant constant) {
+        JavaKind kind = Objects.requireNonNull(constant).getJavaKind();
+        if (kind != JavaKind.Object) {
+            throw new IllegalArgumentException("Constant has unexpected kind " + kind + ": " + constant);
         }
-        return result;
-    }
+        if (constant.isNull()) {
+            /* System.identityHashCode is specified to return 0 when passed null. */
+            return 0;
+        } else if (constant instanceof PatchedWordConstant) {
+            /* Kind of a primitive constant, so it does not have an identity hash code. */
+            throw new IllegalArgumentException("PatchedWordConstant has no identity hash code: " + constant);
+        }
 
-    private static JavaConstant filterInjectedAccessor(AnalysisField field, JavaConstant value) {
-        if (field.getAnnotation(InjectAccessors.class) != null) {
+        ImageHeapConstant imageHeapConstant = (ImageHeapConstant) constant;
+        if (imageHeapConstant.hasIdentityHashCode()) {
             /*
-             * Fields whose accesses are intercepted by injected accessors are not actually present
-             * in the image. Ideally they should never be read, but there are corner cases where
-             * this happens. We intercept the value and return 0 / null.
+             * If the ImageHeapConstant already has a hash code, that value has precedence over the
+             * hosted object.
              */
-            assert !field.isAccessed();
-            return JavaConstant.defaultForKind(value.getJavaKind());
+            return imageHeapConstant.getIdentityHashCode();
         }
-        return value;
+
+        Object hostedObject = Objects.requireNonNull(universe.getSnippetReflection().asObject(Object.class, constant));
+        if (hostedObject instanceof DynamicHub hub) {
+            /*
+             * We need to use the identity hash code of the original java.lang.Class object and not
+             * of the DynamicHub, so that hash maps that are filled during image generation and use
+             * Class keys still work at run time.
+             */
+            hostedObject = hub.getHostedJavaClass();
+        }
+        return System.identityHashCode(hostedObject);
+    }
+
+    @Override
+    public int makeIdentityHashCode(JavaConstant constant, int requestedValue) {
+        throw VMError.unimplemented("makeIdentityHashCode");
+    }
+
+    @Override
+    public MemoryAccessProvider getMemoryAccessProvider() {
+        return NonFoldingMemoryAccessProvider.SINGLETON;
+    }
+
+    @Override
+    public JavaConstant unboxPrimitive(JavaConstant source) {
+        if (!source.getJavaKind().isObject() || source.isNull()) {
+            return null;
+        }
+        ImageHeapConstant imageHeapConstant = (ImageHeapConstant) source;
+        /*
+         * Unbox by reading the known single field "value", which is a primitive field of the
+         * correct unboxed type.
+         */
+        AnalysisType type = imageHeapConstant.getType();
+        if (GuestAccess.get().isBoxingType(type.getWrapped())) {
+            imageHeapConstant.ensureReaderInstalled();
+            ResolvedJavaField[] fields = type.getInstanceFields(true);
+            assert fields.length == 1 && fields[0].getName().equals("value");
+            return ((ImageHeapInstance) imageHeapConstant).readFieldValue((AnalysisField) fields[0]);
+        }
+        /* Not a valid boxed primitive. */
+        return null;
+    }
+
+    @Override
+    public MethodHandleAccessProvider getMethodHandleAccess() {
+        return methodHandleAccess;
+    }
+
+    @Override
+    public Integer readArrayLength(JavaConstant array) {
+        if (array.getJavaKind() != JavaKind.Object || array.isNull()) {
+            return null;
+        }
+        VMError.guarantee(array instanceof ImageHeapConstant);
+        if (array instanceof ImageHeapArray heapArray) {
+            return heapArray.getLength();
+        }
+        return null;
+    }
+
+    @Override
+    public JavaConstant readArrayElement(JavaConstant array, int index) {
+        if (array.getJavaKind() != JavaKind.Object || array.isNull()) {
+            return null;
+        }
+        VMError.guarantee(array instanceof ImageHeapConstant);
+        if (array instanceof ImageHeapArray heapArray) {
+            if (index < 0 || index >= heapArray.getLength()) {
+                return null;
+            }
+            heapArray.ensureReaderInstalled();
+            JavaConstant element = heapArray.readElementValue(index);
+            return checkExpectedValue(element);
+        }
+        return null;
     }
 
     /**
-     * Run all registered object replacers.
+     * Attempts to read a value from an array that is not a full single array element. For example,
+     * the number of bytes to read ({@code accessBytes}) may differ from the array element size.
+     *
+     * @param accessBytes number of bytes to read from the array (1, 2, 4, or 8)
+     * @param accessedDataOffset offset in bytes, from the start of the first array element (not
+     *            from the beginning of the array object)
+     * @return a {@link JavaConstant} containing the read value
+     *
+     * @throws IllegalArgumentException if the value could not be read
      */
-    private JavaConstant replaceObject(JavaConstant value) {
-        if (value == JavaConstant.NULL_POINTER) {
-            return JavaConstant.NULL_POINTER;
+    public JavaConstant readArrayUnaligned(ImageHeapArray array, int accessBytes, long accessedDataOffset, int runtimeIndexScale) {
+        if (accessBytes < 1 || accessBytes > 8 || !CodeUtil.isPowerOf2(accessBytes)) {
+            throw new IllegalArgumentException(String.valueOf(accessBytes));
         }
-        if (value.getJavaKind() == JavaKind.Object) {
-            Object oldObject = universe.getSnippetReflection().asObject(Object.class, value);
-            Object newObject = universe.replaceObject(oldObject);
-            if (newObject != oldObject) {
-                return universe.getSnippetReflection().forObject(newObject);
+
+        if (array.getJavaKind() != JavaKind.Object) {
+            throw new IllegalArgumentException("Base of kind " + array.getJavaKind() + " is not supported.");
+        } else if (array.isNull()) {
+            throw new IllegalArgumentException("Base is null.");
+        }
+
+        if (array instanceof ImageHeapPrimitiveArray heapArray) {
+            /* Unaligned accesses are only allowed for primitive arrays. */
+            MetaAccessProvider originalMetaAccess = GuestAccess.get().getProviders().getMetaAccess();
+            JavaKind arrayKind = heapArray.getType().getComponentType().getJavaKind();
+            long hostedIndexScale = originalMetaAccess.getArrayIndexScale(arrayKind);
+            assert hostedIndexScale == runtimeIndexScale : "element size must match for primitive arrays";
+
+            /* Bounds check. */
+            long arrayDataSize = heapArray.getLength() * hostedIndexScale;
+            if (accessedDataOffset < 0 || accessedDataOffset + accessBytes > arrayDataSize) {
+                throw new IllegalArgumentException("Reading outside array bounds.");
+            }
+            if (accessedDataOffset > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("Offset is too large: " + accessedDataOffset);
+            }
+
+            heapArray.ensureReaderInstalled();
+            JavaKind readKind = switch (accessBytes) {
+                case 1 -> JavaKind.Byte;
+                case 2 -> JavaKind.Short;
+                case 4 -> JavaKind.Int;
+                case 8 -> JavaKind.Long;
+                default -> throw new IllegalArgumentException("Illegal accessBytes: " + accessBytes);
+            };
+            JavaConstant result = GuestAccess.get().readPrimitiveArrayUnaligned(heapArray.getArray(), readKind, (int) accessedDataOffset);
+            return checkExpectedValue(result);
+        } else if (array instanceof ImageHeapObjectArray) {
+            throw new IllegalArgumentException("Misaligned object read from array.");
+        } else {
+            throw VMError.shouldNotReachHere("Unexpected base: " + array.getClass());
+        }
+    }
+
+    public void forEachArrayElement(JavaConstant array, ObjIntConsumer<JavaConstant> consumer) {
+        VMError.guarantee(array instanceof ImageHeapConstant);
+        if (array instanceof ImageHeapArray heapArray) {
+            heapArray.ensureReaderInstalled();
+            for (int index = 0; index < heapArray.getLength(); index++) {
+                JavaConstant element = heapArray.readElementValue(index);
+                consumer.accept(checkExpectedValue(element), index);
             }
         }
+    }
+
+    private static JavaConstant checkExpectedValue(JavaConstant value) {
+        VMError.guarantee(isExpectedJavaConstant(value));
         return value;
     }
 
-    /**
-     * Intercept assertion status: the value of the field during image generation does not matter at
-     * all (because it is the hosted assertion status), we instead return the appropriate runtime
-     * assertion status. Field loads are also intrinsified early in
-     * {@link com.oracle.svm.hosted.phases.EarlyConstantFoldLoadFieldPlugin}, but we could still see
-     * such a field here if user code, e.g., accesses it via reflection.
-     */
-    private static JavaConstant interceptAssertionStatus(AnalysisField field, JavaConstant value) {
-        if (field.isStatic() && field.isSynthetic() && field.getName().startsWith("$assertionsDisabled")) {
-            Class<?> clazz = field.getDeclaringClass().getJavaClass();
-            boolean assertionsEnabled = RuntimeAssertionsSupport.singleton().desiredAssertionStatus(clazz);
-            return JavaConstant.forBoolean(!assertionsEnabled);
-        }
-        return value;
+    private static boolean isExpectedJavaConstant(JavaConstant value) {
+        return value.isNull() || value.getJavaKind().isPrimitive() || value instanceof PatchedWordConstant || value instanceof ImageHeapConstant;
     }
 
-    /**
-     * Intercept {@link Word} types. They are boxed objects in the hosted world, but primitive
-     * values in the runtime world.
-     */
-    private JavaConstant interceptWordType(AnalysisField field, JavaConstant value) {
-        if (value.getJavaKind() == JavaKind.Object) {
-            Object originalObject = universe.getSnippetReflection().asObject(Object.class, value);
-            if (universe.hostVM().isRelocatedPointer(originalObject)) {
+    @Override
+    public JavaConstant readFieldValue(ResolvedJavaField field, JavaConstant receiver) {
+        return readValue((AnalysisField) field, receiver, false, false);
+    }
+
+    public JavaConstant readValue(AnalysisField field, JavaConstant receiver, boolean returnSimulatedValues, boolean readRelocatableValues) {
+        if (!field.isStatic()) {
+            if (!(receiver instanceof ImageHeapInstance imageHeapInstance) || !field.getDeclaringClass().isAssignableFrom(imageHeapInstance.getType())) {
                 /*
-                 * Such pointers are subject to relocation therefore we don't know their values yet.
-                 * Therefore there should not be a relocated pointer constant in a function which is
-                 * compiled. RelocatedPointers are only allowed in non-constant fields. The caller
-                 * of readValue is responsible of handling the returned value correctly.
+                 * During compiler optimizations, it is possible to see field loads with a constant
+                 * receiver of a wrong type. The code will later be removed as dead code, and in
+                 * most cases the field read would also be rejected as illegal by the HotSpot
+                 * constant reflection provider doing the actual field load. But there are several
+                 * other ways how a field can be accessed, e.g., fields of classes that are
+                 * initialized at image run time. To avoid any surprises, we abort the field reading
+                 * here early.
                  */
-                return value;
-            } else if (originalObject instanceof WordBase) {
-                return JavaConstant.forIntegerKind(universe.getWordKind(), ((WordBase) originalObject).rawValue());
-            } else if (originalObject == null && field.getType().isWordType()) {
-                return JavaConstant.forIntegerKind(universe.getWordKind(), 0);
+                return null;
             }
         }
+
+        if (field.preventConstantFolding()) {
+            /* Reading this value is prohibited. */
+            return null;
+        }
+
+        if (receiver instanceof ImageHeapInstance imageHeapInstance && imageHeapInstance.isInSharedLayer() && imageHeapInstance.nullFieldValues()) {
+            return null;
+        }
+
+        if (!fieldValueInterceptionSupport.isValueAvailable(field, receiver)) {
+            /* Value is not yet available. */
+            return null;
+        }
+
+        VMError.guarantee(receiver == null || receiver instanceof ImageHeapConstant, "Expected ImageHeapConstant, found: %s", receiver);
+        JavaConstant value = null;
+        if (returnSimulatedValues) {
+            value = readSimulatedValue(field);
+        }
+        if (value == null && field.isStatic()) {
+            /*
+             * The shadow heap simply returns the hosted value for static fields, it doesn't
+             * directly store simulated values. The simulated values are only accessible via
+             * SimulateClassInitializerSupport.getSimulatedFieldValue().
+             */
+            if (SimulateClassInitializerSupport.singleton().isEnabled()) {
+                /*
+                 * The "late initialization" doesn't work with heap snapshots because the wrong
+                 * value will be snapshot for classes proven late, so we only read via the shadow
+                 * heap if simulation of class initializers is enabled. The check and this comment
+                 * will be removed when the old initialization strategy is removed.
+                 */
+                value = field.getDeclaringClass().getOrComputeData().readFieldValue(field);
+            }
+        }
+        if (value == null && receiver instanceof ImageHeapConstant heapConstant) {
+            heapConstant.ensureReaderInstalled();
+            ImageHeapInstance heapObject = (ImageHeapInstance) receiver;
+            value = heapObject.readFieldValue(field);
+        }
+        if (value == null) {
+            VMError.guarantee(!SimulateClassInitializerSupport.singleton().isEnabled());
+            ImageHeapScanner heapScanner = universe.getHeapScanner();
+            HostedValuesProvider hostedValuesProvider = universe.getHostedValuesProvider();
+            /* Constant reflection snapshots speculatively and must not mark the object reachable. */
+            value = heapScanner.createImageHeapConstant(hostedValuesProvider.readFieldValueWithReplacement(field, receiver), ObjectScanner.OtherReason.UNKNOWN);
+        }
+
+        if (!readRelocatableValues && value instanceof ImageHeapRelocatableConstant) {
+            /*
+             * During compilation we do not want to fold relocatable constants. However, they must
+             * be seen during the heap scanning process.
+             */
+            return null;
+        }
         return value;
+    }
+
+    /**
+     * For classes that are simulated as initialized, provide the value of static fields to the
+     * static analysis so that they are seen properly as roots in the image heap.
+     * <p>
+     * We cannot return such simulated field values for "normal" field value reads because then they
+     * would be seen during bytecode parsing too. Therefore, we only return such values when
+     * explicitly requested via a flag.
+     */
+    private JavaConstant readSimulatedValue(AnalysisField field) {
+        if (!field.isStatic() || field.getDeclaringClass().isInitialized()) {
+            return null;
+        }
+        field.getDeclaringClass().getInitializeMetaDataTask().ensureDone();
+        if (simulateClassInitializerSupport == null) {
+            simulateClassInitializerSupport = SimulateClassInitializerSupport.singleton();
+        }
+        return simulateClassInitializerSupport.getSimulatedFieldValue(field);
     }
 
     @Override
     public ResolvedJavaType asJavaType(Constant constant) {
-        if (constant instanceof SubstrateObjectConstant) {
-            Object obj = SubstrateObjectConstant.asObject(constant);
-            if (obj instanceof DynamicHub) {
-                return getHostVM().lookupType((DynamicHub) obj);
-            } else if (obj instanceof Class) {
-                throw VMError.shouldNotReachHere("Must not have java.lang.Class object: " + obj);
-            }
+        if (constant instanceof JavaConstant javaConstant && metaAccess.isInstanceOf(javaConstant, Class.class)) {
+            /* All type constants must have a hosted object. */
+            Object hostedObject = Objects.requireNonNull(universe.getSnippetReflection().asObject(Object.class, javaConstant));
+            VMError.guarantee(!(hostedObject instanceof Class<?>), "Must not have java.lang.Class object: %s", hostedObject);
+            return getHostVM().lookupType((DynamicHub) hostedObject);
         }
         return null;
     }
 
     @Override
     public JavaConstant asJavaClass(ResolvedJavaType type) {
-        DynamicHub dynamicHub = getHostVM().dynamicHub(type);
-        registerAsReachable(getHostVM(), dynamicHub);
-        assert dynamicHub != null : type.toClassName() + " has a null dynamicHub.";
-        return SubstrateObjectConstant.forObject(dynamicHub);
+        JavaConstant hubConst = GuestAccess.get().getSnippetReflection().forObject(getHostVM().dynamicHub(type));
+        return universe.getHeapScanner().createImageHeapConstant(hubConst, ObjectScanner.OtherReason.UNKNOWN);
     }
 
-    protected static void registerAsReachable(SVMHost hostVM, DynamicHub dynamicHub) {
-        assert dynamicHub != null;
-        /* Make sure that the DynamicHub of this type ends up in the native image. */
-        AnalysisType valueType = hostVM.lookupType(dynamicHub);
-        valueType.registerAsReachable();
+    @Override
+    public JavaConstant forString(String value) {
+        if (value == null) {
+            return JavaConstant.NULL_POINTER;
+        }
+        return universe.getHeapScanner().createImageHeapConstant(GuestAccess.get().asGuestString(value), ObjectScanner.OtherReason.UNKNOWN);
+    }
+
+    @Override
+    public boolean initializationCheckRequired(ResolvedJavaType type) {
+        return classInitializationSupport.requiresInitializationNodeForTypeReached(type);
     }
 
     private SVMHost getHostVM() {

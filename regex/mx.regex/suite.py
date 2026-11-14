@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # The Universal Permissive License (UPL), Version 1.0
@@ -39,12 +39,12 @@
 # SOFTWARE.
 #
 suite = {
-  "mxversion" : "5.292.5",
+  "mxversion": "7.65.0",
 
   "name" : "regex",
 
-  "version" : "21.2.0",
-  "release" : False,
+  "version_from" : "truffle",
+  "release_from" : "truffle",
   "groupId" : "org.graalvm.regex",
   "url" : "http://www.graalvm.org/",
   "developer" : {
@@ -64,13 +64,10 @@ suite = {
       {
         "name" : "truffle",
         "subdir": True,
-        "urls" : [
-          {"url" : "https://curio.ssw.jku.at/nexus/content/repositories/snapshots", "kind" : "binary"},
-         ]
       },
     ]
   },
-
+  "capture_suite_commit_info": False,
   "licenses" : {
     "upl" : {
       "name" : "Universal Permissive License, Version 1.0",
@@ -88,13 +85,15 @@ suite = {
       "sourceDirs" : ["src"],
       "dependencies" : [
         "truffle:TRUFFLE_API",
+        "truffle:TRUFFLE_ICU4J",
+      ],
+      "requires" : [
+        "java.logging",
+        "jdk.unsupported", # sun.misc.Unsafe
       ],
       "annotationProcessors" : ["truffle:TRUFFLE_DSL_PROCESSOR"],
-      "exports" : [
-        "com.oracle.truffle.regex.chardata",
-      ],
-      "checkstyleVersion" : "8.36.1",
-      "javaCompliance" : "8+",
+      "checkstyleVersion" : "10.21.0",
+      "javaCompliance" : "17+",
       "workingSets" : "Truffle,Regex",
       "spotbugsIgnoresGenerated" : True,
     },
@@ -103,7 +102,7 @@ suite = {
       "subDir" : "src",
       "sourceDirs" : ["src"],
       "dependencies" : [
-        "com.oracle.truffle.regex",
+        "regex:TREGEX_TEST_DUMMY_LANG",
         "mx:JUNIT",
         "mx:JMH_1_21",
       ],
@@ -112,8 +111,26 @@ suite = {
         "mx:JMH_1_21",
       ],
       "checkstyle" : "com.oracle.truffle.regex",
-      "javaCompliance" : "8+",
+      "javaCompliance" : "17+",
       "workingSets" : "Truffle,Regex",
+      "testProject" : True,
+      "jacoco" : "exclude",
+    },
+
+    "com.oracle.truffle.regex.test.dummylang" : {
+      "subDir" : "src",
+      "sourceDirs" : ["src"],
+      "dependencies" : [
+        "com.oracle.truffle.regex",
+      ],
+      "annotationProcessors" : [
+        "truffle:TRUFFLE_DSL_PROCESSOR",
+      ],
+      "checkstyle" : "com.oracle.truffle.regex",
+      "javaCompliance" : "17+",
+      "workingSets" : "Truffle,Regex",
+      "testProject" : True,
+      "jacoco" : "exclude",
     },
   },
 
@@ -121,17 +138,49 @@ suite = {
     "TREGEX" : {
       "moduleInfo" : {
         "name" : "com.oracle.truffle.regex",
+        "exports": [
+            "com.oracle.truffle.regex.chardata",
+        ],
+        "requires" : [
+          "java.logging",
+          "jdk.unsupported", # sun.misc.Unsafe
+          "org.graalvm.collections",
+          "org.graalvm.polyglot",
+        ],
       },
       "subDir" : "src",
       "dependencies" : ["com.oracle.truffle.regex"],
       "distDependencies" : [
         "truffle:TRUFFLE_API",
+        "truffle:TRUFFLE_ICU4J",
+      ],
+      "exclude" : [
       ],
       "maven" : {
         "artifactId" : "regex",
+        "tag": ["default", "public"],
       },
       "description" : "Truffle regular expressions language.",
       "allowsJavadocWarnings": True,
+    },
+
+    "TREGEX_TEST_DUMMY_LANG" : {
+      "moduleInfo" : {
+        "name" : "com.oracle.truffle.regex.test.dummylang",
+        "requires": [
+          "org.graalvm.polyglot",
+          "org.graalvm.truffle",
+        ],
+      },
+      "subDir" : "src",
+      "dependencies" : ["com.oracle.truffle.regex.test.dummylang"],
+      "distDependencies" : [
+        "regex:TREGEX",
+      ],
+      "description" : "Truffle regular expressions testing dummy language.",
+      "allowsJavadocWarnings": True,
+      "maven" : False,
+      "testDistribution": True,
     },
 
     "TREGEX_UNIT_TESTS" : {
@@ -143,9 +192,11 @@ suite = {
         "mx:JUNIT",
       ],
       "distDependencies" : [
-        "TREGEX",
+        "regex:TREGEX",
+        "regex:TREGEX_TEST_DUMMY_LANG",
       ],
       "maven" : False,
+      "testDistribution": True,
     },
 
     "TREGEX_GRAALVM_SUPPORT" : {
@@ -153,6 +204,14 @@ suite = {
       "description" : "TRegex support distribution for the GraalVM",
       "layout" : {
         "native-image.properties" : "file:mx.regex/native-image.properties",
+      },
+    },
+
+    "TREGEX_TEST_DUMMY_LANG_GRAALVM_SUPPORT" : {
+      "native" : True,
+      "description" : "TRegex support distribution for the GraalVM",
+      "layout" : {
+        "native-image.properties" : "file:mx.regex/dummylang-native-image.properties",
       },
     },
   }

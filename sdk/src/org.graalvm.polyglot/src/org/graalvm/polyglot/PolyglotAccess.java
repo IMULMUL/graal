@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,13 +41,18 @@
 package org.graalvm.polyglot;
 
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.EconomicSet;
 import org.graalvm.collections.Equivalence;
 import org.graalvm.collections.MapCursor;
 import org.graalvm.collections.UnmodifiableEconomicSet;
+import org.graalvm.polyglot.Engine.ToStringSupport;
 
 /**
  * Represents an access policy for polyglot builtins in the guest languages.
@@ -76,9 +81,7 @@ import org.graalvm.collections.UnmodifiableEconomicSet;
  */
 public final class PolyglotAccess {
 
-    private static final UnmodifiableEconomicSet<String> EMPTY = EconomicSet.create();
-
-    private final EconomicMap<String, EconomicSet<String>> evalAccess;
+    private final EconomicMap<String, UnmodifiableEconomicSet<String>> evalAccess;
     private final EconomicSet<String> bindingsAccess;
     private final boolean allAccess;
 
@@ -88,21 +91,21 @@ public final class PolyglotAccess {
         this.bindingsAccess = bindingsAccess;
     }
 
-    private static EconomicMap<String, EconomicSet<String>> copyMap(EconomicMap<String, EconomicSet<String>> values) {
+    private static EconomicMap<String, UnmodifiableEconomicSet<String>> copyMap(EconomicMap<String, EconomicSet<String>> values) {
         if (values == null) {
             return null;
         }
-        EconomicMap<String, EconomicSet<String>> newMap = EconomicMap.create(Equivalence.DEFAULT, values);
-        MapCursor<String, EconomicSet<String>> cursor = newMap.getEntries();
+        EconomicMap<String, UnmodifiableEconomicSet<String>> newMap = EconomicMap.create(values.size());
+        MapCursor<String, EconomicSet<String>> cursor = values.getEntries();
         while (cursor.advance()) {
             newMap.put(cursor.getKey(), EconomicSet.create(Equivalence.DEFAULT, cursor.getValue()));
         }
         return newMap;
     }
 
-    String validate(UnmodifiableEconomicSet<String> availableLanguages) {
+    String validate(Set<String> availableLanguages) {
         if (evalAccess != null) {
-            MapCursor<String, EconomicSet<String>> entries = evalAccess.getEntries();
+            MapCursor<String, UnmodifiableEconomicSet<String>> entries = evalAccess.getEntries();
             while (entries.advance()) {
                 String invalidKey = null;
                 if (!availableLanguages.contains(entries.getKey())) {
@@ -135,7 +138,7 @@ public final class PolyglotAccess {
 
     }
 
-    static String toStringSet(EconomicSet<String> set) {
+    static String toStringSet(UnmodifiableEconomicSet<String> set) {
         StringBuilder b = new StringBuilder();
         String sep = "";
         for (String entry : set) {
@@ -146,30 +149,53 @@ public final class PolyglotAccess {
         return b.toString();
     }
 
-    UnmodifiableEconomicSet<String> getEvalAccess(String language) {
+    Set<String> getEvalAccess(String language) {
         if (allAccess) {
             return null;
         } else {
             if (evalAccess == null) {
-                return EMPTY;
+                return Set.of();
             } else {
-                EconomicSet<String> a = evalAccess.get(language);
+                UnmodifiableEconomicSet<String> a = evalAccess.get(language);
                 if (a == null) {
-                    return EMPTY;
+                    return Set.of();
                 }
-                return a;
+
+                return Set.of(a.toArray(new String[a.size()]));
             }
         }
     }
 
-    UnmodifiableEconomicSet<String> getBindingsAccess() {
+    Map<String, Set<String>> getEvalAccess() {
+        if (allAccess) {
+            return null;
+        } else {
+            if (evalAccess == null) {
+                return Map.of();
+            } else {
+                Map<String, Set<String>> map = new LinkedHashMap<>();
+                var mapCursor = evalAccess.getEntries();
+                while (mapCursor.advance()) {
+                    var set = mapCursor.getValue();
+                    Set<String> newSet = null;
+                    if (set != null) {
+                        newSet = Set.of(set.toArray(new String[set.size()]));
+                    }
+                    map.put(mapCursor.getKey(), newSet);
+                }
+                return map;
+            }
+        }
+    }
+
+    Set<String> getBindingsAccess() {
         if (allAccess) {
             return null;
         } else {
             if (bindingsAccess == null) {
-                return EMPTY;
+                return Set.of();
             } else {
-                return bindingsAccess;
+                return Set.of(bindingsAccess.toArray(new String[bindingsAccess.size()]));
             }
         }
     }
@@ -189,6 +215,22 @@ public final class PolyglotAccess {
      * @since 19.0
      */
     public static final PolyglotAccess ALL = new PolyglotAccess(true, null, null);
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 25.3
+     */
+    @Override
+    public String toString() {
+        if (this == NONE) {
+            return "PolyglotAccess.NONE";
+        } else if (this == ALL) {
+            return "PolyglotAccess.ALL";
+        } else {
+            return "PolyglotAccess[allAccess=" + allAccess + ", evalAccess=" + getEvalAccess() + ", bindingsAccess=" + getBindingsAccess() + "]";
+        }
+    }
 
     /**
      * Creates a new custom polyglot access configuration builder. A polyglot access builder starts
@@ -221,7 +263,7 @@ public final class PolyglotAccess {
          * more than two then all language evaluation combinations will be allowed. This method
          * potentially overrides already configured access rights with
          * {@link #allowEval(String, String)} or {@link #denyEval(String, String)}. The given
-         * language array must be <code>null</code> and individual languages must not be
+         * language array must be non <code>null</code> and individual languages must not be
          * <code>null</code>.
          *
          * @see #allowEval(String, String)
@@ -239,7 +281,12 @@ public final class PolyglotAccess {
                     languageAccess = EconomicSet.create();
                     evalAccess.put(language, languageAccess);
                 }
-                languageAccess.addAll(Arrays.asList(languages));
+                Set<String> filteredList = new LinkedHashSet<>(Arrays.asList(languages));
+                // filter current language if it is not the only language
+                if (filteredList.size() > 1) {
+                    filteredList.remove(language);
+                }
+                languageAccess.addAll(filteredList);
             }
             return this;
         }
@@ -252,7 +299,7 @@ public final class PolyglotAccess {
          * more than two then all language access combinations will be denied. This method
          * potentially overrides already configured access rights with
          * {@link #allowEval(String, String)} or {@link #denyEval(String, String)}. The given
-         * language array must be <code>null</code> and individual languages must not be
+         * language array must be non <code>null</code> and individual languages must not be
          * <code>null</code>.
          *
          * @see #denyEval(String, String)
@@ -347,6 +394,30 @@ public final class PolyglotAccess {
                 bindingsAccess.remove(language);
             }
             return this;
+        }
+
+        /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("PolyglotAccess.newBuilder()");
+            if (evalAccess != null) {
+                MapCursor<String, EconomicSet<String>> cursor = evalAccess.getEntries();
+                while (cursor.advance()) {
+                    for (String target : cursor.getValue()) {
+                        ToStringSupport.appendCall(b, "allowEval", ToStringSupport.quote(cursor.getKey()), ToStringSupport.quote(target));
+                    }
+                }
+            }
+            if (bindingsAccess != null) {
+                for (String language : bindingsAccess) {
+                    ToStringSupport.appendCall(b, "allowBindingsAccess", ToStringSupport.quote(language));
+                }
+            }
+            return b.toString();
         }
 
         /**

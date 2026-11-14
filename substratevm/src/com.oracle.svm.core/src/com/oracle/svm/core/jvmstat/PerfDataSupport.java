@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,30 @@
  */
 package com.oracle.svm.core.jvmstat;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.c.type.CLongPointer;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+
+import jdk.graal.compiler.api.replacements.Fold;
 
 public interface PerfDataSupport {
-    ByteBuffer attach(String user, int lvmid, int mode);
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
+    static PerfDataSupport singleton() {
+        return ImageSingletons.lookup(PerfDataSupport.class);
+    }
+
+    /// Attaches to local or external performance data.
+    ByteBuffer attach(int lvmid) throws IOException;
 
     void detach(ByteBuffer bb);
 
@@ -45,15 +58,20 @@ public interface PerfDataSupport {
     ByteBuffer createLong(String name, int variability, int units, long value);
 
     ByteBuffer createByteArray(String name, int variability, int units, byte[] value, int maxLength);
+
+    CLongPointer getLong(String name);
+
+    boolean hasLong(String name);
 }
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 class NoPerfDataSupport implements PerfDataSupport {
     @Platforms(Platform.HOSTED_ONLY.class)
     NoPerfDataSupport() {
     }
 
     @Override
-    public ByteBuffer attach(String user, int lvmid, int mode) {
+    public ByteBuffer attach(int lvmid) {
         throw new IllegalArgumentException("Performance data is not supported.");
     }
 
@@ -81,14 +99,14 @@ class NoPerfDataSupport implements PerfDataSupport {
     public ByteBuffer createByteArray(String name, int variability, int units, byte[] value, int maxLength) {
         throw new IllegalArgumentException("Performance data is not supported.");
     }
-}
 
-@AutomaticFeature
-class PerfDataFeature implements Feature {
     @Override
-    public void duringSetup(DuringSetupAccess access) {
-        if (!ImageSingletons.contains(PerfDataSupport.class)) {
-            ImageSingletons.add(PerfDataSupport.class, new NoPerfDataSupport());
-        }
+    public CLongPointer getLong(String name) {
+        throw new IllegalArgumentException("Performance data is not supported.");
+    }
+
+    @Override
+    public boolean hasLong(String name) {
+        return false;
     }
 }

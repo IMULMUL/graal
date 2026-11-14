@@ -27,14 +27,18 @@ package com.oracle.svm.hosted.code;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public final class CFunctionPointerCallStubSupport {
 
     static void initialize(AnalysisUniverse universe) {
@@ -58,7 +62,7 @@ public final class CFunctionPointerCallStubSupport {
 
     public AnalysisMethod getOrCreateStubForMethod(AnalysisMethod method) {
         assert !isStub(method);
-        return methodToStub.computeIfAbsent(method, m -> {
+        return methodToStub.computeIfAbsent(method, _ -> {
             assert !universe.sealed();
             CFunctionPointerCallStubMethod stub = CFunctionPointerCallStubMethod.create(method);
             return universe.lookup(stub);
@@ -66,8 +70,8 @@ public final class CFunctionPointerCallStubSupport {
     }
 }
 
-@AutomaticFeature
-class CFunctionPointerCallStubSupportFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class CFunctionPointerCallStubSupportFeature implements InternalFeature {
     @Override
     public void duringSetup(DuringSetupAccess arg) {
         DuringSetupAccessImpl access = (DuringSetupAccessImpl) arg;

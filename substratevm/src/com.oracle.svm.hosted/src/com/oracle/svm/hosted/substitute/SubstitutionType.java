@@ -24,39 +24,62 @@
  */
 package com.oracle.svm.hosted.substitute;
 
-import java.lang.annotation.Annotation;
 import java.lang.reflect.Modifier;
+import java.util.Arrays;
+import java.util.List;
 
-import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
-import com.oracle.svm.hosted.c.GraalAccess;
+import com.oracle.svm.core.annotate.Substitute;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.AnnotatedWrapper;
+import com.oracle.svm.util.OriginalClassProvider;
 
 import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.Assumptions.AssumptionResult;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
 import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.UnresolvedJavaType;
+import jdk.vm.ci.meta.annotation.Annotated;
 
-public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider {
+/**
+ * Type which fully substitutes its original type, i.e. @{@link Substitute} on the class level.
+ *
+ * @see InjectedFieldsType
+ */
+public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider, AnnotatedWrapper {
+    private static final ResolvedJavaField[] EMPTY_INSTANCE_FIELDS = new ResolvedJavaField[0];
 
     private final ResolvedJavaType original;
     private final ResolvedJavaType annotated;
 
     /**
      * This field is used in the {@link com.oracle.svm.hosted.SubstitutionReportFeature} class to
-     * determine {@link SubstitutionType} objects which correspond to type.
+     * determine {@link SubstitutionType} objects are user-defined substitutions (from the
+     * classpath).
      */
-    private final boolean isUserSubstitution;
+    private final boolean userSubstitution;
 
-    public SubstitutionType(ResolvedJavaType original, ResolvedJavaType annotated, boolean isUserSubstitution) {
+    private final ResolvedJavaField[][] instanceFields;
+
+    public SubstitutionType(ResolvedJavaType original, ResolvedJavaType annotated, boolean userSubstitution) {
         this.annotated = annotated;
         this.original = original;
-        this.isUserSubstitution = isUserSubstitution;
+        this.userSubstitution = userSubstitution;
+        this.instanceFields = new ResolvedJavaField[][]{
+                        canonicalizeInstanceFields(annotated.getInstanceFields(false)),
+                        canonicalizeInstanceFields(annotated.getInstanceFields(true))};
+    }
+
+    static ResolvedJavaField[] canonicalizeInstanceFields(ResolvedJavaField[] fields) {
+        return fields.length == 0 ? EMPTY_INSTANCE_FIELDS : fields;
     }
 
     public boolean isUserSubstitution() {
-        return isUserSubstitution;
+        return userSubstitution;
     }
 
     public ResolvedJavaType getOriginal() {
@@ -65,6 +88,24 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
 
     public ResolvedJavaType getAnnotated() {
         return annotated;
+    }
+
+    @Override
+    public ResolvedJavaType unwrapTowardsOriginalType() {
+        return original;
+    }
+
+    void addInstanceField(ResolvedJavaField field) {
+        for (int i = 0; i < instanceFields.length; i++) {
+            ResolvedJavaField[] newFields = Arrays.copyOf(instanceFields[i], instanceFields[i].length + 1, ResolvedJavaField[].class);
+            newFields[newFields.length - 1] = field;
+            instanceFields[i] = newFields;
+        }
+    }
+
+    @Override
+    public ResolvedJavaField[] getInstanceFields(boolean includeSuperclasses) {
+        return instanceFields[includeSuperclasses ? 1 : 0];
     }
 
     @Override
@@ -115,6 +156,16 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
     @Override
     public boolean isEnum() {
         return annotated.isEnum();
+    }
+
+    @Override
+    public boolean isRecord() {
+        return annotated.isRecord();
+    }
+
+    @Override
+    public List<? extends ResolvedJavaRecordComponent> getRecordComponents() {
+        return annotated.getRecordComponents();
     }
 
     @Override
@@ -189,6 +240,16 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
     }
 
     @Override
+    public boolean isHidden() {
+        return annotated.isHidden();
+    }
+
+    @Override
+    public List<? extends JavaType> getPermittedSubclasses() {
+        return annotated.getPermittedSubclasses();
+    }
+
+    @Override
     public ResolvedJavaMethod resolveConcreteMethod(ResolvedJavaMethod method, ResolvedJavaType callerType) {
         /* First check the annotated class. @Substitute methods are found there. */
         ResolvedJavaMethod result = annotated.resolveConcreteMethod(method, callerType);
@@ -215,28 +276,13 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
     }
 
     @Override
-    public ResolvedJavaField[] getInstanceFields(boolean includeSuperclasses) {
-        return annotated.getInstanceFields(includeSuperclasses);
-    }
-
-    @Override
     public ResolvedJavaField[] getStaticFields() {
         return annotated.getStaticFields();
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return annotated.getAnnotations();
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return annotated.getDeclaredAnnotations();
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return annotated.getAnnotation(annotationClass);
+    public Annotated getWrappedAnnotated() {
+        return annotated;
     }
 
     @Override
@@ -260,18 +306,46 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
     }
 
     @Override
+    public ResolvedJavaType[] getDeclaredTypes() {
+        return annotated.getDeclaredTypes();
+    }
+
+    @Override
     public ResolvedJavaType getEnclosingType() {
         return annotated.getEnclosingType();
     }
 
     @Override
+    public ResolvedJavaMethod getEnclosingMethod() {
+        return annotated.getEnclosingMethod();
+    }
+
+    @Override
     public ResolvedJavaMethod[] getDeclaredConstructors() {
-        return annotated.getDeclaredConstructors();
+        return getDeclaredConstructors(true);
+    }
+
+    @Override
+    public ResolvedJavaMethod[] getDeclaredConstructors(boolean forceLink) {
+        VMError.guarantee(forceLink == false, "only use getDeclaredConstructors without forcing to link, because linking can throw LinkageError");
+        return annotated.getDeclaredConstructors(forceLink);
     }
 
     @Override
     public ResolvedJavaMethod[] getDeclaredMethods() {
-        return annotated.getDeclaredMethods();
+        return getDeclaredMethods(true);
+    }
+
+    @Override
+    public ResolvedJavaMethod[] getDeclaredMethods(boolean forceLink) {
+        VMError.guarantee(forceLink == false, "only use getDeclaredMethods without forcing to link, because linking can throw LinkageError");
+        return annotated.getDeclaredMethods(forceLink);
+    }
+
+    @Override
+    public List<ResolvedJavaMethod> getAllMethods(boolean forceLink) {
+        VMError.guarantee(forceLink == false, "only use getAllMethods without forcing to link, because linking can throw LinkageError");
+        return annotated.getAllMethods(forceLink);
     }
 
     @Override
@@ -301,18 +375,13 @@ public class SubstitutionType implements ResolvedJavaType, OriginalClassProvider
     }
 
     @Override
+    public ResolvedJavaType lookupType(UnresolvedJavaType unresolvedJavaType, boolean resolve) {
+        return original.lookupType(unresolvedJavaType, resolve);
+    }
+
+    @Override
     public boolean isCloneableWithAllocation() {
         throw JVMCIError.unimplemented();
-    }
-
-    @Override
-    public ResolvedJavaType getHostClass() {
-        return original.getHostClass();
-    }
-
-    @Override
-    public Class<?> getJavaClass() {
-        return OriginalClassProvider.getJavaClass(GraalAccess.getOriginalSnippetReflection(), original);
     }
 
     @Override

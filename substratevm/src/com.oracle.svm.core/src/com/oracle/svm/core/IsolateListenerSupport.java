@@ -26,17 +26,24 @@ package com.oracle.svm.core;
 
 import java.util.Arrays;
 
-import org.graalvm.compiler.api.replacements.Fold;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Isolate;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.graal.snippets.CEntryPointSnippets.IsolateCreationWatcher;
+import com.oracle.svm.core.imagelayer.LayeredFoldResolver;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.api.replacements.Fold;
+
+@AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class IsolateListenerSupport {
     private IsolateListener[] listeners;
 
@@ -45,7 +52,6 @@ public class IsolateListenerSupport {
         listeners = new IsolateListener[0];
     }
 
-    // Checkstyle: allow synchronization.
     @Platforms(Platform.HOSTED_ONLY.class)
     public synchronized void register(IsolateListener listener) {
         assert listener != null;
@@ -53,36 +59,53 @@ public class IsolateListenerSupport {
         listeners = Arrays.copyOf(listeners, oldLength + 1);
         listeners[oldLength] = listener;
     }
-    // Checkstyle: disallow synchronization.
 
-    @Fold
+    @Fold(resolver = LayeredFoldResolver.InitialLayer.class)
     public static IsolateListenerSupport singleton() {
         return ImageSingletons.lookup(IsolateListenerSupport.class);
     }
 
     @Uninterruptible(reason = "Thread state not yet set up.")
     public void afterCreateIsolate(Isolate isolate) {
-        // The IsolateCreationWatcher will be removed, see GR-30740.
-        if (ImageSingletons.contains(IsolateCreationWatcher.class)) {
-            IsolateCreationWatcher singletonWatcher = ImageSingletons.lookup(IsolateCreationWatcher.class);
-            singletonWatcher.registerIsolate(isolate);
+        for (IsolateListener listener : listeners) {
+            try {
+                listener.afterCreateIsolate(isolate);
+            } catch (Throwable e) {
+                throw VMError.shouldNotReachHere(e);
+            }
         }
+    }
 
-        for (int i = 0; i < listeners.length; i++) {
-            listeners[i].afterCreateIsolate(isolate);
+    @Uninterruptible(reason = "The isolate teardown is in progress.")
+    public void onIsolateTeardown() {
+        for (int i = listeners.length - 1; i >= 0; i--) {
+            try {
+                listeners[i].onIsolateTeardown();
+            } catch (Throwable e) {
+                throw VMError.shouldNotReachHere(e);
+            }
         }
     }
 
     public interface IsolateListener {
+        /**
+         * Implementations must not throw any exceptions. Note that the thread that creates the
+         * isolate is still unattached when this method is called.
+         */
         @Uninterruptible(reason = "Thread state not yet set up.")
-        void afterCreateIsolate(Isolate isolate);
-    }
-}
+        default void afterCreateIsolate(@SuppressWarnings("unused") Isolate isolate) {
+        }
 
-@AutomaticFeature
-class IsolateListenerFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(IsolateListenerSupport.class, new IsolateListenerSupport());
+        /**
+         * Implementations must not throw any exceptions. Note that this method is called on
+         * listeners in the reverse order of {@link #afterCreateIsolate}.
+         *
+         * This method is called during isolate teardown, when the VM is guaranteed to be
+         * single-threaded (i.e., all other threads already exited on the OS-level). This method is
+         * not called for applications that use {@link JavaMainWrapper}.
+         */
+        @Uninterruptible(reason = "The isolate teardown is in progress.")
+        default void onIsolateTeardown() {
+        }
     }
 }

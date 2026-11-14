@@ -24,28 +24,35 @@
  */
 package com.oracle.svm.core.heap;
 
+import static com.oracle.svm.shared.NeverInline.CALLER_CATCHES_IMPLICIT_EXCEPTIONS;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import java.lang.ref.Reference;
 
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
-
+import com.oracle.svm.guest.staging.IsolateArgumentParser;
+import com.oracle.svm.shared.NeverInline;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.stack.StackOverflowCheck;
-import com.oracle.svm.core.thread.ThreadingSupportImpl;
-import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.internal.ref.CleanerFactory;
 
 public final class ReferenceHandler {
-    @Fold
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean useDedicatedThread() {
-        return SubstrateOptions.UseReferenceHandlerThread.getValue() && SubstrateOptions.MultiThreaded.getValue();
+        int automaticReferenceHandling = IsolateArgumentParser.getOptionIndex(SubstrateOptions.ConcealedOptions.AutomaticReferenceHandling);
+        return ReferenceHandlerThread.isSupported() && IsolateArgumentParser.singleton().getBooleanOptionValue(automaticReferenceHandling);
     }
 
-    public static void maybeProcessCurrentlyPending() {
-        if (useDedicatedThread()) {
-            return;
-        }
+    public static boolean isExecutedManually() {
+        return !useDedicatedThread();
+    }
+
+    public static void processPendingReferencesInRegularThread() {
+        assert isExecutedManually();
+
         /*
          * We might be running in a user thread that is close to a stack overflow, so enable the
          * yellow zone of the stack to ensure that we have sufficient stack space for enqueueing
@@ -63,49 +70,24 @@ public final class ReferenceHandler {
         }
     }
 
+    @NeverInline(CALLER_CATCHES_IMPLICIT_EXCEPTIONS)
     static void processCleaners() {
         // Note: (sun.misc|jdk.internal).Cleaner objects are invoked in pending reference processing
 
-        if (JavaVersionUtil.JAVA_SPEC > 8) {
-            // Process the JDK's common cleaner, additional cleaners start their own threads
-            Target_java_lang_ref_Cleaner commonCleaner = Target_jdk_internal_ref_CleanerFactory.cleaner();
-            Reference<?> ref = commonCleaner.impl.queue.poll();
-            while (ref != null) {
-                try {
-                    Target_java_lang_ref_Cleaner_Cleanable cl = SubstrateUtil.cast(ref, Target_java_lang_ref_Cleaner_Cleanable.class);
-                    cl.clean();
-                } catch (Throwable e) {
-                    // ignore exceptions from the cleanup action and thread interrupts
-                }
-                ref = commonCleaner.impl.queue.poll();
+        // Process the JDK's common cleaner, additional cleaners start their own threads
+        Target_java_lang_ref_Cleaner commonCleaner = SubstrateUtil.cast(CleanerFactory.cleaner(), Target_java_lang_ref_Cleaner.class);
+        Reference<?> ref = commonCleaner.impl.queue.poll();
+        while (ref != null) {
+            try {
+                Target_java_lang_ref_Cleaner_Cleanable cl = SubstrateUtil.cast(ref, Target_java_lang_ref_Cleaner_Cleanable.class);
+                cl.clean();
+            } catch (Throwable e) {
+                // ignore exceptions from the cleanup action and thread interrupts
             }
+            ref = commonCleaner.impl.queue.poll();
         }
     }
 
     private ReferenceHandler() {
-    }
-}
-
-final class ReferenceHandlerRunnable implements Runnable {
-    @Override
-    public void run() {
-        /*
-         * Precaution: this thread does not register a callback itself, but a subclass of Reference,
-         * ReferenceQueue, or a Cleaner or Cleanable might do strange things.
-         */
-        ThreadingSupportImpl.pauseRecurringCallback("An exception in a recurring callback must not interrupt pending reference processing because it could result in a memory leak.");
-        try {
-            while (true) {
-                ReferenceInternals.waitForPendingReferences();
-                ReferenceInternals.processPendingReferences();
-                ReferenceHandler.processCleaners();
-            }
-        } catch (InterruptedException e) {
-            VMError.guarantee(VMThreads.isTearingDown(), "Reference Handler should only be interrupted during tear-down");
-        } catch (Throwable t) {
-            VMError.shouldNotReachHere("Reference processing and cleaners must handle all potential exceptions", t);
-        } finally {
-            ThreadingSupportImpl.resumeRecurringCallback();
-        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,178 +26,93 @@ package com.oracle.svm.core.amd64;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.List;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.struct.SizeOf;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.CPUFeatureAccess;
-import com.oracle.svm.core.CalleeSavedRegisters;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.CPUFeatureAccessImpl;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.jdk.JVMCISubstitutions;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.nodes.spi.LoweringProvider;
+import jdk.graal.compiler.vector.architecture.VectorLoweringProvider;
+import jdk.graal.compiler.vector.architecture.amd64.VectorAMD64;
 import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.amd64.AMD64Kind;
 import jdk.vm.ci.code.Architecture;
 
-@AutomaticFeature
-@Platforms(Platform.AMD64.class)
-class AMD64CPUFeatureAccessFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(CPUFeatureAccess.class, new AMD64CPUFeatureAccess());
-    }
-}
+/**
+ * This singleton should be converted to a multi layer singleton or an application layer only
+ * singleton. It is currently too strict, as different CPUFeatures are allowed in different layers,
+ * but at runtime, all the CPUFeatures used during all builds need to be supported.
+ */
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = CPUFeatureAccessImpl.LayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
+public class AMD64CPUFeatureAccess extends CPUFeatureAccessImpl {
 
-public class AMD64CPUFeatureAccess implements CPUFeatureAccess {
-
-    /**
-     * We include all flags that enable AMD64 CPU instructions as we want best possible performance
-     * for the code.
-     *
-     * @return All the flags that enable AMD64 CPU instructions.
-     */
     @Platforms(Platform.HOSTED_ONLY.class)
-    public static EnumSet<AMD64.Flag> allAMD64Flags() {
-        return EnumSet.of(AMD64.Flag.UseCountLeadingZerosInstruction, AMD64.Flag.UseCountTrailingZerosInstruction);
+    public AMD64CPUFeatureAccess(EnumSet<?> buildtimeCPUFeatures, int[] offsets, byte[] errorMessageBytes, byte[] buildtimeFeatureMaskBytes) {
+        super(buildtimeCPUFeatures, offsets, errorMessageBytes, buildtimeFeatureMaskBytes);
     }
 
-    /**
-     * Determines whether a given JVMCI AMD64.CPUFeature is present on the current hardware. Because
-     * the CPUFeatures available vary across different JDK versions, the features are queried via
-     * their name, as opposed to the actual enum.
-     */
-    private static boolean isFeaturePresent(String featureName, AMD64LibCHelper.CPUFeatures cpuFeatures) {
-        switch (featureName) {
-            case "CX8":
-                return cpuFeatures.fCX8();
-            case "CMOV":
-                return cpuFeatures.fCMOV();
-            case "FXSR":
-                return cpuFeatures.fFXSR();
-            case "HT":
-                return cpuFeatures.fHT();
-            case "MMX":
-                return cpuFeatures.fMMX();
-            case "AMD_3DNOW_PREFETCH":
-                return cpuFeatures.fAMD3DNOWPREFETCH();
-            case "SSE":
-                return cpuFeatures.fSSE();
-            case "SSE2":
-                return cpuFeatures.fSSE2();
-            case "SSE3":
-                return cpuFeatures.fSSE3();
-            case "SSSE3":
-                return cpuFeatures.fSSSE3();
-            case "SSE4A":
-                return cpuFeatures.fSSE4A();
-            case "SSE4_1":
-                return cpuFeatures.fSSE41();
-            case "SSE4_2":
-                return cpuFeatures.fSSE42();
-            case "POPCNT":
-                return cpuFeatures.fPOPCNT();
-            case "LZCNT":
-                return cpuFeatures.fLZCNT();
-            case "TSC":
-                return cpuFeatures.fTSC();
-            case "TSCINV":
-                return cpuFeatures.fTSCINV();
-            case "AVX":
-                return cpuFeatures.fAVX();
-            case "AVX2":
-                return cpuFeatures.fAVX2();
-            case "AES":
-                return cpuFeatures.fAES();
-            case "ERMS":
-                return cpuFeatures.fERMS();
-            case "CLMUL":
-                return cpuFeatures.fCLMUL();
-            case "BMI1":
-                return cpuFeatures.fBMI1();
-            case "BMI2":
-                return cpuFeatures.fBMI2();
-            case "RTM":
-                return cpuFeatures.fRTM();
-            case "ADX":
-                return cpuFeatures.fADX();
-            case "AVX512F":
-                return cpuFeatures.fAVX512F();
-            case "AVX512DQ":
-                return cpuFeatures.fAVX512DQ();
-            case "AVX512PF":
-                return cpuFeatures.fAVX512PF();
-            case "AVX512ER":
-                return cpuFeatures.fAVX512ER();
-            case "AVX512CD":
-                return cpuFeatures.fAVX512CD();
-            case "AVX512BW":
-                return cpuFeatures.fAVX512BW();
-            case "AVX512VL":
-                return cpuFeatures.fAVX512VL();
-            case "SHA":
-                return cpuFeatures.fSHA();
-            case "FMA":
-                return cpuFeatures.fFMA();
-            default:
-                throw VMError.shouldNotReachHere("Missing feature check: " + featureName);
-        }
-    }
-
+    @Override
     @Platforms(Platform.AMD64.class)
-    public static EnumSet<AMD64.CPUFeature> determineHostCPUFeatures() {
+    public EnumSet<AMD64.CPUFeature> determineHostCPUFeatures() {
         EnumSet<AMD64.CPUFeature> features = EnumSet.noneOf(AMD64.CPUFeature.class);
 
-        AMD64LibCHelper.CPUFeatures cpuFeatures = StackValue.get(AMD64LibCHelper.CPUFeatures.class);
+        AMD64LibCHelper.CPUFeatures cpuFeatures = UnsafeStackValue.get(AMD64LibCHelper.CPUFeatures.class);
 
         UnmanagedMemoryUtil.fill((Pointer) cpuFeatures, SizeOf.unsigned(AMD64LibCHelper.CPUFeatures.class), (byte) 0);
 
         AMD64LibCHelper.determineCPUFeatures(cpuFeatures);
 
+        ArrayList<String> unknownFeatures = new ArrayList<>();
         for (AMD64.CPUFeature feature : AMD64.CPUFeature.values()) {
-            if (isFeaturePresent(feature.name(), cpuFeatures)) {
+            if (isFeaturePresent(feature, (Pointer) cpuFeatures, unknownFeatures)) {
                 features.add(feature);
             }
+        }
+        if (!unknownFeatures.isEmpty()) {
+            throw VMError.shouldNotReachHere("Native image does not support the following JVMCI CPU features: " + unknownFeatures);
         }
         return features;
     }
 
+    @Uninterruptible(reason = "Thread state not set up yet.")
     @Override
-    public void verifyHostSupportsArchitecture(Architecture imageArchitecture) {
-        AMD64 architecture = (AMD64) imageArchitecture;
-        EnumSet<AMD64.CPUFeature> features = determineHostCPUFeatures();
+    public int verifyHostSupportsArchitectureEarly() {
+        return AMD64LibCHelper.checkCPUFeatures(BUILDTIME_CPU_FEATURE_MASK.get());
+    }
 
-        if (!features.containsAll(architecture.getFeatures())) {
-            List<AMD64.CPUFeature> missingFeatures = new ArrayList<>();
-            for (AMD64.CPUFeature feature : architecture.getFeatures()) {
-                if (!features.contains(feature)) {
-                    missingFeatures.add(feature);
-                }
-            }
-            throw VMError.shouldNotReachHere("Current target does not support the following CPU features that are required by the image: " + missingFeatures);
-        }
+    @Uninterruptible(reason = "Thread state not set up yet.")
+    @Override
+    public void verifyHostSupportsArchitectureEarlyOrExit() {
+        AMD64LibCHelper.checkCPUFeaturesOrExit(BUILDTIME_CPU_FEATURE_MASK.get(), IMAGE_CPU_FEATURE_ERROR_MSG.get());
     }
 
     @Override
-    public void enableFeatures(Architecture runtimeArchitecture) {
-        if (CalleeSavedRegisters.supportedByPlatform()) {
-            /*
-             * The code for saving and restoring callee-saved registers currently only covers the
-             * registers and register bit width for the CPU features used at image build time. To
-             * enable more CPU features for JIT compilation at run time, the new CPU features
-             * computed by this method would need to be taken into account. Until this is
-             * implemented as part of GR-20653, JIT compilation uses the same CPU features as AOT
-             * compilation.
-             */
-            return;
-        }
+    public void enableFeatures(Architecture runtimeArchitecture, LoweringProvider runtimeLowerer) {
+        // update cpu features
         AMD64 architecture = (AMD64) runtimeArchitecture;
         EnumSet<AMD64.CPUFeature> features = determineHostCPUFeatures();
         architecture.getFeatures().addAll(features);
+
+        // update largest storable kind
+        AMD64Kind largestStorableKind = new AMD64(features).getLargestStorableKind(AMD64.XMM);
+        JVMCISubstitutions.updateLargestStorableKind(architecture, largestStorableKind);
+        AMD64Kind largestStorableMaskKind = new AMD64(features).getLargestStorableKind(AMD64.MASK);
+        JVMCISubstitutions.updateLargestStorableMaskKind(architecture, largestStorableMaskKind);
+
+        // update vector architecture
+        VectorAMD64 initialVectorArch = (VectorAMD64) ((VectorLoweringProvider) runtimeLowerer).getVectorArchitecture();
+        initialVectorArch.updateForRuntimeArchitecture((AMD64) runtimeArchitecture);
     }
 }

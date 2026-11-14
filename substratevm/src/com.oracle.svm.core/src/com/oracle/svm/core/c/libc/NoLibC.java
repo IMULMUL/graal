@@ -24,10 +24,12 @@
  */
 package com.oracle.svm.core.c.libc;
 
-import java.util.List;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
-import com.oracle.svm.core.util.VMError;
-
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class NoLibC implements LibCBase {
 
     public static final String NO_LIBC_ERROR = "Should not call this method when not running on Linux.";
@@ -38,22 +40,7 @@ public class NoLibC implements LibCBase {
     }
 
     @Override
-    public String getTargetCompiler() {
-        throw VMError.shouldNotReachHere(NO_LIBC_ERROR);
-    }
-
-    @Override
-    public List<String> getAdditionalQueryCodeCompilerOptions() {
-        throw VMError.shouldNotReachHere(NO_LIBC_ERROR);
-    }
-
-    @Override
     public boolean hasIsolatedNamespaces() {
-        throw VMError.shouldNotReachHere(NO_LIBC_ERROR);
-    }
-
-    @Override
-    public boolean requiresLibCSpecificStaticJDKLibraries() {
         throw VMError.shouldNotReachHere(NO_LIBC_ERROR);
     }
 }

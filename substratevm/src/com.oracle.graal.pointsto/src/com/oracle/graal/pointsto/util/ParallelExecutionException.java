@@ -31,12 +31,14 @@ import java.util.List;
 /**
  * Bundles all exceptions from on parallel execution so they can be reported properly.
  */
+@SuppressWarnings("serial")
 public class ParallelExecutionException extends RuntimeException {
     private static final long serialVersionUID = -8477198165297173951L;
 
     private final List<Throwable> exceptions;
 
     ParallelExecutionException(List<Throwable> exceptions) {
+        super(exceptions.getFirst().getMessage());
         this.exceptions = exceptions;
     }
 

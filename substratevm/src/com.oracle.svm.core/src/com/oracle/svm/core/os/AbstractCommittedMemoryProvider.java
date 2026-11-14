@@ -24,72 +24,82 @@
  */
 package com.oracle.svm.core.os;
 
-import static com.oracle.svm.core.Isolates.IMAGE_HEAP_BEGIN;
-import static com.oracle.svm.core.Isolates.IMAGE_HEAP_END;
-import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_BEGIN;
-import static com.oracle.svm.core.Isolates.IMAGE_HEAP_WRITABLE_END;
+import static org.graalvm.word.impl.Word.nullPointer;
 
-import java.util.EnumSet;
-
-import org.graalvm.compiler.api.replacements.Fold;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointErrors;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.core.VMInspectionOptions;
+import com.oracle.svm.core.nmt.NativeMemoryTracking;
+import com.oracle.svm.core.nmt.NmtCategory;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.util.VMError;
+import org.graalvm.word.impl.Word;
 
 public abstract class AbstractCommittedMemoryProvider implements CommittedMemoryProvider {
-    @Fold
     @Override
-    public boolean guaranteesHeapPreferredAddressSpaceAlignment() {
-        return SubstrateOptions.SpawnIsolates.getValue() && ImageHeapProvider.get().guaranteesHeapPreferredAddressSpaceAlignment();
+    public Pointer allocateExecutableMemory(UnsignedWord nbytes, UnsignedWord alignment) {
+        return allocate(nbytes, alignment, true, NmtCategory.Code);
     }
 
-    @Uninterruptible(reason = "Still being initialized.")
-    protected static int protectSingleIsolateImageHeap() {
-        assert !SubstrateOptions.SpawnIsolates.getValue() : "Must be handled by ImageHeapProvider when SpawnIsolates is enabled";
-        Pointer heapBegin = IMAGE_HEAP_BEGIN.get();
-        if (Heap.getHeap().getImageHeapOffsetInAddressSpace() != 0) {
-            return CEntryPointErrors.MAP_HEAP_FAILED;
-        }
-        if (!SubstrateOptions.ForceNoROSectionRelocations.getValue()) {
-            /*
-             * Set strict read-only and read+write permissions for the image heap (the entire image
-             * heap should already be read-only, but the linker/loader can place it in a segment
-             * that has the executable bit set unnecessarily)
-             *
-             * If ForceNoROSectionRelocations is set, however, the image heap is writable and should
-             * remain so.
-             */
-            UnsignedWord heapSize = IMAGE_HEAP_END.get().subtract(heapBegin);
-            if (VirtualMemoryProvider.get().protect(heapBegin, heapSize, VirtualMemoryProvider.Access.READ) != 0) {
-                return CEntryPointErrors.PROTECT_HEAP_FAILED;
-            }
-            Pointer writableBegin = IMAGE_HEAP_WRITABLE_BEGIN.get();
-            UnsignedWord writableSize = IMAGE_HEAP_WRITABLE_END.get().subtract(writableBegin);
-            if (VirtualMemoryProvider.get().protect(writableBegin, writableSize, VirtualMemoryProvider.Access.READ | VirtualMemoryProvider.Access.WRITE) != 0) {
-                return CEntryPointErrors.PROTECT_HEAP_FAILED;
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    protected Pointer allocate(UnsignedWord size, UnsignedWord alignment, boolean executable, NmtCategory nmtCategory) {
+        Pointer reserved = Word.nullPointer();
+        if (!UnsignedUtils.isAMultiple(getGranularity(), alignment)) {
+            reserved = VirtualMemoryProvider.get().reserve(size, alignment, executable);
+            if (reserved.isNull()) {
+                return nullPointer();
             }
         }
-        return CEntryPointErrors.NO_ERROR;
+        int access = VirtualMemoryProvider.Access.READ | VirtualMemoryProvider.Access.WRITE;
+        if (executable) {
+            access |= VirtualMemoryProvider.Access.FUTURE_EXECUTE;
+        }
+        Pointer committed = VirtualMemoryProvider.get().commit(reserved, size, access);
+        if (committed.isNull()) {
+            if (reserved.isNonNull()) {
+                VirtualMemoryProvider.get().free(reserved, size);
+            }
+            return nullPointer();
+        }
+        assert reserved.isNull() || reserved.equal(committed);
+
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackReserve(size, nmtCategory);
+            NativeMemoryTracking.singleton().trackCommit(size, nmtCategory);
+        }
+        return committed;
     }
 
     @Override
-    public boolean protect(PointerBase start, UnsignedWord nbytes, EnumSet<Access> accessFlags) {
-        int vmAccessBits = VirtualMemoryProvider.Access.NONE;
-        if (accessFlags.contains(CommittedMemoryProvider.Access.READ)) {
-            vmAccessBits |= VirtualMemoryProvider.Access.READ;
-        }
-        if (accessFlags.contains(CommittedMemoryProvider.Access.WRITE)) {
-            vmAccessBits |= VirtualMemoryProvider.Access.WRITE;
-        }
-        if (accessFlags.contains(CommittedMemoryProvider.Access.EXECUTE)) {
-            vmAccessBits |= VirtualMemoryProvider.Access.EXECUTE;
-        }
-        int success = VirtualMemoryProvider.get().protect(start, nbytes, vmAccessBits);
-        return success == 0;
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public void freeExecutableMemory(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment) {
+        free(start, nbytes, NmtCategory.Code);
     }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    protected static void free(PointerBase start, UnsignedWord nbytes, NmtCategory nmtCategory) {
+        free(start, nbytes, nbytes, nmtCategory);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    protected static void free(PointerBase start, UnsignedWord nbytes, UnsignedWord nbytesCommitted, NmtCategory nmtCategory) {
+        assert nbytesCommitted.belowOrEqual(nbytes);
+        if (VMInspectionOptions.hasNativeMemoryTrackingSupport()) {
+            NativeMemoryTracking.singleton().trackUncommit(nbytesCommitted, nmtCategory);
+            NativeMemoryTracking.singleton().trackFree(nbytes, nmtCategory);
+        }
+
+        int result = VirtualMemoryProvider.get().free(start, nbytes);
+        VMError.guarantee(result == 0, "Error while freeing virtual memory.");
+    }
+
+    /**
+     * The total number of bytes reserved for the whole address space. This address space contains
+     * at least the image heap and the collected Java heap, but may also contain other data such as
+     * the null regions, the metaspace, or auxiliary images.
+     */
+    protected abstract UnsignedWord getReservedAddressSpaceSize();
 }

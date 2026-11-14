@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -80,16 +80,22 @@ public final class BreakpointsHandler {
     }
 
     public List<com.oracle.truffle.tools.dap.types.Breakpoint> setBreakpoints(SetBreakpointsArguments args) {
-        Source source;
+        Source source = null;
         Integer sourceReference = args.getSource().getSourceReference();
-        String path = args.getSource().getPath();
-        String srcId;
-        if (sourceReference != null && sourceReference > 0) {
+        boolean hasSourceReference = sourceReference != null && sourceReference > 0;
+        String clientPath = args.getSource().getPath();
+        String path = hasSourceReference ? clientPath : context.clientToRuntimePath(clientPath);
+        String srcId = null;
+        if (hasSourceReference) {
             source = context.getLoadedSourcesHandler().getSource(sourceReference);
             srcId = (path != null ? path : "") + '#' + sourceReference;
-        } else {
+        }
+        if (source == null && path != null) {
             source = context.getLoadedSourcesHandler().getSource(path);
             srcId = path;
+        }
+        if (srcId == null) {
+            throw Errors.sourceRequestIllegalHandle();
         }
         Map<SourceBreakpoint, Integer> toAdd = new HashMap<>();
         Map<SourceBreakpoint, Integer> toRemove;
@@ -175,7 +181,7 @@ public final class BreakpointsHandler {
                 }
             }
         } else {
-            context.getLoadedSourcesHandler().runOnLoad(args.getSource().getPath(), null);
+            context.getLoadedSourcesHandler().runOnLoad(path, null);
             List<Consumer<Source>> tasks = new ArrayList<>(args.getBreakpoints().size());
             for (SourceBreakpoint sourceBreakpoint : args.getBreakpoints()) {
                 Integer id;
@@ -239,7 +245,7 @@ public final class BreakpointsHandler {
                 }
             }
             if (!tasks.isEmpty()) {
-                context.getLoadedSourcesHandler().runOnLoad(args.getSource().getPath(), (src) -> {
+                context.getLoadedSourcesHandler().runOnLoad(path, (src) -> {
                     for (Consumer<Source> task : tasks) {
                         task.accept(src);
                     }
@@ -344,7 +350,7 @@ public final class BreakpointsHandler {
         if (sourceReference != null && sourceReference > 0) {
             source = context.getLoadedSourcesHandler().getSource(sourceReference);
         } else {
-            source = context.getLoadedSourcesHandler().getSource(args.getSource().getPath());
+            source = context.getLoadedSourcesHandler().getSource(context.clientToRuntimePath(args.getSource().getPath()));
         }
         List<BreakpointLocation> locations = new ArrayList<>();
         if (source != null && source.hasCharacters() && source.getLength() > 0) {

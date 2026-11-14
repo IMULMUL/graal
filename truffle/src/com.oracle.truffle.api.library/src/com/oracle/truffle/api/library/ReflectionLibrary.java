@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -56,15 +56,15 @@ import com.oracle.truffle.api.library.GenerateLibrary.DefaultExport;
  *
  * <h3>Sending Messages</h3>
  *
- * Messages can be sent to receivers by first {@link Message#resolve(Class, String) resolving} a
- * target message. Then the message can be sent to a receiver that may implement that message. The
- * message name and class may be resolved dynamically.
+ * Messages can be sent to receivers by first {@link Message#resolveExact(Class, String, Class[])}
+ * resolving} a target message. Then the message can be sent to a receiver that may implement that
+ * message. The message name and class may be resolved dynamically.
  *
  * <h4>Usage example</h4>
  *
  * <pre>
  * String messageName = "isArray";
- * Message message = Message.resolve(ArrayLibrary.class, messageName);
+ * Message message = Message.resolveExact(ArrayLibrary.class, messageName);
  * Object receiver = 42;
  * try {
  *     ReflectionLibrary.getFactory().getUncached().send(receiver, message);
@@ -132,6 +132,7 @@ public abstract class ReflectionLibrary extends Library {
     }
 
     private static final LibraryFactory<ReflectionLibrary> FACTORY = LibraryFactory.resolve(ReflectionLibrary.class);
+    static final ReflectionLibrary UNCACHED = FACTORY.getUncached();
 
     /**
      * Returns the library factory for {@link ReflectionLibrary}.
@@ -140,6 +141,28 @@ public abstract class ReflectionLibrary extends Library {
      */
     public static LibraryFactory<ReflectionLibrary> getFactory() {
         return FACTORY;
+    }
+
+    /**
+     * Returns the uncached automatically dispatched version of the reflection library. This is a
+     * short-cut for calling <code>ReflectionLibrary.getFactory().getUncached()</code>.
+     *
+     * @see LibraryFactory#getUncached()
+     * @since 21.3
+     */
+    public static ReflectionLibrary getUncached() {
+        return UNCACHED;
+    }
+
+    /**
+     * Returns the uncached manually dispatched version of the reflection library. This is a
+     * short-cut for calling <code>ReflectionLibrary.getFactory().getUncached(v)</code>.
+     *
+     * @see LibraryFactory#getUncached(Object)
+     * @since 21.3
+     */
+    public static ReflectionLibrary getUncached(Object v) {
+        return FACTORY.getUncached(v);
     }
 
 }

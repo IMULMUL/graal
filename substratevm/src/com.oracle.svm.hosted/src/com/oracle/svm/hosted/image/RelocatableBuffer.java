@@ -27,16 +27,21 @@ package com.oracle.svm.hosted.image;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.Collections;
 import java.util.Map;
-import java.util.Set;
-import java.util.SortedMap;
+import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.function.ObjIntConsumer;
 
-import org.graalvm.compiler.core.common.NumUtil;
 import org.graalvm.nativeimage.c.function.RelocatedPointer;
 
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
 import com.oracle.objectfile.ObjectFile;
+import com.oracle.svm.core.graal.code.CGlobalDataBasePointer;
+import com.oracle.svm.guest.staging.meta.MethodRef;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.vm.ci.code.site.Reference;
 
 /**
  * Offers a {@link ByteBuffer} with additional support for marking relocation sites within the
@@ -44,7 +49,7 @@ import com.oracle.objectfile.ObjectFile;
  */
 public final class RelocatableBuffer {
     private final ByteBuffer byteBuffer;
-    private final SortedMap<Integer, Info> relocations;
+    private final NavigableMap<Integer, Info> relocations;
 
     public RelocatableBuffer(long size, ByteOrder byteOrder) {
         int intSize = NumUtil.safeToInt(size);
@@ -52,20 +57,41 @@ public final class RelocatableBuffer {
         this.relocations = new TreeMap<>();
     }
 
-    public void addRelocationWithoutAddend(int key, ObjectFile.RelocationKind relocationKind, Object targetObject) {
-        relocations.put(key, new Info(relocationKind, null, targetObject));
+    public void addRelocationWithoutAddend(int offset, ObjectFile.RelocationKind relocationKind, Object targetObject) {
+        addRelocationWithAddend(offset, relocationKind, 0, targetObject);
     }
 
-    public void addRelocationWithAddend(int key, ObjectFile.RelocationKind relocationKind, Long explicitAddend, Object targetObject) {
-        relocations.put(key, new Info(relocationKind, explicitAddend, targetObject));
+    public void addRelocationWithAddend(int offset, ObjectFile.RelocationKind relocationKind, long addend, Object targetObject) {
+        Info info = new Info(relocationKind, addend, targetObject);
+        assert checkNoOverlaps(offset, info);
+        Info existing = relocations.put(offset, info);
+        VMError.guarantee(existing == null, "Offset %d already has relocation %s when inserting: %s", offset, existing, info);
+    }
+
+    private boolean checkNoOverlaps(int offset, Info info) {
+        Map.Entry<Integer, Info> previous = relocations.floorEntry(offset);
+        if (previous != null) {
+            checkNoOverlap(previous.getKey(), previous.getValue(), offset, info);
+        }
+        Map.Entry<Integer, Info> next = relocations.higherEntry(offset);
+        if (next != null) {
+            checkNoOverlap(offset, info, next.getKey(), next.getValue());
+        }
+        return true;
+    }
+
+    private static void checkNoOverlap(int firstOffset, Info firstInfo, int secondOffset, Info secondInfo) {
+        assert firstOffset <= secondOffset;
+        int firstSize = firstInfo.getRelocationSize();
+        assert (long) firstOffset + firstSize <= secondOffset : String.format("Relocation %s at offset %d overlaps with relocation %s at offset %d", firstInfo, firstOffset, secondInfo, secondOffset);
     }
 
     public boolean hasRelocations() {
         return !relocations.isEmpty();
     }
 
-    public Set<Map.Entry<Integer, RelocatableBuffer.Info>> getSortedRelocations() {
-        return Collections.unmodifiableSet(relocations.entrySet());
+    public void forEachRelocation(ObjIntConsumer<Info> action) {
+        relocations.forEach((offset, info) -> action.accept(info, offset));
     }
 
     public byte[] getBackingArray() {
@@ -76,9 +102,9 @@ public final class RelocatableBuffer {
         return byteBuffer;
     }
 
-    static final class Info {
+    public static final class Info {
         private final ObjectFile.RelocationKind relocationKind;
-        private final Long explicitAddend;
+        private final long addend;
         /**
          * The referenced object on the heap. If this is an instance of a {@link RelocatedPointer},
          * than the relocation is not treated as a data relocation but has a special meaning, e.g. a
@@ -86,26 +112,25 @@ public final class RelocatableBuffer {
          */
         private final Object targetObject;
 
-        Info(ObjectFile.RelocationKind kind, Long explicitAddend, Object targetObject) {
+        Info(ObjectFile.RelocationKind kind, long addend, Object targetObject) {
             this.relocationKind = kind;
-            this.explicitAddend = explicitAddend;
+            this.addend = addend;
             this.targetObject = targetObject;
+
+            /* Sanity check for allowed groups of target objects. */
+            assert targetObject instanceof Reference || targetObject instanceof MethodRef || targetObject instanceof CGlobalDataBasePointer || targetObject instanceof ImageHeapConstant : targetObject;
         }
 
         public int getRelocationSize() {
-            return ObjectFile.RelocationKind.getRelocationSize(relocationKind);
+            return relocationKind.getRelocationSize();
         }
 
         public ObjectFile.RelocationKind getRelocationKind() {
             return relocationKind;
         }
 
-        public boolean hasExplicitAddend() {
-            return (explicitAddend != null);
-        }
-
-        public Long getExplicitAddend() {
-            return explicitAddend;
+        public long getAddend() {
+            return addend;
         }
 
         public Object getTargetObject() {
@@ -114,7 +139,7 @@ public final class RelocatableBuffer {
 
         @Override
         public String toString() {
-            return "RelocatableBuffer.Info(targetObject=" + targetObject + " relocationKind=" + relocationKind + " explicitAddend=" + explicitAddend + ")";
+            return "RelocatableBuffer.Info(targetObject=" + targetObject + " relocationKind=" + relocationKind + " addend=" + addend + ")";
         }
     }
 }

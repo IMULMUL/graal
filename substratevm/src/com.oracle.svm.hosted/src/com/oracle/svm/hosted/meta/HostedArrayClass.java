@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.hosted.meta;
 
+import java.util.List;
+
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 import jdk.vm.ci.meta.JavaKind;
@@ -34,8 +36,9 @@ public class HostedArrayClass extends HostedClass {
     private final HostedType baseType;
     private final int arrayDepth;
 
+    @SuppressWarnings("this-escape")
     public HostedArrayClass(HostedUniverse universe, AnalysisType wrapped, JavaKind kind, JavaKind storageKind, HostedClass superClass, HostedInterface[] interfaces, HostedType componentType) {
-        super(universe, wrapped, kind, storageKind, superClass, interfaces, true);
+        super(universe, wrapped, kind, storageKind, superClass, interfaces);
         this.componentType = componentType;
 
         HostedType cur = this;
@@ -69,6 +72,11 @@ public class HostedArrayClass extends HostedClass {
     }
 
     @Override
+    public List<? extends HostedType> getPermittedSubclasses() {
+        return null;
+    }
+
+    @Override
     public HostedType getBaseType() {
         return baseType;
     }
@@ -80,7 +88,7 @@ public class HostedArrayClass extends HostedClass {
 
     @Override
     public HostedField[] getInstanceFields(boolean includeSuperclasses) {
-        return new HostedField[0];
+        return HostedField.EMPTY_ARRAY;
     }
 
     @Override
@@ -91,11 +99,5 @@ public class HostedArrayClass extends HostedClass {
     @Override
     public boolean isMember() {
         return false;
-    }
-
-    @Override
-    int compareToEqualClass(HostedType other) {
-        assert getClass().equals(other.getClass());
-        return getComponentType().compareTo(other.getComponentType());
     }
 }

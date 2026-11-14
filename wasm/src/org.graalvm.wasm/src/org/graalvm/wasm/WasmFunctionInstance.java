@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,31 +40,54 @@
  */
 package org.graalvm.wasm;
 
+import java.util.Objects;
+
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.TruffleContext;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Idempotent;
+import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.nodes.WasmIndirectCallNode;
+import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.RootNode;
 
 @ExportLibrary(InteropLibrary.class)
-public class WasmFunctionInstance implements TruffleObject {
-    private final WasmContext.Uid contextUid;
+public final class WasmFunctionInstance extends WasmTypedHeapObject implements TruffleObject, EmbedderDataHolder {
+
+    private final WasmContext context;
+    private final WasmInstance moduleInstance;
     private final WasmFunction function;
-    private final CallTarget target;
+    private final RootNode rootNode;
+    /**
+     * Stores the imported function object for {@link org.graalvm.wasm.api.ExecuteHostFunctionNode}.
+     * Initialized during linking.
+     */
+    private Object importedFunction;
+
+    private Object embedderData = WasmConstant.VOID;
 
     /**
      * Represents a call target that is a WebAssembly function or an imported function.
-     *
-     * If the function is imported, then context UID and the function are set to {@code null}.
      */
-    public WasmFunctionInstance(WasmContext.Uid contextUid, WasmFunction function, CallTarget target) {
-        Assert.assertNotNull(target, "Call target must be non-null", Failure.UNSPECIFIED_INTERNAL);
-        this.contextUid = contextUid;
-        this.function = function;
-        this.target = target;
+    public WasmFunctionInstance(WasmInstance moduleInstance, WasmFunction function, CallTarget target) {
+        this(moduleInstance.context(), moduleInstance, function, target);
+    }
+
+    public WasmFunctionInstance(WasmContext context, WasmInstance moduleInstance, WasmFunction function, CallTarget target) {
+        super(function.type());
+        this.context = Objects.requireNonNull(context, "context must be non-null");
+        this.moduleInstance = Objects.requireNonNull(moduleInstance, "module instance must be non-null");
+        this.function = Objects.requireNonNull(function, "function must be non-null");
+        this.rootNode = ((RootCallTarget) Objects.requireNonNull(target, "Call target must be non-null")).getRootNode();
+        assert rootNode.getLanguage(WasmLanguage.class) == context.language();
     }
 
     @Override
@@ -72,13 +95,26 @@ public class WasmFunctionInstance implements TruffleObject {
         return name();
     }
 
-    public WasmContext.Uid contextUid() {
-        return contextUid;
+    public WasmStore store() {
+        return moduleInstance.store();
     }
 
+    public WasmContext context() {
+        return context;
+    }
+
+    public TruffleContext getTruffleContext() {
+        return context.environment().getContext();
+    }
+
+    public WasmInstance moduleInstance() {
+        return moduleInstance;
+    }
+
+    @TruffleBoundary
     public String name() {
         if (function == null) {
-            return target.toString();
+            return target().toString();
         }
         return function.name();
     }
@@ -88,16 +124,79 @@ public class WasmFunctionInstance implements TruffleObject {
     }
 
     public CallTarget target() {
-        return target;
+        return rootNode.getCallTarget();
     }
 
+    @Idempotent
+    public RootNode rootNode() {
+        return rootNode;
+    }
+
+    public void setImportedFunction(Object importedFunction) {
+        this.importedFunction = importedFunction;
+    }
+
+    public Object getImportedFunction() {
+        return importedFunction;
+    }
+
+    @SuppressWarnings("static-method")
     @ExportMessage
     boolean isExecutable() {
         return true;
     }
 
     @ExportMessage
-    Object execute(Object[] arguments, @Cached WasmIndirectCallNode callNode) {
-        return callNode.execute(target, arguments);
+    static class Execute {
+        private static Object execute(WasmFunctionInstance functionInstance, Object[] arguments, CallTarget callAdapter, Node callNode) {
+            return callAdapter.call(callNode, WasmArguments.create(functionInstance, arguments));
+            // throws ArityException, UnsupportedTypeException
+        }
+
+        @SuppressWarnings("unused")
+        @Specialization(guards = {"actualFunction == cachedFunction"}, limit = "2")
+        static Object direct(WasmFunctionInstance functionInstance, Object[] arguments,
+                        @Bind("functionInstance.function()") WasmFunction actualFunction,
+                        @Cached("actualFunction") WasmFunction cachedFunction,
+                        @Cached("getOrCreateInteropCallAdapter(functionInstance)") CallTarget cachedCallAdapter,
+                        @Bind Node node) {
+            return execute(functionInstance, arguments, cachedCallAdapter, node);
+        }
+
+        @SuppressWarnings("unused")
+        @Specialization(guards = {"actualCallAdapter == cachedCallAdapter"}, limit = "3", replaces = "direct")
+        static Object directAdapter(WasmFunctionInstance functionInstance, Object[] arguments,
+                        @Bind("getOrCreateInteropCallAdapter(functionInstance)") CallTarget actualCallAdapter,
+                        @Cached("actualCallAdapter") CallTarget cachedCallAdapter,
+                        @Bind Node node) {
+            return execute(functionInstance, arguments, cachedCallAdapter, node);
+        }
+
+        @Specialization(replaces = "directAdapter")
+        static Object indirect(WasmFunctionInstance functionInstance, Object[] arguments,
+                        @Bind Node node) {
+            CallTarget callAdapter = getOrCreateInteropCallAdapter(functionInstance);
+            Node callNode = node.isAdoptable() ? node : EncapsulatingNodeReference.getCurrent().get();
+            return execute(functionInstance, arguments, callAdapter, callNode);
+        }
+
+        static CallTarget getOrCreateInteropCallAdapter(WasmFunctionInstance functionInstance) {
+            WasmFunction function = functionInstance.function();
+            CallTarget callAdapter = function.getInteropCallAdapter();
+            if (CompilerDirectives.injectBranchProbability(CompilerDirectives.SLOWPATH_PROBABILITY, callAdapter == null)) {
+                return function.getOrCreateInteropCallAdapter(functionInstance.context().language());
+            }
+            return callAdapter;
+        }
+    }
+
+    @Override
+    public Object getEmbedderData() {
+        return embedderData;
+    }
+
+    @Override
+    public void setEmbedderData(Object embedderData) {
+        this.embedderData = embedderData;
     }
 }

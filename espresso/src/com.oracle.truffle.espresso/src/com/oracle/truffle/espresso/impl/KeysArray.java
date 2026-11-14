@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,11 +31,15 @@ import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.profiles.BranchProfile;
 
+/**
+ * Lightweight Truffle interop wrapper that exposes a Java array as a readable foreign array. Used
+ * throughout Espresso when array-shaped results need to cross an interop boundary.
+ */
 @ExportLibrary(InteropLibrary.class)
-public final class KeysArray implements TruffleObject {
-    @CompilationFinal(dimensions = 1) private final String[] keys;
+public final class KeysArray<T> implements TruffleObject {
+    @CompilationFinal(dimensions = 1) private final T[] keys;
 
-    public KeysArray(String[] keys) {
+    public KeysArray(T[] keys) {
         this.keys = keys;
     }
 
@@ -56,7 +60,7 @@ public final class KeysArray implements TruffleObject {
     }
 
     @ExportMessage
-    String readArrayElement(long idx,
+    Object readArrayElement(long idx,
                     @Cached BranchProfile exception) throws InvalidArrayIndexException {
         if (!isArrayElementReadable(idx)) {
             exception.enter();

@@ -24,22 +24,22 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_8;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_8;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_8;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_8;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.InputType;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.DeoptimizingFixedWithNextNode;
-import org.graalvm.compiler.nodes.DeoptimizingNode.DeoptBefore;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.memory.SingleMemoryKill;
-import org.graalvm.compiler.nodes.spi.Lowerable;
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
 
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.InputType;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.DeoptimizingFixedWithNextNode;
+import jdk.graal.compiler.nodes.DeoptimizingNode.DeoptBefore;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
+import jdk.graal.compiler.nodes.spi.Lowerable;
 import jdk.vm.ci.meta.JavaKind;
 
 @NodeInfo(cycles = CYCLES_8, size = SIZE_8, allowedUsageTypes = {InputType.Memory})
@@ -51,38 +51,41 @@ public final class CEntryPointEnterNode extends DeoptimizingFixedWithNextNode im
     public enum EnterAction {
         CreateIsolate,
         AttachThread,
+        AttachNewlyStartedThread,
         Enter,
-        EnterIsolate,
+        EnterByIsolate,
     }
 
     protected final EnterAction enterAction;
 
     @OptionalInput protected ValueNode parameter;
     private final boolean ensureJavaThread;
-    private final boolean isCrashHandler;
 
     public static CEntryPointEnterNode createIsolate(ValueNode parameters) {
-        return new CEntryPointEnterNode(EnterAction.CreateIsolate, parameters, false, false);
+        return new CEntryPointEnterNode(EnterAction.CreateIsolate, parameters, false);
     }
 
-    public static CEntryPointEnterNode attachThread(ValueNode isolate, boolean ensureJavaThread, boolean inCrashHandler) {
-        return new CEntryPointEnterNode(EnterAction.AttachThread, isolate, ensureJavaThread, inCrashHandler);
+    public static CEntryPointEnterNode attachThread(ValueNode isolate, boolean ensureJavaThread) {
+        return new CEntryPointEnterNode(EnterAction.AttachThread, isolate, ensureJavaThread);
+    }
+
+    public static CEntryPointEnterNode attachNewlyStartedThread(ValueNode thread) {
+        return new CEntryPointEnterNode(EnterAction.AttachNewlyStartedThread, thread, false);
     }
 
     public static CEntryPointEnterNode enter(ValueNode isolateThread) {
-        return new CEntryPointEnterNode(EnterAction.Enter, isolateThread, false, false);
+        return new CEntryPointEnterNode(EnterAction.Enter, isolateThread, false);
     }
 
-    public static CEntryPointEnterNode enterIsolate(ValueNode isolate) {
-        return new CEntryPointEnterNode(EnterAction.EnterIsolate, isolate, false, false);
+    public static CEntryPointEnterNode enterByIsolate(ValueNode isolate) {
+        return new CEntryPointEnterNode(EnterAction.EnterByIsolate, isolate, false);
     }
 
-    protected CEntryPointEnterNode(EnterAction enterAction, ValueNode parameter, boolean ensureJavaThread, boolean isCrashHandler) {
+    protected CEntryPointEnterNode(EnterAction enterAction, ValueNode parameter, boolean ensureJavaThread) {
         super(TYPE, StampFactory.forKind(JavaKind.Int));
         this.enterAction = enterAction;
         this.parameter = parameter;
         this.ensureJavaThread = ensureJavaThread;
-        this.isCrashHandler = isCrashHandler;
     }
 
     public EnterAction getEnterAction() {
@@ -95,10 +98,6 @@ public final class CEntryPointEnterNode extends DeoptimizingFixedWithNextNode im
 
     public boolean getEnsureJavaThread() {
         return ensureJavaThread;
-    }
-
-    public boolean isCrashHandler() {
-        return isCrashHandler;
     }
 
     @Override

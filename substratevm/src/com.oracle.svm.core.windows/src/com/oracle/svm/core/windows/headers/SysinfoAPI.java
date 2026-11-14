@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,7 +34,8 @@ import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.windows.headers.LibC.WCharPointer;
+import com.oracle.svm.core.windows.headers.WinBase.FILETIME;
+import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
 
 // Checkstyle: stop
 
@@ -51,6 +52,10 @@ public class SysinfoAPI {
     /** Return information about the current computer system. */
     @CFunction(transition = NO_TRANSITION)
     public static native void GetSystemInfo(SYSTEM_INFO lpSystemInfo);
+
+    /** Retrieves the current local date and time. */
+    @CFunction(transition = NO_TRANSITION)
+    public static native void GetLocalTime(SYSTEMTIME lpSystemTime);
 
     /** Structure containing information about the current computer system. */
     @CStruct
@@ -88,6 +93,41 @@ public class SysinfoAPI {
         @CField
         short wProcessorRevision();
     }
+
+    /** Structure containing a date and time. */
+    @CStruct
+    public interface SYSTEMTIME extends PointerBase {
+        @CField
+        short wYear();
+
+        @CField
+        short wMonth();
+
+        @CField
+        short wDayOfWeek();
+
+        @CField
+        short wDay();
+
+        @CField
+        short wHour();
+
+        @CField
+        short wMinute();
+
+        @CField
+        short wSecond();
+
+        @CField
+        short wMilliseconds();
+    }
+
+    /**
+     * Retrieves the current system date and time. The information is in Coordinated Universal Time
+     * (UTC) format.
+     */
+    @CFunction(transition = NO_TRANSITION)
+    public static native void GetSystemTimeAsFileTime(FILETIME lpSystemTimeAsFileTime);
 
     /** Retrieves the path of the Windows directory. */
     @CFunction(transition = NO_TRANSITION)

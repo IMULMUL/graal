@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,7 @@ package com.oracle.truffle.regex.tregex.parser.ast;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.regex.tregex.buffer.CompilationBuffer;
 import com.oracle.truffle.regex.tregex.util.json.JsonValue;
+import com.oracle.truffle.regex.util.TBitSet;
 
 /**
  * An assertion that succeeds depending on whether another regular expression can be matched at the
@@ -53,6 +54,8 @@ import com.oracle.truffle.regex.tregex.util.json.JsonValue;
  * goal symbol in the ECMAScript RegExp syntax.
  */
 public class LookAheadAssertion extends LookAroundAssertion {
+
+    private TBitSet referencedConditionGroups;
 
     /**
      * Creates a new lookahead assertion AST node.
@@ -72,6 +75,21 @@ public class LookAheadAssertion extends LookAroundAssertion {
 
     private LookAheadAssertion(LookAheadAssertion copy, RegexAST ast, CompilationBuffer compilationBuffer) {
         super(copy, ast, compilationBuffer);
+    }
+
+    public void registerReferencedConditionGroup(int groupNumber) {
+        if (referencedConditionGroups == null) {
+            referencedConditionGroups = new TBitSet(Long.SIZE);
+        }
+        referencedConditionGroups.set(groupNumber);
+    }
+
+    public TBitSet getReferencedConditionGroups() {
+        if (referencedConditionGroups == null) {
+            return TBitSet.getEmptyInstance();
+        } else {
+            return referencedConditionGroups;
+        }
     }
 
     @Override

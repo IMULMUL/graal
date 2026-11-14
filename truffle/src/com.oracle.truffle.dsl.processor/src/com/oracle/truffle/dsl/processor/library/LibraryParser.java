@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,10 +40,13 @@
  */
 package com.oracle.truffle.dsl.processor.library;
 
-import java.util.Arrays;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.AnnotationValue;
@@ -52,18 +55,21 @@ import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.ElementFilter;
+import javax.lang.model.util.Elements;
+import javax.lang.model.util.Types;
 
+import com.oracle.truffle.dsl.processor.ProcessorContext;
 import com.oracle.truffle.dsl.processor.java.ElementUtils;
 import com.oracle.truffle.dsl.processor.java.compiler.CompilerFactory;
 import com.oracle.truffle.dsl.processor.parser.AbstractParser;
 
 public class LibraryParser extends AbstractParser<LibraryData> {
-
-    public final List<DeclaredType> annotations = Arrays.asList(types.GenerateLibrary, types.GenerateLibrary_DefaultExport, types.GenerateLibrary_Abstract);
 
     @Override
     public boolean isDelegateToRootDeclaredType() {
@@ -91,6 +97,23 @@ public class LibraryParser extends AbstractParser<LibraryData> {
         }
         if (element.getEnclosingElement().getKind() != ElementKind.PACKAGE && !element.getModifiers().contains(Modifier.STATIC)) {
             model.addError("Declared inner library classes must be static.");
+            return model;
+        }
+
+        AnnotationMirror generateAOT = ElementUtils.findAnnotationMirror(element, types.GenerateAOT);
+        if (generateAOT != null) {
+            model.setGenerateAOT(true);
+        }
+
+        AnnotationMirror invalidAnnotation = ElementUtils.findAnnotationMirror(element, types.GenerateCached);
+        if (invalidAnnotation == null) {
+            invalidAnnotation = ElementUtils.findAnnotationMirror(element, types.GenerateUncached);
+        }
+        if (invalidAnnotation == null) {
+            invalidAnnotation = ElementUtils.findAnnotationMirror(element, types.GenerateInline);
+        }
+        if (invalidAnnotation != null) {
+            model.addError(invalidAnnotation, null, "The annotation @%s cannot be used on a library.", ElementUtils.getSimpleName(invalidAnnotation.getAnnotationType()));
             return model;
         }
 
@@ -130,7 +153,8 @@ public class LibraryParser extends AbstractParser<LibraryData> {
         allMethods.add(ElementUtils.findExecutableElement(types.Library, "accepts"));
 
         TypeMirror inferredReceiverType = null;
-        Map<String, LibraryMessage> messages = new HashMap<>();
+
+        Map<String, List<LibraryMessage>> messageByName = new LinkedHashMap<>();
         for (ExecutableElement executable : allMethods) {
             Modifier visibility = ElementUtils.getVisibility(executable.getModifiers());
             if (visibility == Modifier.PRIVATE) {
@@ -144,16 +168,11 @@ public class LibraryParser extends AbstractParser<LibraryData> {
                 // it is automatically implemented.
                 continue;
             }
+            boolean isDeprecated = ElementUtils.isDeprecated(executable);
             String messageName = executable.getSimpleName().toString();
 
-            LibraryMessage message = messages.get(messageName);
-            if (message == null) {
-                message = new LibraryMessage(model, messageName, executable);
-            } else {
-                message.addError("Library message must have a unique name. Two methods with the same name found." +
-                                "If this method is not intended to be a library message then add the private or final modifier to ignore it.");
-                continue;
-            }
+            LibraryMessage message = new LibraryMessage(model, messageName, executable, isDeprecated);
+            messageByName.computeIfAbsent(messageName, (e) -> new ArrayList<>()).add(message);
 
             if (visibility == null) {
                 message.addError("Library messages must be public or protected. Annotate with @GenerateLibrary.Ignore to ignore this method for generation. ");
@@ -178,14 +197,82 @@ public class LibraryParser extends AbstractParser<LibraryData> {
                 }
             }
 
-            LibraryMessage declaredIn = messages.get(messageName);
-            if (declaredIn != null) {
-                message.addError("Messages with the same name are not supported.");
-                continue;
+        }
+
+        // deprecation handling + add messages to model
+        messageByName: for (var entry : messageByName.entrySet()) {
+            List<LibraryMessage> messages = entry.getValue();
+
+            for (LibraryMessage message : messages) {
+                if (message.isDeprecated() && message.isAbstract()) {
+                    message.addError("A deprecated message must not be abstract. Deprecated messages need a default implementation.");
+                    model.getMethods().add(message);
+                    continue messageByName;
+                }
             }
 
-            messages.put(messageName, message);
-            model.getMethods().add(message);
+            if (messages.size() > 1) {
+                List<LibraryMessage> deprecatedMessages = new ArrayList<>();
+                List<LibraryMessage> nonDeprecatedMessages = new ArrayList<>();
+                for (LibraryMessage overload : messages) {
+                    if (overload.isDeprecated()) {
+                        deprecatedMessages.add(overload);
+                    } else {
+                        nonDeprecatedMessages.add(overload);
+                    }
+                }
+                LibraryMessage primaryMessage = null;
+                if (nonDeprecatedMessages.size() > 1) {
+                    for (LibraryMessage message : nonDeprecatedMessages) {
+                        message.addError("Library message must have a unique name. Two methods with the same name found. " +
+                                        "If this method is not intended to be a library message then add the private or final modifier to ignore it. " +
+                                        "Note it is also possible to deprecate all messages except one using the @Deprecated annotation in order to evolve APIs in a compatible way.");
+                    }
+                    model.getMethods().addAll(nonDeprecatedMessages);
+                    continue; // next group
+                } else if (nonDeprecatedMessages.size() == 1) {
+                    primaryMessage = nonDeprecatedMessages.get(0);
+
+                    for (LibraryMessage message : deprecatedMessages) {
+                        if (!primaryMessage.canBeDeprecatedFrom(message)) {
+                            message.addError("Could not delegate from this deprecated message to method %s. Method parameters are not compatible.",
+                                            ElementUtils.getReadableSignature(primaryMessage.getExecutable()));
+                            model.getMethods().add(message);
+                            continue messageByName;
+                        }
+                    }
+
+                } else {
+                    outer: for (LibraryMessage m1 : deprecatedMessages) {
+                        for (LibraryMessage m2 : deprecatedMessages) {
+                            if (!m1.canBeDeprecatedFrom(m2)) {
+                                continue outer;
+                            }
+                        }
+                        primaryMessage = m1;
+                    }
+
+                    if (primaryMessage == null) {
+                        for (LibraryMessage message : deprecatedMessages) {
+                            message.addError(
+                                            "Could not determine primary overload for all deprecated messages. " +
+                                                            "There must be one library message with the same name that all other messages can delegate to.");
+                        }
+                        model.getMethods().addAll(deprecatedMessages);
+                        continue; // next group
+                    }
+
+                    deprecatedMessages.remove(primaryMessage);
+                }
+                for (LibraryMessage deprecated : deprecatedMessages) {
+                    deprecated.setDeprecatedReplacement(primaryMessage);
+                }
+
+                primaryMessage.setDeprecatedOverloads(deprecatedMessages);
+                model.getMethods().add(primaryMessage);
+            } else {
+                model.getMethods().addAll(messages);
+            }
         }
 
         if (!model.hasErrors() && model.getMethods().size() <= 1) {
@@ -193,20 +280,24 @@ public class LibraryParser extends AbstractParser<LibraryData> {
         }
 
         // parse abstract methods
+        Set<LibraryMessage> replacedMessages = new HashSet<>();
         for (LibraryMessage message : model.getMethods()) {
             AnnotationMirror abstractMirror = ElementUtils.findAnnotationMirror(message.getExecutable(), types.GenerateLibrary_Abstract);
             if (abstractMirror != null) {
                 message.setAbstract(true);
-                AnnotationValue value = ElementUtils.getAnnotationValue(abstractMirror, "ifExported");
-                for (String ifExported : ElementUtils.getAnnotationValueList(String.class, abstractMirror, "ifExported")) {
-                    LibraryMessage ifExportedMessage = messages.get(ifExported);
-                    if (ifExportedMessage == message) {
-                        message.addError(abstractMirror, value, "The ifExported condition links to itself. Remove that condition to resolve this problem.");
-                    } else if (ifExportedMessage == null) {
-                        message.addError(abstractMirror, value, "The ifExported condition links to an unknown message '%s'. Only valid library messages may be linked.", ifExported);
-                    } else {
-                        message.getAbstractIfExported().add(ifExportedMessage);
+                message.getAbstractIfExported().addAll(parseAbstractIfExported(message, abstractMirror, "ifExported", messageByName));
+                message.getAbstractIfExportedAsWarning().addAll(parseAbstractIfExported(message, abstractMirror, "ifExportedAsWarning", messageByName));
+                LibraryMessage replaced = parseAbstractReplacementFor(message, abstractMirror, "replacementOf", messageByName);
+                ExecutableElement replacementMethod = parseAbstractReplacementWith(message, replaced, abstractMirror, "replacementMethod", allMethods);
+
+                if (replacementMethod != null && replaced == null) {
+                    message.addError("The 'replacementMethod' attribute is only valid when 'replacementOf' is also specified.");
+                }
+                if (replaced != null) {
+                    if (!replacedMessages.add(replaced)) {
+                        message.addError("Message " + message.getName() + " is a replacement of multiple messages. Arguments to replacementOf annotation have to be unique.");
                     }
+                    message.setReplacementOf(replaced, replacementMethod);
                 }
             }
         }
@@ -252,7 +343,189 @@ public class LibraryParser extends AbstractParser<LibraryData> {
             model.setObjectExports(objectExports);
         }
 
+        for (LibraryMessage message : model.getMethods()) {
+            // must be first to guarantee message lookup ordering
+            model.getAllMethods().add(message);
+            model.getAllMethods().addAll(message.getDeprecatedOverloads());
+        }
+
         return model;
+    }
+
+    private static Set<LibraryMessage> parseAbstractIfExported(LibraryMessage message, AnnotationMirror abstractMirror, String ifExportedAttribute, Map<String, List<LibraryMessage>> messages) {
+        Set<LibraryMessage> abstractIfExportedMessages = new LinkedHashSet<>();
+        AnnotationValue value = ElementUtils.getAnnotationValue(abstractMirror, ifExportedAttribute);
+        List<String> valueList = ElementUtils.getAnnotationValueList(String.class, abstractMirror, ifExportedAttribute);
+        for (String ifExported : valueList) {
+            List<LibraryMessage> ifExportedMessages = messages.get(ifExported);
+            LibraryMessage ifExportedMessage = ifExportedMessages != null ? ifExportedMessages.get(0) : null;
+
+            if (ifExportedMessage == message) {
+                message.addError(abstractMirror, value, "The %s condition links to itself. Remove that condition to resolve this problem.", ifExportedAttribute);
+            } else if (ifExportedMessage == null) {
+                message.addError(abstractMirror, value, "The %s condition links to an unknown message '%s'. Only valid library messages may be linked.", ifExportedAttribute, ifExported);
+            } else {
+                abstractIfExportedMessages.add(ifExportedMessage);
+            }
+        }
+        return abstractIfExportedMessages;
+    }
+
+    private static LibraryMessage parseAbstractReplacementFor(LibraryMessage message, AnnotationMirror abstractMirror, String replacementOfAttribute, Map<String, List<LibraryMessage>> messages) {
+        String replacementValue = ElementUtils.getAnnotationValue(String.class, abstractMirror, replacementOfAttribute);
+        if (replacementValue == null) {
+            return null;
+        }
+        String replacement = replacementValue.replaceAll("\\s", "");
+        if (replacement.isEmpty()) {
+            return null;
+        }
+        int signatureStart = replacement.indexOf('(');
+        if (signatureStart > 0) {
+            String base = replacement.substring(0, signatureStart);
+            List<LibraryMessage> list = messages.get(base);
+            if (list != null) {
+                ProcessorContext context = ProcessorContext.getInstance();
+                String[] typeNames = replacement.substring(signatureStart + 1, replacement.length() - 1).split(",");
+                List<TypeMirror> signature = new ArrayList<>(typeNames.length);
+                for (String typeName : typeNames) {
+                    TypeMirror parsedType = parseType(typeName, context);
+                    signature.add(parsedType);
+                    if (parsedType.getKind() == TypeKind.NONE) {
+                        message.addError(abstractMirror, null, "Cannot parse replaced message parameter type %s. Use a qualified name for declared types.", typeName);
+                    }
+                }
+                for (LibraryMessage msg : list) {
+                    List<? extends TypeMirror> parameterTypes = ((ExecutableType) msg.getExecutable().asType()).getParameterTypes();
+                    if (signature.size() == parameterTypes.size()) {
+                        boolean sameSignature = true;
+                        for (int i = 0; i < signature.size(); i++) {
+                            sameSignature = ElementUtils.typeEquals(signature.get(i), parameterTypes.get(i));
+                            if (!sameSignature) {
+                                break;
+                            }
+                        }
+                        if (sameSignature) {
+                            validateAssignableArguments(message, abstractMirror, msg);
+                            return msg;
+                        }
+                    }
+                }
+            }
+        } else {
+            List<LibraryMessage> list = messages.get(replacement);
+            for (LibraryMessage msg : list) {
+                if (replacement.equals(msg.getName())) {
+                    validateAssignableArguments(message, abstractMirror, msg);
+                    return msg;
+                }
+            }
+        }
+        message.addError(abstractMirror, null, "The replaced message %s was not found. Specify an existing message with optional type arguments.", replacementValue);
+        return null;
+    }
+
+    private static TypeMirror parseType(String typeName, ProcessorContext context) {
+        Types typeUtils = context.getEnvironment().getTypeUtils();
+        // Primitives
+        switch (typeName) {
+            case "boolean":
+                return typeUtils.getPrimitiveType(TypeKind.BOOLEAN);
+            case "byte":
+                return typeUtils.getPrimitiveType(TypeKind.BYTE);
+            case "short":
+                return typeUtils.getPrimitiveType(TypeKind.SHORT);
+            case "int":
+                return typeUtils.getPrimitiveType(TypeKind.INT);
+            case "long":
+                return typeUtils.getPrimitiveType(TypeKind.LONG);
+            case "char":
+                return typeUtils.getPrimitiveType(TypeKind.CHAR);
+            case "float":
+                return typeUtils.getPrimitiveType(TypeKind.FLOAT);
+            case "double":
+                return typeUtils.getPrimitiveType(TypeKind.DOUBLE);
+            case "void":
+                return typeUtils.getNoType(TypeKind.VOID);
+        }
+        // Arrays
+        if (typeName.endsWith("[]")) {
+            String elementType = typeName.substring(0, typeName.length() - 2);
+            TypeMirror elemMirror = parseType(elementType, context);
+            return typeUtils.getArrayType(elemMirror);
+        }
+        // Declared types with auto-import of java.lang.*
+        Elements elementUtils = context.getEnvironment().getElementUtils();
+        TypeElement el = elementUtils.getTypeElement(typeName);
+        if (el == null && !typeName.contains(".")) {
+            el = elementUtils.getTypeElement("java.lang." + typeName);
+        }
+        if (el != null) {
+            return el.asType();
+        }
+        return typeUtils.getNoType(TypeKind.NONE);
+    }
+
+    private static void validateAssignableArguments(LibraryMessage message, AnnotationMirror abstractMirror, LibraryMessage msg) {
+        ExecutableElement replacementMethodExecutable = message.getExecutable();
+        List<? extends VariableElement> replacementMethodParameters = replacementMethodExecutable.getParameters();
+        ExecutableElement replacedExecutable = msg.getExecutable();
+        List<? extends VariableElement> replacedParameters = replacedExecutable.getParameters();
+        int n = replacementMethodParameters.size();
+        assert n == replacedParameters.size() : replacementMethodParameters.toString() + replacedParameters.toString();
+        for (int i = 0; i < n; i++) {
+            TypeMirror replaced = replacedParameters.get(i).asType();
+            TypeMirror replacementMethod = replacementMethodParameters.get(i).asType();
+            boolean isAssignable = ElementUtils.isAssignable(replaced, replacementMethod);
+            if (!isAssignable) {
+                String sign = ElementUtils.getReadableSignature(message.getExecutable());
+                sign = sign.substring(sign.indexOf('('));
+                String replacementMethodMessage = message.getName() + sign;
+                sign = ElementUtils.getReadableSignature(msg.getExecutable());
+                sign = sign.substring(sign.indexOf('('));
+                String replacedMessage = msg.getName() + sign;
+                message.addError(abstractMirror, null, "Type %s is not assignable from %s, message %s can not be replaced with %s.", replacementMethod, replaced, replacedMessage,
+                                replacementMethodMessage);
+            }
+        }
+    }
+
+    private static ExecutableElement parseAbstractReplacementWith(LibraryMessage message, LibraryMessage replaced, AnnotationMirror abstractMirror, String replacementMethodAttribute,
+                    List<ExecutableElement> allMethods) {
+        String replacementMethodValue = ElementUtils.getAnnotationValue(String.class, abstractMirror, replacementMethodAttribute);
+        if (replacementMethodValue != null) {
+            String replacement = replacementMethodValue.replaceAll("\\s", "");
+            if (!replacement.isEmpty()) {
+                boolean hasWrongSignature = false;
+                for (ExecutableElement executable : allMethods) {
+                    String methodName = executable.getSimpleName().toString();
+                    if (replacement.equals(methodName)) {
+                        if (replaced == null || hasEqualSignature(replaced.getExecutable(), executable)) {
+                            return executable;
+                        } else {
+                            hasWrongSignature = true;
+                        }
+                    }
+                }
+                if (hasWrongSignature) {
+                    message.addError(abstractMirror, null, "The replacement method %s does not have signature and thrown types equal to the message %s it replaces.", replacement,
+                                    ElementUtils.getReadableSignature(replaced.getExecutable()));
+                } else {
+                    message.addError(abstractMirror, null, "The replacement method %s does not exist.", replacement);
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasEqualSignature(ExecutableElement executable1, ExecutableElement executable2) {
+        if (!ElementUtils.typeEquals(executable1.getReturnType(), executable2.getReturnType())) {
+            return false;
+        }
+        if (!ElementUtils.parameterTypesEquals(executable1, executable2)) {
+            return false;
+        }
+        return ElementUtils.thrownTypesEquals(executable1, executable2);
     }
 
     private static void parseAssertions(Element element, AnnotationMirror mirror, TypeElement type, LibraryData model) {

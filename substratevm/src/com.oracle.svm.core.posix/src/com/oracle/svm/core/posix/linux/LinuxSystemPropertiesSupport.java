@@ -25,22 +25,34 @@
 package com.oracle.svm.core.posix.linux;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.impl.RuntimeSystemPropertiesSupport;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jdk.SystemPropertiesSupport;
 import com.oracle.svm.core.posix.PosixSystemPropertiesSupport;
 import com.oracle.svm.core.posix.headers.Stdlib;
 import com.oracle.svm.core.posix.headers.Utsname;
+import com.oracle.svm.hosted.NativeImageOptions;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class LinuxSystemPropertiesSupport extends PosixSystemPropertiesSupport {
 
+    public LinuxSystemPropertiesSupport(boolean compatibilityMode) {
+        super(compatibilityMode);
+    }
+
     @Override
-    protected String tmpdirValue() {
+    protected String javaIoTmpdirValue() {
         /*
          * The initial value of `java.io.tmpdir` is hard coded in libjava when building the JDK. So
          * to be completely correct, we would have to use the value from libjava, but since it is
@@ -70,7 +82,7 @@ public class LinuxSystemPropertiesSupport extends PosixSystemPropertiesSupport {
 
     @Override
     protected String osNameValue() {
-        Utsname.utsname name = StackValue.get(Utsname.utsname.class);
+        Utsname.utsname name = UnsafeStackValue.get(Utsname.utsname.class);
         if (Utsname.uname(name) >= 0) {
             return CTypeConversion.toJavaString(name.sysname());
         }
@@ -79,18 +91,30 @@ public class LinuxSystemPropertiesSupport extends PosixSystemPropertiesSupport {
 
     @Override
     protected String osVersionValue() {
-        Utsname.utsname name = StackValue.get(Utsname.utsname.class);
+        Utsname.utsname name = UnsafeStackValue.get(Utsname.utsname.class);
         if (Utsname.uname(name) >= 0) {
             return CTypeConversion.toJavaString(name.release());
         }
         return "Unknown";
     }
+
+    @Override
+    protected String jvmLibSuffix() {
+        return ".so";
+    }
 }
 
-@AutomaticFeature
-class LinuxSystemPropertiesFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class LinuxSystemPropertiesFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void duringSetup(DuringSetupAccess access) {
-        ImageSingletons.add(SystemPropertiesSupport.class, new LinuxSystemPropertiesSupport());
+        LinuxSystemPropertiesSupport singleton = new LinuxSystemPropertiesSupport(NativeImageOptions.compatibilityMode());
+        ImageSingletons.add(RuntimeSystemPropertiesSupport.class, singleton);
+        ImageSingletons.add(SystemPropertiesSupport.class, singleton);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,28 +40,33 @@
  */
 package org.graalvm.polyglot;
 
-import org.graalvm.collections.EconomicMap;
-import org.graalvm.collections.EconomicSet;
-import org.graalvm.collections.Equivalence;
-import org.graalvm.collections.MapCursor;
-
 import java.lang.annotation.Annotation;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodHandles.Lookup;
 import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
+import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Predicate;
+
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.collections.Equivalence;
+import org.graalvm.collections.MapCursor;
+import org.graalvm.polyglot.Engine.ToStringSupport;
 
 /**
  * Represents the host access policy of a polyglot context. The host access policy specifies which
@@ -72,11 +77,20 @@ import java.util.function.Predicate;
  * <ul>
  * <li>{@link #EXPLICIT} - Java host methods or fields, must be public and be annotated with
  * {@link Export @Export} to make them accessible to the guest language.
+ * <li>{@link #SCOPED} - Java host methods or fields, must be public and be annotated with
+ * {@link Export @Export} to make them accessible to the guest language. Guest-to-host callback
+ * parameter validity is scoped to the duration of the callback by default.
  * <li>{@link #NONE} - Does not allow any access to methods or fields of host objects. Java host
  * objects may still be passed into a context, but they cannot be accessed.
  * <li>{@link #ALL} - Does allow full unrestricted access to public methods or fields of host
  * objects. Note that this policy allows unrestricted access to reflection. It is highly discouraged
  * from using this policy in environments where the guest application is not fully trusted.
+ * <li>{@link #CONSTRAINED} host access policy suitable for a context with
+ * {@link SandboxPolicy#CONSTRAINED CONSTRAINED} sandbox policy.
+ * <li>{@link #ISOLATED} host access policy suitable for a context with
+ * {@link SandboxPolicy#ISOLATED ISOLATED} sandbox policy.
+ * <li>{@link #UNTRUSTED} host access policy suitable for a context with
+ * {@link SandboxPolicy#UNTRUSTED UNTRUSTED} sandbox policy.
  * </ul>
  * Custom host access policies can be created using {@link #newBuilder()}. The builder allows to
  * specify a custom export annotation and allowed and denied methods or fields.
@@ -85,25 +99,35 @@ import java.util.function.Predicate;
  */
 public final class HostAccess {
 
+    private static final Predicate<Member> UNRESTRICTED_PUBLIC_ACCESS = member -> true;
+
     private final String name;
     private final EconomicSet<Class<? extends Annotation>> accessAnnotations;
-    private final EconomicSet<Class<? extends Annotation>> implementableAnnotations;
+    final EconomicSet<Class<? extends Annotation>> implementableAnnotations;
     private final EconomicMap<Class<?>, Boolean> excludeTypes;
     private final EconomicSet<AnnotatedElement> members;
     private final EconomicSet<Class<?>> implementableTypes;
     private final List<Object> targetMappings;
-    private final boolean allowPublic;
-    private final boolean allowAllInterfaceImplementations;
-    private final boolean allowAllClassImplementations;
+    private final Predicate<Member> allowPublicPredicate;
+    final boolean allowAllInterfaceImplementations;
+    final boolean allowAllClassImplementations;
     final boolean allowArrayAccess;
     final boolean allowListAccess;
     final boolean allowBufferAccess;
     final boolean allowIterableAccess;
     final boolean allowIteratorAccess;
     final boolean allowMapAccess;
+    final boolean allowBigIntegerNumberAccess;
+    final boolean allowAccessInheritance;
+    private final boolean methodScopingDefault;
+    private final MutableTargetMapping[] allowMutableTargetMappings;
+    private final EconomicSet<Class<? extends Annotation>> disableMethodScopingAnnotations;
+    private final EconomicSet<Executable> disableMethodScoping;
+    final Lookup methodLookup;
     volatile Object impl;
 
-    private static final HostAccess EMPTY = new HostAccess(null, null, null, null, null, null, null, false, false, false, false, false, false, false, false, false);
+    private static final HostAccess EMPTY = new HostAccess(null, null, null, null, null, null, null, null, false, false, false, false, false, false, false, false, false, false,
+                    null, false, null, null, null);
 
     /**
      * Predefined host access policy that allows access to public host methods or fields that were
@@ -114,8 +138,12 @@ public final class HostAccess {
      * Equivalent of using the following builder configuration:
      *
      * <pre>
-     * HostAccess.newBuilder().allowAccessAnnotatedBy(HostAccess.Export.class).//
-     *                 allowImplementationsAnnotatedBy(HostAccess.Implementable.class).build();
+     * <code>
+     * HostAccess.newBuilder().allowAccessAnnotatedBy(HostAccess.Export.class).
+     *                allowImplementationsAnnotatedBy(HostAccess.Implementable.class).
+     *                allowImplementationsAnnotatedBy(FunctionalInterface.class).
+     *                .build();
+     * </code>
      * </pre>
      *
      * @since 19.0
@@ -125,6 +153,34 @@ public final class HostAccess {
                     allowImplementationsAnnotatedBy(HostAccess.Implementable.class).//
                     allowImplementationsAnnotatedBy(FunctionalInterface.class).//
                     name("HostAccess.EXPLICIT").build();
+
+    /**
+     * Predefined host access policy that is the same as EXPLICIT and enables method scoping of
+     * callback parameter values on top. Methods that are annotated with
+     * {@link HostAccess.DisableMethodScoping} are exempt from scoping.
+     * <p>
+     * Equivalent of using the following builder configuration:
+     *
+     * <pre>
+     * <code>
+     * HostAccess.newBuilder().allowAccessAnnotatedBy(HostAccess.Export.class).
+     *                 allowImplementationsAnnotatedBy(HostAccess.Implementable.class).
+     *                 allowImplementationsAnnotatedBy(FunctionalInterface.class).
+     *                 methodScoping(true).
+     *                 disableMethodScopingAnnotatedBy(HostAccess.DisableMethodScoping.class)
+     *                 .build();
+     * </code>
+     * </pre>
+     *
+     * @since 21.3
+     */
+    public static final HostAccess SCOPED = newBuilder().//
+                    allowAccessAnnotatedBy(HostAccess.Export.class).//
+                    allowImplementationsAnnotatedBy(HostAccess.Implementable.class).//
+                    allowImplementationsAnnotatedBy(FunctionalInterface.class).//
+                    methodScoping(true).//
+                    disableMethodScopingAnnotatedBy(HostAccess.DisableMethodScoping.class).//
+                    name("HostAccess.SCOPED").build();
 
     /**
      * Predefined host access policy that allows full unrestricted access to public methods or
@@ -138,11 +194,16 @@ public final class HostAccess {
      * <pre>
      * <code>
      * HostAccess.newBuilder()
-     *           .allowPublicAccess(true)
-     *           .allowAllImplementations(true)
-     *           .allowAllClassImplementations(true)
-     *           .allowArrayAccess(true)
-     *           .allowListAccess(true)
+     *           allowPublicAccess(true).
+     *           allowAllImplementations(true).
+     *           allowAllClassImplementations(true).
+     *           allowArrayAccess(true).
+     *           allowListAccess(true).
+     *           allowBufferAccess(true).
+     *           allowIterableAccess(true).
+     *           allowIteratorAccess(true).
+     *           allowMapAccess(true).
+     *           allowAccessInheritance(true).
      *           .build();
      * </code>
      * </pre>
@@ -155,6 +216,7 @@ public final class HostAccess {
                     allowAllClassImplementations(true).//
                     allowArrayAccess(true).allowListAccess(true).allowBufferAccess(true).//
                     allowIterableAccess(true).allowIteratorAccess(true).allowMapAccess(true).//
+                    allowAccessInheritance(true).//
                     name("HostAccess.ALL").build();
 
     /**
@@ -170,12 +232,119 @@ public final class HostAccess {
      */
     public static final HostAccess NONE = newBuilder().name("HostAccess.NONE").build();
 
+    /**
+     * Predefined host access policy used by Context with a {@link SandboxPolicy#CONSTRAINED}
+     * sandbox policy when the host access policy is not explicitly specified by the embedder.
+     * <p>
+     * Equivalent of using the following builder configuration:
+     *
+     * <pre>
+     * <code>
+     * HostAccess.newBuilder().
+     *           allowAccessAnnotatedBy(Export.class).
+     *           allowImplementationsAnnotatedBy(Implementable.class).
+     *           allowMutableTargetMappings().build();
+     * </code>
+     * </pre>
+     *
+     * @since 23.0
+     */
+    public static final HostAccess CONSTRAINED = HostAccess.newBuilder().//
+                    allowAccessAnnotatedBy(Export.class).//
+                    allowImplementationsAnnotatedBy(Implementable.class).//
+                    allowMutableTargetMappings().name("HostAccess.CONSTRAINED").build();
+
+    /**
+     * Predefined host access policy used by Context with an {@link SandboxPolicy#ISOLATED} sandbox
+     * policy when the host access policy is not explicitly specified by the embedder.
+     * <p>
+     * Equivalent of using the following builder configuration:
+     *
+     * <pre>
+     * <code>
+     * HostAccess.newBuilder(CONSTRAINED).
+     *           methodScoping(true).build();
+     * </code>
+     * </pre>
+     *
+     * @since 23.0
+     */
+    public static final HostAccess ISOLATED = HostAccess.newBuilder(CONSTRAINED).//
+                    methodScoping(true).//
+                    name("HostAccess.ISOLATED").build();
+
+    /**
+     * Predefined host access policy used by Context with an {@link SandboxPolicy#UNTRUSTED} sandbox
+     * policy when the host access policy is not explicitly specified by the embedder.
+     * <p>
+     * Equivalent of using the following builder configuration:
+     *
+     * <pre>
+     * <code>
+     * HostAccess.newBuilder().
+     *           allowAccessAnnotatedBy(Export.class).
+     *           allowMutableTargetMappings().
+     *           methodScoping(true).build();
+     * </code>
+     * </pre>
+     *
+     * @since 23.0
+     */
+    public static final HostAccess UNTRUSTED = HostAccess.newBuilder().//
+                    allowAccessAnnotatedBy(Export.class).//
+                    allowMutableTargetMappings().//
+                    methodScoping(true).//
+                    name("HostAccess.UNTRUSTED").build();
+
+    /**
+     * List of default host object mappings of mutable target types available in
+     * {@link Value#as(Class)}. The mappings map guest object traits to host object types.
+     *
+     * @since 23.0
+     */
+    public enum MutableTargetMapping {
+        /**
+         * Enables default mapping of guest object arrays to host object {@link java.util.List}.
+         * This mapping is also applied when the target host object is {@link java.util.Collection}.
+         */
+        ARRAY_TO_JAVA_LIST,
+        /**
+         * Enables default mapping of guest object iterators to host object
+         * {@link java.util.Iterator}.
+         */
+        ITERATOR_TO_JAVA_ITERATOR,
+        /**
+         * Enables default mapping of guest object iterables to host object
+         * {@link java.lang.Iterable}.
+         */
+        ITERABLE_TO_JAVA_ITERABLE,
+        /**
+         * Enables default mapping of guest object hashes to host object {@link java.util.Map}.
+         */
+        HASH_TO_JAVA_MAP,
+        /**
+         * Enables default mapping of guest objects with members to {@link java.util.Map}.
+         */
+        MEMBERS_TO_JAVA_MAP,
+        /**
+         * Enables default mapping of guest objects with members to a Java interface.
+         */
+        MEMBERS_TO_JAVA_INTERFACE,
+        /**
+         * Enables default mapping of executable guest objects to a
+         * {@link java.lang.FunctionalInterface}.
+         */
+        EXECUTABLE_TO_JAVA_INTERFACE,
+    }
+
     HostAccess(EconomicSet<Class<? extends Annotation>> annotations, EconomicMap<Class<?>, Boolean> excludeTypes, EconomicSet<AnnotatedElement> members,
                     EconomicSet<Class<? extends Annotation>> implementableAnnotations,
-                    EconomicSet<Class<?>> implementableTypes, List<Object> targetMappings,
+                    EconomicSet<Class<?>> implementableTypes, List<Object> targetMappings, Predicate<Member> allowPublicPredicate,
                     String name,
-                    boolean allowPublic, boolean allowAllImplementations, boolean allowAllClassImplementations, boolean allowArrayAccess, boolean allowListAccess, boolean allowBufferAccess,
-                    boolean allowIterableAccess, boolean allowIteratorAccess, boolean allowMapAccess) {
+                    boolean allowAllImplementations, boolean allowAllClassImplementations, boolean allowArrayAccess, boolean allowListAccess, boolean allowBufferAccess,
+                    boolean allowIterableAccess, boolean allowIteratorAccess, boolean allowMapAccess, boolean allowBigIntegerNumberAccess, boolean allowAccessInheritance,
+                    MutableTargetMapping[] allowMutableTargetMappings, boolean methodScopingDefault, EconomicSet<Class<? extends Annotation>> disableMethodScopingAnnotations,
+                    EconomicSet<Executable> disableMethodScoping, Lookup methodLookup) {
         // create defensive copies
         this.accessAnnotations = copySet(annotations, Equivalence.IDENTITY);
         this.excludeTypes = copyMap(excludeTypes, Equivalence.IDENTITY);
@@ -183,8 +352,8 @@ public final class HostAccess {
         this.implementableAnnotations = copySet(implementableAnnotations, Equivalence.IDENTITY);
         this.implementableTypes = copySet(implementableTypes, Equivalence.IDENTITY);
         this.targetMappings = targetMappings != null ? new ArrayList<>(targetMappings) : null;
+        this.allowPublicPredicate = allowPublicPredicate;
         this.name = name;
-        this.allowPublic = allowPublic;
         this.allowAllInterfaceImplementations = allowAllImplementations;
         this.allowAllClassImplementations = allowAllClassImplementations;
         this.allowArrayAccess = allowArrayAccess;
@@ -192,7 +361,14 @@ public final class HostAccess {
         this.allowBufferAccess = allowBufferAccess;
         this.allowIterableAccess = allowListAccess || allowIterableAccess;
         this.allowMapAccess = allowMapAccess;
+        this.allowBigIntegerNumberAccess = allowBigIntegerNumberAccess;
         this.allowIteratorAccess = allowListAccess || allowIterableAccess || allowMapAccess || allowIteratorAccess;
+        this.allowAccessInheritance = allowAccessInheritance;
+        this.allowMutableTargetMappings = allowMutableTargetMappings;
+        this.methodScopingDefault = methodScopingDefault;
+        this.disableMethodScopingAnnotations = disableMethodScopingAnnotations;
+        this.disableMethodScoping = disableMethodScoping;
+        this.methodLookup = methodLookup;
     }
 
     /**
@@ -206,20 +382,22 @@ public final class HostAccess {
             return false;
         }
         HostAccess other = (HostAccess) obj;
-        return allowPublic == other.allowPublic//
-                        && allowAllInterfaceImplementations == other.allowAllInterfaceImplementations//
+        return allowAllInterfaceImplementations == other.allowAllInterfaceImplementations//
                         && allowAllClassImplementations == other.allowAllClassImplementations//
                         && allowArrayAccess == other.allowArrayAccess//
                         && allowListAccess == other.allowListAccess//
                         && allowIterableAccess == other.allowIterableAccess//
                         && allowIteratorAccess == other.allowIteratorAccess//
                         && allowMapAccess == other.allowMapAccess//
+                        && allowBigIntegerNumberAccess == other.allowBigIntegerNumberAccess//
                         && equalsMap(excludeTypes, other.excludeTypes)//
                         && equalsSet(members, other.members)//
                         && equalsSet(implementableAnnotations, other.implementableAnnotations)//
                         && equalsSet(implementableTypes, other.implementableTypes)//
                         && Objects.equals(targetMappings, other.targetMappings)//
-                        && equalsSet(accessAnnotations, other.accessAnnotations);
+                        && Objects.equals(allowPublicPredicate, other.allowPublicPredicate)//
+                        && equalsSet(accessAnnotations, other.accessAnnotations)//
+                        && Arrays.equals(allowMutableTargetMappings, other.allowMutableTargetMappings);
     }
 
     /**
@@ -229,20 +407,21 @@ public final class HostAccess {
      */
     @Override
     public int hashCode() {
-        return Objects.hash(allowPublic,
-                        allowAllInterfaceImplementations,
+        return Objects.hash(allowAllInterfaceImplementations,
                         allowAllClassImplementations,
                         allowArrayAccess,
                         allowListAccess,
                         allowIterableAccess,
                         allowIteratorAccess,
                         allowMapAccess,
+                        allowBigIntegerNumberAccess,
                         hashMap(excludeTypes),
                         hashSet(members),
                         hashSet(implementableAnnotations),
                         hashSet(implementableTypes),
                         hashSet(members),
                         targetMappings,
+                        allowPublicPredicate,
                         hashSet(accessAnnotations));
     }
 
@@ -369,24 +548,10 @@ public final class HostAccess {
     }
 
     boolean allowsAccess(AnnotatedElement member) {
-        if (excludeTypes != null) {
-            Class<?> owner = getDeclaringClass(member);
-            MapCursor<Class<?>, Boolean> cursor = excludeTypes.getEntries();
-            while (cursor.advance()) {
-                Class<?> ban = cursor.getKey();
-                if (cursor.getValue()) {
-                    // include subclasses
-                    if (ban.isAssignableFrom(owner)) {
-                        return false;
-                    }
-                } else {
-                    if (ban == owner) {
-                        return false;
-                    }
-                }
-            }
+        if (isAccessExcluded(member)) {
+            return false;
         }
-        if (allowPublic) {
+        if (allowsPublicAccessImpl(member)) {
             return true;
         }
         if (members != null && members.contains(member)) {
@@ -402,6 +567,72 @@ public final class HostAccess {
         return false;
     }
 
+    boolean allowsPublicAccess(AnnotatedElement member) {
+        return !isAccessExcluded(member) && allowsPublicAccessImpl(member);
+    }
+
+    private boolean isAccessExcluded(AnnotatedElement member) {
+        if (excludeTypes != null) {
+            Class<?> owner = getDeclaringClass(member);
+            MapCursor<Class<?>, Boolean> cursor = excludeTypes.getEntries();
+            while (cursor.advance()) {
+                Class<?> ban = cursor.getKey();
+                if (cursor.getValue()) {
+                    // include subclasses
+                    if (ban.isAssignableFrom(owner)) {
+                        return true;
+                    }
+                } else if (ban == owner) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean allowsPublicAccessImpl(AnnotatedElement member) {
+        return allowPublicPredicate != null && allowPublicPredicate.test((Member) member);
+    }
+
+    boolean isMethodScoped(Executable e) {
+        if (!isMethodScopingEnabled()) {
+            return false;
+        }
+        if (disableMethodScoping != null) {
+            if (disableMethodScoping.contains(e)) {
+                return false;
+            }
+        }
+        if (disableMethodScopingAnnotations != null) {
+            for (Class<? extends Annotation> ann : disableMethodScopingAnnotations) {
+                if (e.getAnnotation(ann) != null) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    boolean isMethodScopingEnabled() {
+        return methodScopingDefault;
+    }
+
+    MutableTargetMapping[] getMutableTargetMappings() {
+        return allowMutableTargetMappings;
+    }
+
+    boolean hasPublicAccess() {
+        return allowPublicPredicate != null;
+    }
+
+    boolean allowsAllPublicAccess() {
+        return allowPublicPredicate == UNRESTRICTED_PUBLIC_ACCESS;
+    }
+
+    boolean hasPublicAccessPredicate() {
+        return hasPublicAccess() && !allowsAllPublicAccess();
+    }
+
     /**
      * {@inheritDoc}
      *
@@ -409,7 +640,33 @@ public final class HostAccess {
      */
     @Override
     public String toString() {
-        return name == null ? super.toString() : name;
+        if (name != null) {
+            return name;
+        }
+        boolean allowsAllPublicAccess = allowsAllPublicAccess();
+        return "HostAccess[allowPublicAccess=" + allowsAllPublicAccess +
+                        ", allowPublicPredicate=" + (allowsAllPublicAccess ? null : allowPublicPredicate) +
+                        ", allowAllInterfaceImplementations=" + allowAllInterfaceImplementations +
+                        ", allowAllClassImplementations=" + allowAllClassImplementations +
+                        ", allowArrayAccess=" + allowArrayAccess +
+                        ", allowListAccess=" + allowListAccess +
+                        ", allowBufferAccess=" + allowBufferAccess +
+                        ", allowIterableAccess=" + allowIterableAccess +
+                        ", allowIteratorAccess=" + allowIteratorAccess +
+                        ", allowMapAccess=" + allowMapAccess +
+                        ", allowBigIntegerNumberAccess=" + allowBigIntegerNumberAccess +
+                        ", allowAccessInheritance=" + allowAccessInheritance +
+                        ", accessAnnotations=" + accessAnnotations +
+                        ", implementableAnnotations=" + implementableAnnotations +
+                        ", excludedTypes=" + excludeTypes +
+                        ", implementableTypes=" + implementableTypes +
+                        ", members=" + members +
+                        ", targetMappings=" + targetMappings +
+                        ", mutableTargetMappings=" + Arrays.toString(allowMutableTargetMappings) +
+                        ", methodScoping=" + methodScopingDefault +
+                        ", disableMethodScopingAnnotations=" + disableMethodScopingAnnotations +
+                        ", disableMethodScoping=" + disableMethodScoping +
+                        ", methodLookup=" + methodLookup + "]";
     }
 
     private static boolean hasAnnotation(AnnotatedElement member, Class<? extends Annotation> annotationType) {
@@ -495,6 +752,20 @@ public final class HostAccess {
     }
 
     /**
+     * If {@link HostAccess#SCOPED} is used, placing this annotation on an exported host function
+     * excludes it from parameter scoping, i.e. parameters will not be released after invocation of
+     * a callback.
+     *
+     * @see HostAccess#SCOPED
+     * @since 21.3
+     *
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target({ElementType.CONSTRUCTOR, ElementType.METHOD})
+    public @interface DisableMethodScoping {
+    }
+
+    /**
      * Represents the precedence of a target type mapping. The precedence influences target type
      * mappings in two ways:
      * <ul>
@@ -563,16 +834,23 @@ public final class HostAccess {
         private EconomicSet<Class<?>> implementableTypes;
         private EconomicSet<AnnotatedElement> members;
         private List<Object> targetMappings;
-        private boolean allowPublic;
+        private Predicate<Member> allowPublicPredicate;
         private boolean allowArrayAccess;
         private boolean allowListAccess;
         private boolean allowBufferAccess;
         private boolean allowIterableAccess;
         private boolean allowIteratorAccess;
         private boolean allowMapAccess;
+        private boolean allowBigIntegerNumberAccess = true;
         private boolean allowAllImplementations;
         private boolean allowAllClassImplementations;
+        private boolean allowAccessInheritance;
+        private MutableTargetMapping[] allowMutableTargetMappings = MutableTargetMapping.values();
+        private boolean methodScopingDefault;
+        private EconomicSet<Class<? extends Annotation>> disableMethodScopingAnnotations;
+        private EconomicSet<Executable> disableMethodScoping;
         private String name;
+        private Lookup methodLookup;
 
         Builder() {
         }
@@ -584,17 +862,22 @@ public final class HostAccess {
             this.implementationAnnotations = copySet(access.implementableAnnotations, Equivalence.IDENTITY);
             this.implementableTypes = copySet(access.implementableTypes, Equivalence.IDENTITY);
             this.targetMappings = access.targetMappings != null ? new ArrayList<>(access.targetMappings) : null;
+            this.allowPublicPredicate = access.allowPublicPredicate;
             this.excludeTypes = access.excludeTypes;
-            this.members = access.members;
-            this.targetMappings = access.targetMappings;
-            this.allowPublic = access.allowPublic;
             this.allowListAccess = access.allowListAccess;
             this.allowArrayAccess = access.allowArrayAccess;
+            this.allowBufferAccess = access.allowBufferAccess;
             this.allowIterableAccess = access.allowIterableAccess;
             this.allowIteratorAccess = access.allowIteratorAccess;
             this.allowMapAccess = access.allowMapAccess;
+            this.allowBigIntegerNumberAccess = access.allowBigIntegerNumberAccess;
             this.allowAllImplementations = access.allowAllInterfaceImplementations;
             this.allowAllClassImplementations = access.allowAllClassImplementations;
+            this.allowAccessInheritance = access.allowAccessInheritance;
+            this.allowMutableTargetMappings = access.allowMutableTargetMappings;
+            this.methodScopingDefault = access.methodScopingDefault;
+            this.disableMethodScopingAnnotations = copySet(access.disableMethodScopingAnnotations, Equivalence.IDENTITY);
+            this.disableMethodScoping = copySet(access.disableMethodScoping, Equivalence.IDENTITY);
         }
 
         /**
@@ -616,12 +899,46 @@ public final class HostAccess {
          * Allows unrestricted access to all public constructors, methods or fields of public
          * classes. Note that this policy allows unrestricted access to reflection. It is highly
          * discouraged from using this option in environments where the guest application is not
-         * fully trusted.
+         * fully trusted. This setting replaces selected public access configured using
+         * {@link #allowPublicAccess(Predicate)}.
          *
          * @since 19.0
          */
         public Builder allowPublicAccess(boolean allow) {
-            allowPublic = allow;
+            allowPublicPredicate = allow ? UNRESTRICTED_PUBLIC_ACCESS : null;
+            return this;
+        }
+
+        /**
+         * Allows access to public constructors, methods or fields of public classes for which the
+         * given predicate returns {@code true}. Only public members are passed to the predicate. A
+         * predicate that returns {@code true} for every member exposes the same host members as
+         * {@link #allowPublicAccess(boolean) allowPublicAccess(true)}. This setting replaces previously
+         * configured public access. The predicate does not restrict
+         * access granted by {@link #allowAccess(Executable)},
+         * {@link #allowAccess(Field)}, or {@link #allowAccessAnnotatedBy(Class)}. For example, a
+         * method annotated with an annotation configured using {@link #allowAccessAnnotatedBy(Class)}
+         * remains accessible even if the predicate returns {@code false} for that method. Access denied
+         * with {@link #denyAccess(Class)} or {@link #denyAccess(Class, boolean)} takes precedence.
+         * <p>
+         * Predicate-selected public access is only supported with {@link SandboxPolicy#TRUSTED} and
+         * cannot be used with {@link SandboxPolicy#CONSTRAINED} or stricter sandbox policies. For a
+         * sandboxed context, each required member should instead be granted explicitly using
+         * {@link #allowAccess(Executable)} or {@link #allowAccess(Field)} after reviewing it for
+         * security implications.
+         * <p>
+         * Member visibility is determined when host class metadata is initialized and retained for
+         * the lifetime of this policy. The predicate may be invoked multiple times and concurrently,
+         * and therefore must be stable, thread-safe, and free of side effects. Errors thrown by the
+         * predicate are propagated as host exceptions.
+         *
+         * @param predicate the predicate that selects public host members to expose
+         * @return this builder
+         * @throws NullPointerException if {@code predicate} is {@code null}
+         * @since 25.4
+         */
+        public Builder allowPublicAccess(Predicate<Member> predicate) {
+            allowPublicPredicate = Objects.requireNonNull(predicate);
             return this;
         }
 
@@ -832,6 +1149,18 @@ public final class HostAccess {
         }
 
         /**
+         * Allows the guest application to access {@link java.math.BigInteger BigInteger} as a
+         * {@link Value#isNumber() number}. By default BigInteger number access is allowed.
+         *
+         * @see Value#isNumber()
+         * @since 23.0
+         */
+        public Builder allowBigIntegerNumberAccess(boolean bigIntegerNumberAccess) {
+            this.allowBigIntegerNumberAccess = bigIntegerNumberAccess;
+            return this;
+        }
+
+        /**
          * Allows the guest application to access {@link java.nio.ByteBuffer}s as values with
          * {@link Value#hasBufferElements() buffer elements}. By default no buffer access is
          * allowed.
@@ -841,6 +1170,54 @@ public final class HostAccess {
          */
         public Builder allowBufferAccess(boolean bufferAccess) {
             this.allowBufferAccess = bufferAccess;
+            return this;
+        }
+
+        /**
+         * Allows the guest application to inherit access to allowed methods, i.e. implementations
+         * of allowed abstract and interface methods and overrides of allowed concrete methods.
+         *
+         * If access inheritance is disabled, all method implementations need to be explicitly
+         * allowed (either by {@linkplain #allowAccessAnnotatedBy(Class) an annotation} or
+         * {@linkplain #allowAccess(Executable) using reflection}) to be available. Consequently,
+         * attempting to allow abstract methods has no effect in this access mode.
+         *
+         * Rationale:
+         *
+         * Requiring explicit vetting of all method implementations prevents unintentional exporting
+         * of newly added or overridden methods.
+         *
+         * When a user annotates an abstract (or concrete) method as exported, they might still know
+         * what that means when they write the code and know of all its implementations; but they
+         * might forget it later and other contributors to the codebase might not be aware of what
+         * is exported through an interface or superclass. So when someone introduces a new
+         * implementation or overrides the method in a subclass, perhaps a few levels down, they
+         * could be accidentally exporting it to the guest application.
+         *
+         * @see #allowAccessAnnotatedBy(Class)
+         * @see #allowAccess(Executable)
+         * @since 22.2
+         */
+        public Builder allowAccessInheritance(boolean inheritAccess) {
+            this.allowAccessInheritance = inheritAccess;
+            return this;
+        }
+
+        /**
+         * Allows host object mappings of mutable target types, such as {@link java.util.List},
+         * {@link java.util.Map}, {@link java.util.Iterator} and {@link java.lang.Iterable} based on
+         * the {@link MutableTargetMapping}.
+         *
+         * Mapping guest objects to well-known host object types such as {@link java.util.Map} is
+         * convenient on one hand. On the other hand it can lead to bugs as the guest code is free
+         * to provide an arbitrary backing implementation of such objects, which may not behave as
+         * expected of a {@link java.util.Map}.
+         *
+         * @since 23.0
+         */
+        public Builder allowMutableTargetMappings(MutableTargetMapping... mapping) {
+            Objects.requireNonNull(mapping);
+            this.allowMutableTargetMappings = mapping;
             return this;
         }
 
@@ -1002,14 +1379,200 @@ public final class HostAccess {
         }
 
         /**
+         * Sets the default scoping of callback function parameters. Parameters escape from the
+         * scope of a function, if a reference to them is kept after the function returns. To use a
+         * value beyond the method scope {@link Value#pin()} may be used.
+         *
+         * @see Value#pin()
+         * @since 21.3
+         */
+        public Builder methodScoping(boolean scopingDefault) {
+            methodScopingDefault = scopingDefault;
+            return this;
+        }
+
+        /**
+         * Function parameters of a method annotated with the specified annotation are not scoped.
+         *
+         * @since 21.3
+         */
+        public Builder disableMethodScopingAnnotatedBy(Class<? extends Annotation> annotation) {
+            Objects.requireNonNull(annotation);
+            if (disableMethodScopingAnnotations == null) {
+                disableMethodScopingAnnotations = EconomicSet.create(Equivalence.IDENTITY);
+            }
+            disableMethodScopingAnnotations.add(annotation);
+            return this;
+        }
+
+        /**
+         * Function parameters of the specified executable escape the executable's scope.
+         *
+         * @since 21.3
+         */
+        public Builder disableMethodScoping(Executable e) {
+            Objects.requireNonNull(e);
+            if (disableMethodScoping == null) {
+                disableMethodScoping = EconomicSet.create(Equivalence.IDENTITY);
+            }
+            disableMethodScoping.add(e);
+            return this;
+        }
+
+        /**
+         * Sets the {@link Lookup lookup} the guest application should use to find and access
+         * classes on the host side in {@link Module modularized} host applications. This allows
+         * guest applications to find and access public classes that are not directly exported by
+         * the lookup module, or public classes that are exported to the module only through
+         * qualified exports. Access to classes in the unnamed module is not affected by the use of
+         * this method.
+         * <p>
+         * Pass <code>MethodHandles.lookup()</code> from a named module to export its access
+         * privileges to the guest application.
+         * <p>
+         * It is requited that the lookup module is a named module, i.e.,
+         * <code>lookup.lookupClass().getModule().isNamed()</code> must be <code>true</code>.
+         * <p>
+         * Note that even though the provided lookup may provide access to non-public classes or
+         * members, the access will be restricted to classes or members with public visibility.
+         * <p>
+         * By default, {@link MethodHandles#publicLookup()} is used to access host classes which can
+         * only access classes from the unnamed module and classes exported to the unnamed module.
+         * <p>
+         * {@link MethodHandles#publicLookup()} is also used for classes from the unnamed module
+         * even if another lookup is specified by this method. Therefore, the guest application can
+         * still add classes to the classpath and access them even though a custom lookup from a
+         * named module is specified.
+         *
+         * @param lookup lookup from a named module to be used for host access.
+         * @throws IllegalArgumentException if the passed lookup is not from a named module.
+         * @since 23.1
+         */
+        public Builder useModuleLookup(Lookup lookup) {
+            Objects.requireNonNull(lookup);
+            if (!lookup.lookupClass().getModule().isNamed()) {
+                throw new IllegalArgumentException("The passed lookup is from an unnamed module. Please specify a lookup from a named module.");
+            }
+            methodLookup = lookup;
+            return this;
+        }
+
+        /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("HostAccess.newBuilder()");
+            if (accessAnnotations != null) {
+                for (Class<? extends Annotation> annotation : accessAnnotations) {
+                    ToStringSupport.appendCall(b, "allowAccessAnnotatedBy", ToStringSupport.classLiteral(annotation));
+                }
+            }
+            if (implementationAnnotations != null) {
+                for (Class<? extends Annotation> annotation : implementationAnnotations) {
+                    ToStringSupport.appendCall(b, "allowImplementationsAnnotatedBy", ToStringSupport.classLiteral(annotation));
+                }
+            }
+            if (excludeTypes != null) {
+                MapCursor<Class<?>, Boolean> cursor = excludeTypes.getEntries();
+                while (cursor.advance()) {
+                    ToStringSupport.appendCall(b, "denyAccess", ToStringSupport.classLiteral(cursor.getKey()), cursor.getValue());
+                }
+            }
+            if (implementableTypes != null) {
+                for (Class<?> type : implementableTypes) {
+                    ToStringSupport.appendCall(b, "allowImplementations", ToStringSupport.classLiteral(type));
+                }
+            }
+            if (members != null) {
+                for (AnnotatedElement member : members) {
+                    ToStringSupport.appendCall(b, "allowAccess", member);
+                }
+            }
+            if (targetMappings != null) {
+                for (Object mapping : targetMappings) {
+                    ToStringSupport.appendCall(b, "targetTypeMapping", mapping);
+                }
+            }
+            if (allowPublicPredicate == UNRESTRICTED_PUBLIC_ACCESS) {
+                ToStringSupport.appendCall(b, "allowPublicAccess", true);
+            } else if (allowPublicPredicate != null) {
+                ToStringSupport.appendCall(b, "allowPublicAccess", allowPublicPredicate);
+            }
+            if (allowAllImplementations) {
+                ToStringSupport.appendCall(b, "allowAllImplementations", true);
+            }
+            if (allowAllClassImplementations) {
+                ToStringSupport.appendCall(b, "allowAllClassImplementations", true);
+            }
+            if (allowArrayAccess) {
+                ToStringSupport.appendCall(b, "allowArrayAccess", true);
+            }
+            if (allowListAccess) {
+                ToStringSupport.appendCall(b, "allowListAccess", true);
+            }
+            if (allowBufferAccess) {
+                ToStringSupport.appendCall(b, "allowBufferAccess", true);
+            }
+            if (allowIterableAccess) {
+                ToStringSupport.appendCall(b, "allowIterableAccess", true);
+            }
+            if (allowIteratorAccess) {
+                ToStringSupport.appendCall(b, "allowIteratorAccess", true);
+            }
+            if (allowMapAccess) {
+                ToStringSupport.appendCall(b, "allowMapAccess", true);
+            }
+            if (!allowBigIntegerNumberAccess) {
+                ToStringSupport.appendCall(b, "allowBigIntegerNumberAccess", false);
+            }
+            if (allowAccessInheritance) {
+                ToStringSupport.appendCall(b, "allowAccessInheritance", true);
+            }
+            if (!Arrays.equals(allowMutableTargetMappings, MutableTargetMapping.values())) {
+                StringBuilder mappings = new StringBuilder();
+                String separator = "";
+                if (allowMutableTargetMappings != null) {
+                    for (MutableTargetMapping mapping : allowMutableTargetMappings) {
+                        mappings.append(separator);
+                        mappings.append("MutableTargetMapping.");
+                        mappings.append(mapping);
+                        separator = ", ";
+                    }
+                }
+                ToStringSupport.appendCall(b, "allowMutableTargetMappings", mappings);
+            }
+            if (methodScopingDefault) {
+                ToStringSupport.appendCall(b, "methodScoping", true);
+            }
+            if (disableMethodScopingAnnotations != null) {
+                for (Class<? extends Annotation> annotation : disableMethodScopingAnnotations) {
+                    ToStringSupport.appendCall(b, "disableMethodScopingAnnotatedBy", ToStringSupport.classLiteral(annotation));
+                }
+            }
+            if (disableMethodScoping != null) {
+                for (Executable executable : disableMethodScoping) {
+                    ToStringSupport.appendCall(b, "disableMethodScoping", executable);
+                }
+            }
+            if (methodLookup != null) {
+                ToStringSupport.appendCall(b, "useModuleLookup", methodLookup);
+            }
+            return b.toString();
+        }
+
+        /**
          * Creates an instance of the custom host access configuration.
          *
          * @since 19.0
          */
         public HostAccess build() {
-            return new HostAccess(accessAnnotations, excludeTypes, members, implementationAnnotations, implementableTypes, targetMappings, name, allowPublic,
+            return new HostAccess(accessAnnotations, excludeTypes, members, implementationAnnotations, implementableTypes, targetMappings, allowPublicPredicate, name,
                             allowAllImplementations, allowAllClassImplementations, allowArrayAccess, allowListAccess, allowBufferAccess, allowIterableAccess,
-                            allowIteratorAccess, allowMapAccess);
+                            allowIteratorAccess, allowMapAccess, allowBigIntegerNumberAccess, allowAccessInheritance, allowMutableTargetMappings, methodScopingDefault, disableMethodScopingAnnotations,
+                            disableMethodScoping, methodLookup);
         }
     }
 

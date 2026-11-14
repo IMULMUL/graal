@@ -24,15 +24,28 @@
  */
 package com.oracle.svm.core.image;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
+import jdk.vm.ci.meta.ResolvedJavaType;
+
 public interface ImageHeapObject {
     long getSize();
 
+    Object getWrapped();
+
     Object getObject();
+
+    Class<?> getObjectClass();
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    ResolvedJavaType getObjectType();
 
     void setHeapPartition(ImageHeapPartition value);
 
     void setOffsetInPartition(long value);
 
+    /** Returns the heap-base relative offset of this object. */
     long getOffset();
 
     ImageHeapPartition getPartition();

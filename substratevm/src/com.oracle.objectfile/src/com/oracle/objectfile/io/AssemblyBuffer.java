@@ -25,7 +25,6 @@
 
 package com.oracle.objectfile.io;
 
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
@@ -47,8 +46,7 @@ import java.util.Deque;
  * 255, or (byte) -1? The latter is more consistent with the writing behavior, but also more
  * confusing when considered in isolation. So far, this distinction has only been important when
  * reading bytes, and we provide explicit readUbyte() and readByte() methods to cater to each
- * requirement separately. FIXME: this should probably be expanded to cover the full range of
- * integer data types (except long, which we're stuck with).
+ * requirement separately.
  */
 public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
 
@@ -59,15 +57,15 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
         return new AssemblyBuffer(in);
     }
 
-    public static OutputAssembler createOutputAssembler(ByteBuffer out) {
+    public static AssemblyBuffer createOutputAssembler(ByteBuffer out) {
         return new AssemblyBuffer(out);
     }
 
-    public static OutputAssembler createOutputAssembler(ByteOrder order) {
+    public static AssemblyBuffer createOutputAssembler(ByteOrder order) {
         return new AssemblyBuffer(order);
     }
 
-    public static OutputAssembler createOutputAssembler() {
+    public static AssemblyBuffer createOutputAssembler() {
         return new AssemblyBuffer();
     }
 
@@ -90,19 +88,12 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
         return !buf.hasRemaining();
     }
 
-    /**
-     * See {@code org.graalvm.compiler.serviceprovider.BufferUtil}.
-     */
-    private static Buffer asBaseBuffer(Buffer obj) {
-        return obj;
-    }
-
     @Override
     public void seek(long pos) {
         if (pos > pos()) {
             ensure((int) (pos - pos()));
         }
-        asBaseBuffer(buf).position((int) pos);
+        buf.position((int) pos);
     }
 
     @Override
@@ -188,7 +179,7 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
             if ((vv == 0L && (b & 0x40) == 0) || (vv == -1L && (b & 0x40) == 0x40)) {
                 more = false;
             } else {
-                b |= 0x80;
+                b |= (byte) 0x80;
             }
             writeByte(b);
         }
@@ -288,23 +279,24 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
             }
 
             // grow and replace
-            ByteBuffer nbuf = ByteBuffer.allocate(newCap);
-            nbuf.order(ByteOrder.nativeOrder());
-            byte[] old = new byte[pos];
-            asBaseBuffer(buf).rewind();
-            buf.get(old);
-            nbuf.put(old);
-            buf = nbuf;
+            buf = ByteBuffer.wrap(Arrays.copyOf(buf.array(), newCap));
+            buf.order(ByteOrder.nativeOrder());
+            buf.position(pos);
         }
     }
 
     @Override
     public byte[] getBlob() {
-        int len = buf.position();
-        byte[] bytes = new byte[len];
-        asBaseBuffer(buf).position(0);
-        buf.get(bytes);
-        return bytes;
+        return getBlob(false);
+    }
+
+    public byte[] getBlob(boolean consume) {
+        byte[] array = buf.array();
+        int position = buf.position();
+        if (consume) {
+            buf = null;
+        }
+        return Arrays.copyOf(array, position);
     }
 
     @Override
@@ -381,7 +373,7 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
                 writeByte((byte) value);
                 break;
             default:
-                throw new IllegalArgumentException("can only truncate to powers-of-two <= 8");
+                throw new IllegalArgumentException("Can only truncate to powers-of-two <= 8");
         }
     }
 
@@ -397,7 +389,7 @@ public class AssemblyBuffer implements InputDisassembler, OutputAssembler {
             case 1:
                 return readUbyte();
             default:
-                throw new IllegalArgumentException("can only truncate to powers-of-two <= 8");
+                throw new IllegalArgumentException("Can only truncate to powers-of-two <= 8");
         }
     }
 

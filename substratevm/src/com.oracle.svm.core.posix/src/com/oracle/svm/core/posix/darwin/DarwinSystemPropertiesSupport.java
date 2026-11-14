@@ -24,40 +24,52 @@
  */
 package com.oracle.svm.core.posix.darwin;
 
+import com.oracle.svm.hosted.NativeImageOptions;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.function.CLibrary;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.impl.RuntimeSystemPropertiesSupport;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.headers.LibC;
 import com.oracle.svm.core.jdk.SystemPropertiesSupport;
 import com.oracle.svm.core.posix.PosixSystemPropertiesSupport;
 import com.oracle.svm.core.posix.headers.Limits;
 import com.oracle.svm.core.posix.headers.Stdlib;
 import com.oracle.svm.core.posix.headers.Unistd;
 import com.oracle.svm.core.posix.headers.darwin.Foundation;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 @CLibrary(value = "darwin", requireStatic = true)
 public class DarwinSystemPropertiesSupport extends PosixSystemPropertiesSupport {
 
+    public DarwinSystemPropertiesSupport(boolean compatibilityMode) {
+        super(compatibilityMode);
+    }
+
     @Override
-    protected String tmpdirValue() {
+    protected String javaIoTmpdirValue() {
         /* Darwin has a per-user temp dir */
         int buflen = Limits.PATH_MAX();
-        CCharPointer tmpPath = StackValue.get(buflen);
-        UnsignedWord pathSize = Unistd.confstr(Unistd._CS_DARWIN_USER_TEMP_DIR(), tmpPath, WordFactory.unsigned(buflen));
+        CCharPointer tmpPath = UnsafeStackValue.get(buflen);
+        UnsignedWord pathSize = Unistd.confstr(Unistd._CS_DARWIN_USER_TEMP_DIR(), tmpPath, Word.unsigned(buflen));
         if (pathSize.aboveThan(0) && pathSize.belowOrEqual(buflen)) {
             return CTypeConversion.toJavaString(tmpPath);
         } else {
             /*
-             * Default as defined in JDK source/jdk/src/solaris/native/java/lang/java_props_md.c
-             * line 135.
+             * Default as defined in JDK src/java.base/unix/native/libjava/java_props_md.c line 90.
              */
             return "/var/tmp";
         }
@@ -93,23 +105,55 @@ public class DarwinSystemPropertiesSupport extends PosixSystemPropertiesSupport 
             return osVersionValue;
         }
 
-        Foundation.NSOperatingSystemVersion osVersion = StackValue.get(Foundation.NSOperatingSystemVersion.class);
+        Foundation.NSOperatingSystemVersion osVersion = UnsafeStackValue.get(Foundation.NSOperatingSystemVersion.class);
         Foundation.operatingSystemVersion(osVersion);
-        if (osVersion.isNull()) {
-            return osVersionValue = "Unknown";
-        } else {
+        if (osVersion.isNonNull()) {
             long major = osVersion.getMajorVersion();
             long minor = osVersion.getMinorVersion();
             long patch = osVersion.getPatchVersion();
-            return osVersionValue = major + "." + minor + "." + patch;
+            if (major == 10 && minor >= 16 && patch == 0) {
+                // Read *real* ProductVersion
+                CCharPointer osVersionStr = Foundation.systemVersionPlatform();
+                if (osVersionStr.isNonNull()) {
+                    osVersionValue = CTypeConversion.toJavaString(osVersionStr);
+                    LibC.free(osVersionStr);
+                    return osVersionValue;
+                }
+            } else {
+                if (patch == 0) {
+                    return osVersionValue = major + "." + minor;
+                } else {
+                    return osVersionValue = major + "." + minor + "." + patch;
+                }
+            }
         }
+        // Fallback
+        CCharPointer osVersionStr = Foundation.systemVersionPlatformFallback();
+        if (osVersionStr.isNonNull()) {
+            osVersionValue = CTypeConversion.toJavaString(osVersionStr);
+            LibC.free(osVersionStr);
+            return osVersionValue;
+        }
+        return osVersionValue = "Unknown";
+    }
+
+    @Override
+    protected String jvmLibSuffix() {
+        return ".dylib";
     }
 }
 
-@AutomaticFeature
-class DarwinSystemPropertiesFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class DarwinSystemPropertiesFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void duringSetup(DuringSetupAccess access) {
-        ImageSingletons.add(SystemPropertiesSupport.class, new DarwinSystemPropertiesSupport());
+        ImageSingletons.add(RuntimeSystemPropertiesSupport.class,
+                        new DarwinSystemPropertiesSupport(NativeImageOptions.compatibilityMode()));
+        ImageSingletons.add(SystemPropertiesSupport.class, (SystemPropertiesSupport) ImageSingletons.lookup(RuntimeSystemPropertiesSupport.class));
     }
 }

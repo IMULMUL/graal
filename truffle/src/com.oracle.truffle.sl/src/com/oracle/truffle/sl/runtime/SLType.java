@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,6 @@ package com.oracle.truffle.sl.runtime;
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -79,7 +78,7 @@ public final class SLType implements TruffleObject {
      * nicely match those of the types in InteropLibrary. This might not be the case and more
      * additional checks need to be performed (similar to number checking for SLBigNumber).
      */
-    public static final SLType NUMBER = new SLType("Number", (l, v) -> l.fitsInLong(v) || v instanceof SLBigNumber);
+    public static final SLType NUMBER = new SLType("Number", (l, v) -> l.fitsInLong(v) || v instanceof SLBigInteger);
     public static final SLType NULL = new SLType("NULL", (l, v) -> l.isNull(v));
     public static final SLType STRING = new SLType("String", (l, v) -> l.isString(v));
     public static final SLType BOOLEAN = new SLType("Boolean", (l, v) -> l.isBoolean(v));
@@ -116,13 +115,13 @@ public final class SLType implements TruffleObject {
     }
 
     @ExportMessage
-    boolean hasLanguage() {
+    boolean hasLanguageId() {
         return true;
     }
 
     @ExportMessage
-    Class<? extends TruffleLanguage<?>> getLanguage() {
-        return SLLanguage.class;
+    String getLanguageId() {
+        return SLLanguage.ID;
     }
 
     /*

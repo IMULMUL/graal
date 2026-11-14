@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,28 @@
  */
 package org.graalvm.nativeimage.impl;
 
+import java.util.Arrays;
+
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+
 public interface RuntimeReflectionSupport extends ReflectionRegistry {
-    // specific to java.lang.reflect reflection
+    // needed as reflection-specific ImageSingletons key
+    default void registerAllFields(AccessCondition condition, boolean preserved, Class<?> clazz) {
+        register(condition, false, preserved, clazz.getFields());
+    }
+
+    default void registerAllDeclaredFields(AccessCondition condition, boolean preserved, Class<?> clazz) {
+        register(condition, false, preserved, clazz.getDeclaredFields());
+    }
+
+    void registerClassLookupException(AccessCondition condition, String typeName, Throwable t);
+
+    default void registerUnsafeAllocation(AccessCondition condition, boolean preserved, Class<?>... classes) {
+        Arrays.stream(classes).forEach(clazz -> {
+            register(condition, preserved, clazz);
+            registerUnsafeAllocation(condition, preserved, clazz);
+        });
+    }
+
+    void registerUnsafeAllocation(AccessCondition condition, boolean preserved, Class<?> clazz);
 }

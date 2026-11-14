@@ -24,22 +24,41 @@
  */
 package com.oracle.svm.hosted.jdk;
 
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
+import java.util.ArrayList;
+import java.util.Optional;
+
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.hosted.RuntimeJNIAccess;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.JNIRegistrationUtil;
-import com.oracle.svm.core.jdk.NativeLibrarySupport;
-import com.oracle.svm.core.jni.JNIRuntimeAccess;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.FeatureImpl;
-import com.oracle.svm.hosted.c.NativeLibraries;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.HostModuleUtil;
+import com.oracle.svm.util.JVMCIReflectionUtil;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeJNIAccess;
+
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 @Platforms({InternalPlatform.PLATFORM_JNI.class})
-@AutomaticFeature
-public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Feature {
+@AutomaticallyRegisteredFeature
+public class JNIRegistrationPrefs extends JNIRegistrationUtil implements InternalFeature {
+
+    private static Optional<ResolvedJavaModule> requiredModule() {
+        return JVMCIReflectionUtil.bootModuleLayer().findModule("java.prefs");
+    }
+
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return requiredModule().isPresent();
+    }
+
+    @Override
+    public void afterRegistration(AfterRegistrationAccess access) {
+        HostModuleUtil.addReads(JNIRegistrationPrefs.class, requiredModule().get());
+    }
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
@@ -49,13 +68,19 @@ public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Feature
          * ensure we pick up the loadLibrary call and properly link against the library.
          */
         String preferencesImplementation = getPlatformPreferencesClassName();
-        rerunClassInit(access, preferencesImplementation);
+        initializeAtRunTime(access, preferencesImplementation);
+        ArrayList<ResolvedJavaType> triggers = new ArrayList<>();
+        triggers.add(type(access, preferencesImplementation));
 
         if (isDarwin()) {
-            rerunClassInit(access, "java.util.prefs.MacOSXPreferencesFile");
+            String darwinSpecificClass = "java.util.prefs.MacOSXPreferencesFile";
+            initializeAtRunTime(access, darwinSpecificClass);
+            /* present on Darwin in the JDK */
+            initializeAtRunTime(access, "java.util.prefs.FileSystemPreferences");
+            triggers.add(type(access, darwinSpecificClass));
         }
 
-        access.registerReachabilityHandler(JNIRegistrationPrefs::handlePreferencesClassReachable, clazz(access, preferencesImplementation));
+        access.registerReachabilityHandler(JNIRegistrationPrefs::handlePreferencesClassReachable, triggers.toArray());
     }
 
     private static String getPlatformPreferencesClassName() {
@@ -70,20 +95,11 @@ public class JNIRegistrationPrefs extends JNIRegistrationUtil implements Feature
     }
 
     private static void handlePreferencesClassReachable(DuringAnalysisAccess access) {
-        if (JavaVersionUtil.JAVA_SPEC > 8) {
-            NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary("prefs");
-        } else {
-            /* On JDK versions below 8, prefs is part of libjava */
-            if (isDarwin()) {
-                NativeLibraries nativeLibraries = ((FeatureImpl.DuringAnalysisAccessImpl) access).getNativeLibraries();
-                nativeLibraries.addStaticJniLibrary("osx");
-            }
-        }
-
         if (isDarwin()) {
             /* Darwin allocates a string array from native code */
-            JNIRuntimeAccess.register(String[].class);
+            RuntimeJNIAccess.register(String[].class);
+            /* Called by libprefs on Darwin */
+            JVMCIRuntimeJNIAccess.register(method(access, "java.lang.System", "arraycopy", Object.class, int.class, Object.class, int.class, int.class));
         }
     }
-
 }

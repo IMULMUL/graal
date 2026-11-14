@@ -25,16 +25,23 @@
 package com.oracle.svm.core.posix.darwin;
 
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.CErrorNumber.CErrorNumberSupport;
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.core.os.ImageHeapProvider;
 
-@AutomaticFeature
-class DarwinImageSingletonsFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class DarwinImageSingletonsFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
 
     @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(CErrorNumberSupport.class, new DarwinCErrorNumberSupport());
+    public void duringSetup(DuringSetupAccess access) {
+        if (!ImageSingletons.contains(ImageHeapProvider.class)) {
+            ImageSingletons.add(ImageHeapProvider.class, new DarwinImageHeapProvider());
+        }
     }
 }

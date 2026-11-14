@@ -47,7 +47,7 @@ import com.oracle.truffle.api.nodes.Node;
 final class DefaultThreadLocalHandshake extends ThreadLocalHandshake {
 
     static final DefaultThreadLocalHandshake SINGLETON = new DefaultThreadLocalHandshake();
-    private static final ThreadLocal<TruffleSafepointImpl> STATE = ThreadLocal.withInitial(() -> SINGLETON.getThreadState(Thread.currentThread()));
+    private static final ThreadLocal<TruffleSafepointImpl> STATE = new ThreadLocal<>();
 
     /*
      * Number of active pending threads. Allows to check the active threads more efficiently.
@@ -55,6 +55,11 @@ final class DefaultThreadLocalHandshake extends ThreadLocalHandshake {
     private static final AtomicInteger PENDING_COUNT = new AtomicInteger();
 
     private DefaultThreadLocalHandshake() {
+    }
+
+    @Override
+    public void ensureThreadInitialized() {
+        STATE.set(getThreadState(Thread.currentThread()));
     }
 
     @Override
@@ -68,7 +73,20 @@ final class DefaultThreadLocalHandshake extends ThreadLocalHandshake {
 
     @Override
     public TruffleSafepointImpl getCurrent() {
-        return STATE.get();
+        TruffleSafepointImpl impl = STATE.get();
+        if (impl == null && isCurrentPolyglotContextEntered()) {
+            /*
+             * Executor workers, notably the common ForkJoinPool workers, can clear ordinary
+             * ThreadLocal values between top-level tasks without terminating the Java Thread. The
+             * context's thread table still contains the thread, so re-entering the context may skip
+             * the first-enter initialization that installed this safepoint state. When the context
+             * fast thread-local confirms that a polyglot context is currently entered, recreate the
+             * missing safepoint ThreadLocal lazily.
+             */
+            ensureThreadInitialized();
+            impl = STATE.get();
+        }
+        return impl;
     }
 
     @Override

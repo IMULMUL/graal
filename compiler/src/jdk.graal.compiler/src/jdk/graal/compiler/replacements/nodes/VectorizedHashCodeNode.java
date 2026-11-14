@@ -1,0 +1,156 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package jdk.graal.compiler.replacements.nodes;
+
+import static jdk.vm.ci.amd64.AMD64.CPUFeature.AVX;
+import static jdk.vm.ci.amd64.AMD64.CPUFeature.AVX2;
+
+import java.util.EnumSet;
+
+import org.graalvm.word.Pointer;
+
+import jdk.graal.compiler.core.common.spi.ForeignCallDescriptor;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.lir.GenerateStub;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.NamedLocationIdentity;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
+import jdk.vm.ci.aarch64.AArch64;
+import jdk.vm.ci.amd64.AMD64;
+import jdk.vm.ci.code.Architecture;
+import jdk.vm.ci.meta.JavaKind;
+
+/**
+ * Calculate the hash code for an array. Intrinsification for
+ * {@code jdk.internal.util.ArraySupport.vectorizedHashCode}.
+ */
+@NodeInfo(cycles = NodeCycles.CYCLES_UNKNOWN, size = NodeSize.SIZE_256)
+public final class VectorizedHashCodeNode extends PureFunctionStubIntrinsicNode {
+    public static final NodeClass<VectorizedHashCodeNode> TYPE = NodeClass.create(VectorizedHashCodeNode.class);
+
+    public static final ForeignCallDescriptor STUB_BOOLEAN = ForeignCalls.pureFunctionForeignCallDescriptor("vectorizedHashCodeBoolean",
+                    int.class, Pointer.class, int.class, int.class);
+    public static final ForeignCallDescriptor STUB_CHAR = ForeignCalls.pureFunctionForeignCallDescriptor("vectorizedHashCodeChar",
+                    int.class, Pointer.class, int.class, int.class);
+    public static final ForeignCallDescriptor STUB_BYTE = ForeignCalls.pureFunctionForeignCallDescriptor("vectorizedHashCodeByte",
+                    int.class, Pointer.class, int.class, int.class);
+    public static final ForeignCallDescriptor STUB_SHORT = ForeignCalls.pureFunctionForeignCallDescriptor("vectorizedHashCodeShort",
+                    int.class, Pointer.class, int.class, int.class);
+    public static final ForeignCallDescriptor STUB_INT = ForeignCalls.pureFunctionForeignCallDescriptor("vectorizedHashCodeInt",
+                    int.class, Pointer.class, int.class, int.class);
+
+    public static final ForeignCallDescriptor[] STUBS = {STUB_BOOLEAN, STUB_CHAR, STUB_BYTE, STUB_SHORT, STUB_INT};
+
+    @Input protected ValueNode arrayStart;
+    @Input protected ValueNode length;
+    @Input protected ValueNode initialValue;
+
+    private final JavaKind arrayKind;
+
+    public VectorizedHashCodeNode(ValueNode arrayStart, ValueNode length, ValueNode initialValue, JavaKind arrayKind) {
+        this(arrayStart, length, initialValue, arrayKind, null);
+    }
+
+    public VectorizedHashCodeNode(ValueNode arrayStart, ValueNode length, ValueNode initialValue, JavaKind arrayKind, EnumSet<?> runtimeCheckedCPUFeatures) {
+        super(TYPE, StampFactory.intValue(), runtimeCheckedCPUFeatures, NamedLocationIdentity.getArrayLocation(arrayKind));
+
+        this.arrayStart = arrayStart;
+        this.length = length;
+        this.initialValue = initialValue;
+        this.arrayKind = arrayKind;
+    }
+
+    @Override
+    public ForeignCallDescriptor getForeignCallDescriptor() {
+        return switch (arrayKind) {
+            case Boolean -> STUB_BOOLEAN;
+            case Char -> STUB_CHAR;
+            case Byte -> STUB_BYTE;
+            case Short -> STUB_SHORT;
+            case Int -> STUB_INT;
+            default -> throw GraalError.shouldNotReachHere("Unsupported JavaKind " + arrayKind);
+        };
+    }
+
+    @Override
+    public ValueNode[] getForeignCallArguments() {
+        return new ValueNode[]{arrayStart, length, initialValue};
+    }
+
+    /**
+     * Features required by the AVX2 runtime-compilation stub variant.
+     */
+    public static EnumSet<AMD64.CPUFeature> runtimeFeaturesAMD64() {
+        return EnumSet.of(AVX, AVX2);
+    }
+
+    /**
+     * Features required to enter the guarded AVX fast path. SSE3, SSSE3, SSE4.1, and SSE4.2 are
+     * intentionally omitted; the fast path guard must only check feature flags supported by
+     * RuntimeCPUFeatureCheck, which includes AVX and AVX2 but none of the SSE flags, currently.
+     * When AVX is available, AMD64VectorizedHashCodeOp emits exclusively AVX/AVX2 vector encodings,
+     * so this path does not require any extra SSE features (neither does the scalar fallback path
+     * that is used as the AMD64 baseline compatibility target).
+     */
+    public static EnumSet<AMD64.CPUFeature> guardedFeaturesAMD64() {
+        return EnumSet.of(AVX);
+    }
+
+    public static boolean isSupported(Architecture arch) {
+        return switch (arch) {
+            case AMD64 amd64 -> true;
+            case AArch64 aarch64 -> true;
+            default -> false;
+        };
+    }
+
+    @Override
+    public boolean needsExplicitZeroExtension(Architecture arch) {
+        return false;
+    }
+
+    @Override
+    public void emitIntrinsic(NodeLIRBuilderTool gen) {
+        gen.setResult(this, gen.getLIRGeneratorTool().emitVectorizedHashCode(runtimeCheckedCPUFeatures, gen.operand(arrayStart), gen.operand(length), gen.operand(initialValue), arrayKind));
+    }
+
+    @NodeIntrinsic
+    @GenerateStub.Default(runtimeCPUFeaturesAMD64 = "runtimeFeaturesAMD64", guardedCPUFeaturesAMD64 = "guardedFeaturesAMD64")
+    @GenerateStub(name = "vectorizedHashCodeBoolean", parameters = "Boolean")
+    @GenerateStub(name = "vectorizedHashCodeChar", parameters = "Char")
+    @GenerateStub(name = "vectorizedHashCodeByte", parameters = "Byte")
+    @GenerateStub(name = "vectorizedHashCodeShort", parameters = "Short")
+    @GenerateStub(name = "vectorizedHashCodeInt", parameters = "Int")
+    public static native int vectorizedHashCode(Pointer arrayStart, int length, int initialValue, @ConstantNodeParameter JavaKind arrayKind);
+
+    @NodeIntrinsic
+    public static native int vectorizedHashCode(Pointer arrayStart, int length, int initialValue, @ConstantNodeParameter JavaKind arrayKind,
+                    @ConstantNodeParameter EnumSet<?> runtimeCheckedCPUFeatures);
+}

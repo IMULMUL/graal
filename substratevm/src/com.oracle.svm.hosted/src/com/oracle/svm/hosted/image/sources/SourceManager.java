@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2020, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2020, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,12 +26,13 @@
 
 package com.oracle.svm.hosted.image.sources;
 
-import jdk.vm.ci.meta.ResolvedJavaType;
-import org.graalvm.compiler.debug.DebugContext;
-
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.HashMap;
+
+import org.graalvm.collections.EconomicMap;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * A singleton class responsible for locating source files for classes included in a native image
@@ -44,7 +45,7 @@ public class SourceManager {
     /**
      * Find and cache a source file for a given Java class and return a Path to the file relative to
      * the source.
-     * 
+     *
      * @param resolvedType the Java type whose source file should be located and cached
      * @param clazz the Java class associated with the resolved type
      * @param debugContext context for logging details of any lookup failure
@@ -53,7 +54,10 @@ public class SourceManager {
      */
     public Path findAndCacheSource(ResolvedJavaType resolvedType, Class<?> clazz, DebugContext debugContext) {
         /* short circuit if we have already seen this type */
-        Path path = verifiedPaths.get(resolvedType);
+        Path path;
+        synchronized (verifiedPaths) {
+            path = verifiedPaths.get(resolvedType);
+        }
         if (path != null) {
             return (path != INVALID_PATH ? path : null);
         }
@@ -71,10 +75,10 @@ public class SourceManager {
                 path = locateSource(fileName, packageName, clazz);
                 if (path == null) {
                     // as a last ditch effort derive path from the Java class name
-                    if (debugContext.areScopesEnabled()) {
-                        debugContext.log(DebugContext.INFO_LEVEL, "Failed to find source file for class %s\n", resolvedType.toJavaName());
+                    if (debugContext.isLogEnabled()) {
+                        debugContext.log(DebugContext.INFO_LEVEL, "Failed to find source file for class %s%n", resolvedType.toJavaName());
                     }
-                    if (packageName.length() > 0) {
+                    if (!packageName.isEmpty()) {
                         path = Paths.get("", packageName.split("\\."));
                         path = path.resolve(fileName);
                     }
@@ -82,7 +86,9 @@ public class SourceManager {
             }
         }
         /* memoize the lookup */
-        verifiedPaths.put(resolvedType, (path != null ? path : INVALID_PATH));
+        synchronized (verifiedPaths) {
+            verifiedPaths.put(resolvedType, (path != null ? path : INVALID_PATH));
+        }
 
         return path;
     }
@@ -90,9 +96,9 @@ public class SourceManager {
     /**
      * Construct the base file name for a resolved Java class excluding path elements using either
      * the source name embedded in the class file or the class name itself.
-     * 
+     *
      * @param resolvedType the resolved java type whose source file name is required
-     * @return the file name or null if it the class cannot be associated with a source file
+     * @return the file name or null if the class cannot be associated with a source file
      */
     private static String computeBaseName(ResolvedJavaType resolvedType) {
         if (resolvedType.isPrimitive()) {
@@ -125,7 +131,7 @@ public class SourceManager {
 
     /**
      * Construct the package name for a Java type or the empty String if it has no package.
-     * 
+     *
      * @param javaType the Java type whose package name is required
      * @return the package name or the empty String if it has no package
      */
@@ -142,13 +148,13 @@ public class SourceManager {
     /**
      * Construct the prototype name for a Java source file which can be used to resolve and cache an
      * actual source file.
-     * 
+     *
      * @param fileName the base file name for the source file
      * @param packageName the name of the package for the associated Java class
-     * @return a protoype name for the source file
+     * @return a prototype name for the source file
      */
     private static Path computePrototypeName(String fileName, String packageName) {
-        if (packageName.length() == 0) {
+        if (packageName.isEmpty()) {
             return Paths.get("", fileName);
         } else {
             return Paths.get("", packageName.split("\\.")).resolve(fileName);
@@ -159,7 +165,7 @@ public class SourceManager {
      * A map from a Java type to an associated source paths which is known to have an up to date
      * entry in the relevant source file cache. This is used to memoize previous lookups.
      */
-    private static HashMap<ResolvedJavaType, Path> verifiedPaths = new HashMap<>();
+    private final EconomicMap<ResolvedJavaType, Path> verifiedPaths = EconomicMap.create();
 
     /**
      * An invalid path used as a marker to track failed lookups so we don't waste time looking up

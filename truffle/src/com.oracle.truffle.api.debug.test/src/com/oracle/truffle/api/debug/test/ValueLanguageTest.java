@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -57,14 +57,12 @@ import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.debug.Breakpoint;
 import com.oracle.truffle.api.debug.DebugStackFrame;
 import com.oracle.truffle.api.debug.DebugValue;
 import com.oracle.truffle.api.debug.DebuggerSession;
 import com.oracle.truffle.api.debug.SuspendedEvent;
-import com.oracle.truffle.api.frame.FrameSlot;
 import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.GenerateWrapper;
@@ -240,8 +238,16 @@ public class ValueLanguageTest extends AbstractDebugTest {
         static final String ID = "truffle-test-values-language1";
 
         public ValuesLanguage1() {
-            super("1");
+            super(ID, "1");
         }
+
+        private static final ContextReference<Context> CONTEXT_REF = ContextReference.create(ValuesLanguage1.class);
+
+        @Override
+        protected ContextReference<Context> getContextReference0() {
+            return CONTEXT_REF;
+        }
+
     }
 
     @TruffleLanguage.Registration(id = ValuesLanguage2.ID, name = ValuesLanguage2.NAME, version = "1.0")
@@ -252,7 +258,14 @@ public class ValueLanguageTest extends AbstractDebugTest {
         static final String ID = "truffle-test-values-language2";
 
         public ValuesLanguage2() {
-            super("2");
+            super(ID, "2");
+        }
+
+        private static final ContextReference<Context> CONTEXT_REF = ContextReference.create(ValuesLanguage2.class);
+
+        @Override
+        protected ContextReference<Context> getContextReference0() {
+            return CONTEXT_REF;
         }
     }
 
@@ -269,11 +282,13 @@ public class ValueLanguageTest extends AbstractDebugTest {
         }
     }
 
-    public static class ValuesLanguage extends TruffleLanguage<Context> {
+    public abstract static class ValuesLanguage extends TruffleLanguage<Context> {
 
+        private final String languageId;
         private final String id;
 
-        ValuesLanguage(String id) {
+        ValuesLanguage(String languageId, String id) {
+            this.languageId = languageId;
             this.id = id;
         }
 
@@ -282,10 +297,12 @@ public class ValueLanguageTest extends AbstractDebugTest {
             return new Context(env);
         }
 
+        protected abstract ContextReference<Context> getContextReference0();
+
         @Override
         protected CallTarget parse(ParsingRequest request) throws Exception {
             final com.oracle.truffle.api.source.Source source = request.getSource();
-            return Truffle.getRuntime().createCallTarget(new RootNode(this) {
+            return new RootNode(this) {
 
                 @Node.Child private BlockNode variables = parse(source);
 
@@ -294,7 +311,7 @@ public class ValueLanguageTest extends AbstractDebugTest {
                     return variables.execute(frame);
                 }
 
-            });
+            }.getCallTarget();
         }
 
         private BlockNode parse(com.oracle.truffle.api.source.Source source) {
@@ -390,12 +407,11 @@ public class ValueLanguageTest extends AbstractDebugTest {
         public static class VarNode extends Node implements InstrumentableNode {
 
             private final SourceSection sourceSection;
-            private final ValuesLanguage language;
+            final ValuesLanguage language;
             private final String name;
             protected final Object value;
-            @CompilationFinal private ContextReference<Context> contextReference;
             @Child private InteropLibrary interop = InteropLibrary.getFactory().createDispatched(5);
-            @CompilationFinal protected FrameSlot slot;
+            @CompilationFinal protected Integer slot;
 
             VarNode(ValuesLanguage language, String name, Object value, SourceSection sourceSection) {
                 this.language = language;
@@ -430,31 +446,17 @@ public class ValueLanguageTest extends AbstractDebugTest {
             public Object execute(VirtualFrame frame) {
                 if (slot == null) {
                     CompilerDirectives.transferToInterpreterAndInvalidate();
-                    slot = frame.getFrameDescriptor().findOrAddFrameSlot(name);
+                    slot = frame.getFrameDescriptor().findOrAddAuxiliarySlot(name);
                 }
-                if (value instanceof Integer) {
-                    frame.setInt(slot, (Integer) value);
-                } else if (value instanceof Long) {
-                    frame.setLong(slot, (Long) value);
-                } else {
-                    frame.setObject(slot, value);
-                }
+                frame.setAuxiliarySlot(slot, value);
                 try {
-                    interop.writeMember(getContextReference().get().getEnv().getPolyglotBindings(), name, value);
+                    interop.writeMember(language.getContextReference0().get(null).getEnv().getPolyglotBindings(), name, value);
                 } catch (UnknownIdentifierException | UnsupportedTypeException | UnsupportedMessageException e) {
                     CompilerDirectives.transferToInterpreter();
                     // should not happen for polyglot bindings.
                     throw new AssertionError(e);
                 }
                 return value;
-            }
-
-            protected final ContextReference<Context> getContextReference() {
-                if (contextReference == null) {
-                    CompilerDirectives.transferToInterpreterAndInvalidate();
-                    this.contextReference = lookupContextReference(language.getClass());
-                }
-                return this.contextReference;
             }
 
             @Override
@@ -505,25 +507,22 @@ public class ValueLanguageTest extends AbstractDebugTest {
                 Object varObj = null;
                 if (slot == null) {
                     CompilerDirectives.transferToInterpreterAndInvalidate();
-                    slot = frame.getFrameDescriptor().findFrameSlot(var);
-                    if (slot == null) {
-                        try {
-                            varObj = interop.readMember(getContextReference().get().getEnv().getPolyglotBindings(), var);
-                        } catch (UnknownIdentifierException e) {
-                            varObj = null;
-                        } catch (UnsupportedMessageException e) {
-                            CompilerDirectives.transferToInterpreter();
-                            throw new AssertionError(e);
-                        }
-                        slot = frame.getFrameDescriptor().addFrameSlot(var);
-                        frame.setObject(slot, varObj);
-                    }
+                    slot = frame.getFrameDescriptor().findOrAddAuxiliarySlot(var);
                 }
+                varObj = frame.getAuxiliarySlot(slot);
                 if (varObj == null) {
-                    varObj = frame.getValue(slot);
+                    try {
+                        varObj = interop.readMember(language.getContextReference0().get(null).getEnv().getPolyglotBindings(), var);
+                    } catch (UnknownIdentifierException e) {
+                        varObj = null;
+                    } catch (UnsupportedMessageException e) {
+                        CompilerDirectives.transferToInterpreter();
+                        throw new AssertionError(e);
+                    }
                     if (varObj == null) {
                         throw new IllegalStateException("Unknown var " + var);
                     }
+                    frame.setAuxiliarySlot(slot, varObj);
                 }
                 PropertiesMapObject props = (PropertiesMapObject) varObj;
                 props.map.put(prop, value);
@@ -550,13 +549,13 @@ public class ValueLanguageTest extends AbstractDebugTest {
             }
 
             @ExportMessage
-            boolean hasLanguage() {
+            boolean hasLanguageId() {
                 return true;
             }
 
             @ExportMessage
-            Class<? extends TruffleLanguage<?>> getLanguage() {
-                return language.getClass();
+            String getLanguageId() {
+                return language.languageId;
             }
 
             @ExportMessage
@@ -600,13 +599,13 @@ public class ValueLanguageTest extends AbstractDebugTest {
             }
 
             @ExportMessage
-            boolean hasLanguage() {
+            boolean hasLanguageId() {
                 return true;
             }
 
             @ExportMessage
-            Class<? extends TruffleLanguage<?>> getLanguage() {
-                return language.getClass();
+            String getLanguageId() {
+                return language.languageId;
             }
 
             @ExportMessage
@@ -626,7 +625,7 @@ public class ValueLanguageTest extends AbstractDebugTest {
             @TruffleBoundary
             Object toDisplayString(@SuppressWarnings("unused") boolean config) {
                 if (delegate instanceof Number) {
-                    return "L" + language.id + ":" + ((Number) delegate).toString();
+                    return "L" + language.id + ":" + delegate.toString();
                 }
                 if (delegate instanceof String) {
                     return "L" + language.id + ":" + delegate.toString();
@@ -702,17 +701,13 @@ public class ValueLanguageTest extends AbstractDebugTest {
 
             @SuppressWarnings("static-method")
             @ExportMessage
-            boolean hasLanguage() {
+            boolean hasLanguageId() {
                 return true;
             }
 
-            String getLanguageId() {
-                return language.id;
-            }
-
             @ExportMessage
-            Class<? extends TruffleLanguage<?>> getLanguage() {
-                return language.getClass();
+            String getLanguageId() {
+                return language.languageId;
             }
 
             @ExportMessage

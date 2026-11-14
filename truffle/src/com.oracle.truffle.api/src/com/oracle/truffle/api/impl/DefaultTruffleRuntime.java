@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,17 +41,20 @@
 package com.oracle.truffle.api.impl;
 
 import java.io.Closeable;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.reflect.Field;
 import java.util.Iterator;
 import java.util.Objects;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.CompilerOptions;
+import com.oracle.truffle.api.InternalResource;
 import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleRuntime;
@@ -61,12 +64,15 @@ import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.frame.FrameInstanceVisitor;
 import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.nodes.DirectCallNode;
-import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.LoopNode;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RepeatingNode;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.sun.management.HotSpotDiagnosticMXBean;
+import org.graalvm.nativeimage.ImageInfo;
+import sun.misc.Unsafe;
+
+import javax.management.MBeanServer;
 
 /**
  * Default implementation of the Truffle runtime if the virtual machine does not provide a better
@@ -79,8 +85,14 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
 
     private final ThreadLocal<DefaultFrameInstance> stackTraces = new ThreadLocal<>();
     private final DefaultTVMCI tvmci = new DefaultTVMCI();
+    /**
+     * Contains a reason why the default fallback engine was selected.
+     */
+    private final String fallbackReason;
 
-    private final TVMCI.Test<Closeable, CallTarget> testTvmci = new TVMCI.Test<Closeable, CallTarget>() {
+    private final boolean explicitlyRequested;
+
+    private final TVMCI.Test<Closeable, CallTarget> testTvmci = new TVMCI.Test<>() {
 
         @Override
         protected Closeable createTestContext(String testName) {
@@ -89,7 +101,7 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
 
         @Override
         public CallTarget createTestCallTarget(Closeable testContext, RootNode testNode) {
-            return createCallTarget(testNode);
+            return testNode.getCallTarget();
         }
 
         @Override
@@ -99,6 +111,24 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
     };
 
     public DefaultTruffleRuntime() {
+        this(null, false);
+    }
+
+    public DefaultTruffleRuntime(String fallbackReason) {
+        this(fallbackReason, false);
+    }
+
+    public DefaultTruffleRuntime(String fallbackReason, boolean explicitlyRequested) {
+        this.fallbackReason = fallbackReason;
+        this.explicitlyRequested = explicitlyRequested;
+    }
+
+    public String getFallbackReason() {
+        return fallbackReason;
+    }
+
+    public boolean isExplicitlyRequested() {
+        return explicitlyRequested;
     }
 
     /**
@@ -117,28 +147,9 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
         return "Interpreted";
     }
 
-    @SuppressWarnings("deprecation")
-    @Override
-    public RootCallTarget createCallTarget(RootNode rootNode) {
-        DefaultCallTarget target = new DefaultCallTarget(rootNode);
-        DefaultRuntimeAccessor.INSTRUMENT.onLoad(target.getRootNode());
-        return target;
-    }
-
-    @Override
-    public DirectCallNode createDirectCallNode(CallTarget target) {
-        Objects.requireNonNull(target);
-        return new DefaultDirectCallNode(target);
-    }
-
-    @Override
-    public IndirectCallNode createIndirectCallNode() {
-        return new DefaultIndirectCallNode();
-    }
-
     @Override
     public VirtualFrame createVirtualFrame(Object[] arguments, FrameDescriptor frameDescriptor) {
-        return new DefaultVirtualFrame(frameDescriptor, arguments);
+        return new FrameWithoutBoxing(frameDescriptor, arguments);
     }
 
     @Override
@@ -148,12 +159,7 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
 
     @Override
     public MaterializedFrame createMaterializedFrame(Object[] arguments, FrameDescriptor frameDescriptor) {
-        return new DefaultMaterializedFrame(new DefaultVirtualFrame(frameDescriptor, arguments));
-    }
-
-    @Override
-    public CompilerOptions createCompilerOptions() {
-        return new DefaultCompilerOptions();
+        return new FrameWithoutBoxing(frameDescriptor, arguments);
     }
 
     @Override
@@ -168,31 +174,26 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
 
     @Override
     public <T> T iterateFrames(FrameInstanceVisitor<T> visitor) {
-        T result = null;
+        return iterateFrames(visitor, 0);
+    }
+
+    public <T> T iterateFrames(FrameInstanceVisitor<T> visitor, int skipFrames) {
+        if (skipFrames < 0) {
+            throw new IllegalArgumentException("The skipFrames parameter must be >= 0.");
+        }
         DefaultFrameInstance frameInstance = getThreadLocalStackTrace();
+        int skipCounter = skipFrames;
         while (frameInstance != null) {
-            result = visitor.visitFrame(frameInstance);
-            if (result != null) {
-                return result;
+            if (skipCounter <= 0) {
+                T result = visitor.visitFrame(frameInstance);
+                if (result != null) {
+                    return result;
+                }
             }
             frameInstance = frameInstance.callerFrame;
+            skipCounter--;
         }
-        return result;
-    }
-
-    @Override
-    public FrameInstance getCallerFrame() {
-        DefaultFrameInstance currentFrame = getThreadLocalStackTrace();
-        if (currentFrame != null) {
-            return currentFrame.callerFrame;
-        } else {
-            return null;
-        }
-    }
-
-    @Override
-    public FrameInstance getCurrentFrame() {
-        return getThreadLocalStackTrace();
+        return null;
     }
 
     private DefaultFrameInstance getThreadLocalStackTrace() {
@@ -203,18 +204,12 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
         stackTraces.set(topFrame);
     }
 
-    DefaultFrameInstance pushFrame(VirtualFrame frame, CallTarget target) {
-        DefaultFrameInstance callerFrame = getThreadLocalStackTrace();
-        setThreadLocalStackTrace(new DefaultFrameInstance(frame, target, null, callerFrame));
-        return callerFrame;
-    }
-
-    DefaultFrameInstance pushFrame(VirtualFrame frame, CallTarget target, Node parentCallNode) {
+    DefaultFrameInstance pushFrame(VirtualFrame frame, CallTarget target, Node parentCallNode, int bytecodeIndex) {
         DefaultFrameInstance callerFrame = getThreadLocalStackTrace();
         // we need to ensure that frame instances are immutable so we need to recreate the parent
         // frame
-        DefaultFrameInstance callerFrameWithCallNode = callerFrame != null ? callerFrame.withCallNode(parentCallNode) : callerFrame;
-        setThreadLocalStackTrace(new DefaultFrameInstance(frame, target, null, callerFrameWithCallNode));
+        DefaultFrameInstance callerFrameWithCallNode = callerFrame != null ? callerFrame.withCallNode(parentCallNode, bytecodeIndex) : callerFrame;
+        setThreadLocalStackTrace(new DefaultFrameInstance(frame, target, null, -1, callerFrameWithCallNode));
         return callerFrame;
     }
 
@@ -239,48 +234,23 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
     }
 
     private static final class Loader {
-        private static final Method LOAD_METHOD;
-        static {
-            Method loadMethod = null;
-            try {
-                Class<?> servicesClass = Class.forName("jdk.vm.ci.services.Services");
-                loadMethod = servicesClass.getMethod("load", Class.class);
-            } catch (ClassNotFoundException | NoSuchMethodException e) {
-                // Services.load is not available
-            }
-            if (loadMethod != null) {
-                try {
-                    try {
-                        loadMethod.invoke(null, (Object) null);
-                    } catch (InvocationTargetException e) {
-                        throw e.getTargetException();
-                    }
-                } catch (NullPointerException npe) {
-                    // Services.load is accessible
-                } catch (IllegalAccessException iae) {
-                    // Services.load is not accessible. This happens on JDK 9+ when EnableJVMCI is
-                    // true (either explicitly or by default) which causes the jdk.internal.vm.ci
-                    // module to be resolved.
-                    loadMethod = null;
-                } catch (Throwable e) {
-                    throw new InternalError(e);
-                }
-            }
-            LOAD_METHOD = loadMethod;
-        }
-
         @SuppressWarnings("unchecked")
         static <S> Iterable<S> load(Class<S> service) {
-            TruffleJDKServices.addUses(service);
-            if (LOAD_METHOD != null) {
-                try {
-                    return (Iterable<S>) LOAD_METHOD.invoke(null, service);
-                } catch (Exception e) {
-                    throw new InternalError(e);
-                }
-            } else {
-                return ServiceLoader.load(service);
+            Module truffleModule = DefaultTruffleRuntime.class.getModule();
+            if (!truffleModule.canUse(service)) {
+                truffleModule.addUses(service);
             }
+            ModuleLayer moduleLayer = truffleModule.getLayer();
+            Iterable<S> services;
+            if (moduleLayer != null) {
+                services = ServiceLoader.load(moduleLayer, service);
+            } else {
+                services = ServiceLoader.load(service, DefaultTruffleRuntime.class.getClassLoader());
+            }
+            if (!services.iterator().hasNext()) {
+                services = ServiceLoader.load(service);
+            }
+            return services;
         }
     }
 
@@ -303,15 +273,18 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
         private final CallTarget target;
         private final VirtualFrame frame;
         private final Node callNode;
+        private final int bytecodeIndex;
         private final DefaultFrameInstance callerFrame;
 
-        DefaultFrameInstance(VirtualFrame frame, CallTarget target, Node callNode, DefaultFrameInstance callerFrame) {
+        DefaultFrameInstance(VirtualFrame frame, CallTarget target, Node callNode, int bytecodeIndex, DefaultFrameInstance callerFrame) {
             this.target = target;
             this.frame = frame;
             this.callNode = callNode;
+            this.bytecodeIndex = bytecodeIndex;
             this.callerFrame = callerFrame;
         }
 
+        @Override
         public Frame getFrame(FrameAccess access) {
             Frame localFrame = this.frame;
             switch (access) {
@@ -327,22 +300,145 @@ public final class DefaultTruffleRuntime implements TruffleRuntime {
             }
         }
 
+        @Override
         public boolean isVirtualFrame() {
             return false;
         }
 
+        @Override
         public CallTarget getCallTarget() {
             return target;
         }
 
+        @Override
         public Node getCallNode() {
             return callNode;
         }
 
-        DefaultFrameInstance withCallNode(Node otherCallNode) {
-            return new DefaultFrameInstance(frame, target, otherCallNode, callerFrame);
+        @Override
+        public int getBytecodeIndex() {
+            if (bytecodeIndex != -1) {
+                return bytecodeIndex;
+            }
+            return FrameInstance.super.getBytecodeIndex();
+        }
+
+        int getBytecodeIndex(Frame readOnlyFrame) {
+            if (bytecodeIndex != -1) {
+                return bytecodeIndex;
+            }
+            RootCallTarget rootTarget = (RootCallTarget) target;
+            RootNode root = rootTarget.getRootNode();
+            return DefaultRuntimeAccessor.NODES.findBytecodeIndex(root, callNode, readOnlyFrame);
+        }
+
+        @Override
+        public Node getInstrumentableCallNode() {
+            RootCallTarget rootTarget = (RootCallTarget) target;
+            RootNode root = rootTarget.getRootNode();
+            Frame readOnlyFrame = DefaultRuntimeAccessor.NODES.isCaptureFramesForTrace(root, false) ? getFrame(FrameAccess.READ_ONLY) : null;
+            int callBytecodeIndex = bytecodeIndex != -1 ? bytecodeIndex : DefaultRuntimeAccessor.NODES.findBytecodeIndex(root, callNode, readOnlyFrame);
+            return DefaultRuntimeAccessor.NODES.findInstrumentableCallNode(root, callNode, readOnlyFrame, callBytecodeIndex);
+        }
+
+        DefaultFrameInstance withCallNode(Node otherCallNode, int otherBytecodeIndex) {
+            return new DefaultFrameInstance(frame, target, otherCallNode, otherBytecodeIndex, callerFrame);
         }
 
     }
 
+    public void markFrameMaterializeCalled(@SuppressWarnings("unused") FrameDescriptor descriptor) {
+        // empty
+    }
+
+    static <T> ThreadLocal<T> createTerminatingThreadLocal(Supplier<T> initialValue, Consumer<T> onThreadTermination) {
+        if (ImageInfo.inImageRuntimeCode()) {
+            throw new AssertionError("Must not be called in native-image execution time");
+        }
+        Objects.requireNonNull(initialValue, "initialValue must be non null.");
+        Objects.requireNonNull(onThreadTermination, "onThreadTermination must be non null.");
+        return DefaultRuntimeAccessor.ENGINE.getModulesAccessor().getJavaLangSupport().createTerminatingThreadLocal(initialValue, onThreadTermination);
+    }
+
+    static long getStackOverflowLimit() {
+        if (ImageInfo.inImageRuntimeCode()) {
+            throw new AssertionError("Must not be called in native-image execution time");
+        }
+        long platformStackEnd = getPlatformStackEnd0();
+        if (platformStackEnd == 0L) {
+            throw new UnsupportedOperationException("Unable to determine platform stack end for the current thread.");
+        }
+        HotSpotStackConfig config = HotSpotStackConfig.INSTANCE;
+        long red = alignUp(config.redZoneSize(), config.pageSize());
+        long yellow = alignUp(config.yellowZoneSize(), config.pageSize());
+        long reserved = alignUp(config.reservedZoneSize(), config.pageSize());
+        long shadow = alignUp(config.shadowZoneSize(), config.pageSize());
+        long guardZone = red + yellow + reserved;
+        return platformStackEnd + config.transitionSafetyMargin() + Math.max(guardZone, shadow);
+    }
+
+    private static long alignUp(long x, long a) {
+        return ((x + a - 1) / a) * a;
+    }
+
+    private record HotSpotStackConfig(long redZoneSize, long yellowZoneSize, long reservedZoneSize,
+                    long shadowZoneSize, long transitionSafetyMargin, long pageSize) {
+
+        HotSpotStackConfig {
+            assert transitionSafetyMargin % pageSize == 0 : "transitionSafetyMargin must be a multiple of pageSize";
+        }
+
+        private static final HotSpotStackConfig INSTANCE = init();
+
+        private static HotSpotStackConfig init() {
+            if (ImageInfo.inImageCode()) {
+                return null;
+            }
+            long pageSize = getUnsafe().pageSize();
+            /*
+             * On Linux, add one page of extra safety margin to compensate for libc/pthread
+             * stack-bound reporting differences (notably older glibc guard-page behavior). The
+             * fallback stack overflow limit is only required to be conservative, not identical to
+             * HotSpot's exact limit.
+             */
+            long safetyMargin = InternalResource.OS.getCurrent() == InternalResource.OS.LINUX ? pageSize : 0L;
+            MBeanServer platformMBeanServer = ManagementFactory.getPlatformMBeanServer();
+            try {
+                HotSpotDiagnosticMXBean bean = ManagementFactory.newPlatformMXBeanProxy(platformMBeanServer, "com.sun.management:type=HotSpotDiagnostic", HotSpotDiagnosticMXBean.class);
+                return new HotSpotStackConfig(
+                                // uses 4KB units
+                                Long.parseLong(bean.getVMOption("StackRedPages").getValue()) * 4096L,
+                                // uses 4KB units
+                                Long.parseLong(bean.getVMOption("StackYellowPages").getValue()) * 4096L,
+                                // uses 4KB units
+                                Long.parseLong(bean.getVMOption("StackReservedPages").getValue()) * 4096L,
+                                // uses 4KB units
+                                Long.parseLong(bean.getVMOption("StackShadowPages").getValue()) * 4096L,
+                                // size in bytes
+                                safetyMargin,
+                                // OS page size in bytes
+                                pageSize);
+            } catch (IOException ioe) {
+                throw new RuntimeException(ioe);
+            }
+        }
+
+        private static Unsafe getUnsafe() {
+            try {
+                // Fast path when we are trusted.
+                return Unsafe.getUnsafe();
+            } catch (SecurityException se) {
+                // Slow path when we are not trusted.
+                try {
+                    Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+                    theUnsafe.setAccessible(true);
+                    return (Unsafe) theUnsafe.get(Unsafe.class);
+                } catch (Exception e) {
+                    throw new RuntimeException("exception while trying to get Unsafe", e);
+                }
+            }
+        }
+    }
+
+    private static native long getPlatformStackEnd0();
 }

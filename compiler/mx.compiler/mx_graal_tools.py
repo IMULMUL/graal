@@ -1,6 +1,4 @@
 #
-# ----------------------------------------------------------------------------------------------------
-#
 # Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
@@ -24,19 +22,16 @@
 # or visit www.oracle.com if you need additional information or have any
 # questions.
 #
-# ----------------------------------------------------------------------------------------------------
 
-from __future__ import print_function
 
 import os
-import shutil
 import re
+import shutil
 import sys
-from os.path import join, exists
 from argparse import ArgumentParser, REMAINDER
+from os.path import join, exists
 
 import mx
-from mx_urlrewrites import rewriteurl
 
 if sys.version_info[0] < 3:
     _long = long # pylint: disable=undefined-variable
@@ -45,9 +40,10 @@ else:
 
 _suite = mx.suite('compiler')
 
-def run_netbeans_app(app_name, env=None, args=None):
+def run_netbeans_app(app_name, jdkhome, args=None, dist=None, launch_message=None):
     args = [] if args is None else args
-    dist = app_name.upper() + '_DIST'
+    if dist is None:
+        dist = app_name.upper() + '_DIST'
     name = app_name.lower()
     res = mx.library(dist)
 
@@ -65,75 +61,125 @@ def run_netbeans_app(app_name, env=None, args=None):
     if mx.get_os() != 'windows':
         # Make sure that execution is allowed. The zip file does not always specfiy that correctly
         os.chmod(executable, 0o777)
-    launch = [executable]
-    if not mx.get_opts().verbose:
-        launch.append('-J-Dnetbeans.logger.console=false')
-    mx.run(launch+args, env=env)
 
-def netbeans_jdk(appName):
-    v8u20 = mx.VersionSpec("1.8.0_20")
-    v8u40 = mx.VersionSpec("1.8.0_40")
-    def _igvJdkVersionCheck(version):
-        return version < v8u20 or version >= v8u40
-    return mx.get_jdk(_igvJdkVersionCheck, versionDescription='(< 1.8.0u20 or >= 1.8.0u40)', purpose="running " + appName).home
+    # the current launcher .conf file enables assertions so explicitly disable them until a new IGV
+    # distribution is built
+    launch = [executable, '-J-da']
+    if jdkhome:
+        launch += ['--jdkhome', jdkhome]
+
+    # log to console if mx -v is specified
+    if mx.get_opts().verbose:
+        args.append('-J-Dnetbeans.logger.console=true')
+    if mx.get_os() == 'linux':
+        # Mitigates X server crashes on Linux
+        launch.append('-J-Dsun.java2d.xrender=false')
+    if launch_message:
+        launch_message()
+    mx.run(launch+args)
+
+
+def netbeans_docstring(fullname, mxname):
+    return f"""run the {fullname}
+
+    The current version is based on NetBeans 26 which officially supports JDK 17 through JDK 24.  A
+    supported JDK will be chosen from the JDKs known to mx but it will fall back to whatever is
+    configured as JAVA_HOME if a supported JDK can't be found.  It's not recommended to run igv with
+    pre-release JDKs.  Setting TOOLS_JAVA_HOME to point at a supported JDK is the recommended way to
+    configure the JDK for IGV.
+
+    You can directly control which JDK is used to launch IGV using
+
+       mx {mxname} --jdkhome /path/to/java/home
+
+    This will completely ignore any JAVA_HOME settings in mx.
+
+    Extra NetBeans specific options can be passed as well.  mx {mxname} --help will show the
+    help for the NetBeans launcher.
+
+    """
+
+def launch_netbeans_app(fullname, distname, mxname, args, launch_message=None):
+    min_version = 17
+    max_version = 24
+    min_version_spec = mx.VersionSpec(str(min_version))
+    next_version_spec = mx.VersionSpec(str(max_version + 1))
+    def _netbeansJdkVersionCheck(version):
+        return min_version_spec <= version < next_version_spec
+
+    jdkhome = None
+    if '--jdkhome' not in args:
+        def _do_not_abort(msg):
+            pass
+
+        # try to find a fully supported version first
+        jdk = mx.get_tools_jdk(versionCheck=_netbeansJdkVersionCheck, versionDescription=f'{fullname} prefers JDK {min_version} through JDK {max_version}', abortCallback=_do_not_abort)
+        if jdk is None:
+            # try any JDK
+            jdk = mx.get_jdk()
+
+        if jdk:
+            jdkhome = jdk.home
+            mx.log(f'Launching {fullname} with {jdkhome}')
+            if not _netbeansJdkVersionCheck(jdk.version):
+                mx.warn(f'{jdk.home} is not an officially supported JDK.')
+                mx.warn(f'If you experience any problems try to use an LTS release between JDK {min_version} and JDK {max_version} instead.')
+                mx.warn(f'mx help {mxname} provides more details.')
+
+    run_netbeans_app(distname, jdkhome, args=args, dist=f'{distname.upper()}_DIST', launch_message=launch_message)
 
 def igv(args):
-    """(obsolete) informs about IGV"""
-    mx.warn(
-        """IGV (idealgraphvisualizer) is available from
-    https://www.oracle.com/technetwork/graalvm/downloads/index.html
-Please download the distribution and run
-    bin/idealgraphvisualizer
-from the GraalVM EE installation.
-""")
+    def help_message():
+        print('Consider flag -J-Dsun.java2d.uiScale=2 if on a high resolution display')
+        print('Consider flag -J-Xms4g -J-Xmx8g if dealing with large graphs')
+
+    launch_netbeans_app('Ideal Graph Visualizer', 'IdealGraphVisualizer', 'igv', args, launch_message=help_message)
+
+igv.__doc__ = netbeans_docstring('Ideal Graph Visualizer', 'igv')
 
 def c1visualizer(args):
-    """run the C1 Compiler Visualizer"""
-    env = dict(os.environ)
-    env['jdkhome'] = netbeans_jdk("C1 Visualizer")
-    run_netbeans_app('C1Visualizer', env, args)
+    launch_netbeans_app('C1 Visualizer', 'C1Visualizer', 'c1visualizer', args)
 
-def hsdis(args, copyToDir=None):
-    """download the hsdis library
+c1visualizer.__doc__ = netbeans_docstring('C1 Visualizer', 'c1visualizer')
+
+
+def get_hsdis_lib() -> str:
+    hsdis_lib_name = 'HSDIS'
+    hsdis_lib = mx.library(hsdis_lib_name)
+
+    if hsdis_lib.optional:
+        mx.abort('hsdis is not supported on this platform or architecture')
+
+    hsdis_lib_path = hsdis_lib.get_path(resolve=True)
+    hsdis_lib_files = os.listdir(hsdis_lib_path)
+    if len(hsdis_lib_files) != 1:
+        mx.abort(f"hsdis library '{hsdis_lib_name}' does not contain a single file: {hsdis_lib_files}")
+    hsdis_lib_file = join(hsdis_lib_path, hsdis_lib_files[0])
+    return hsdis_lib_file
+
+def hsdis(args):
+    """download the hsdis library and copy it to a specific dir or to the current JDK
 
     This is needed to support HotSpot's assembly dumping features.
-    By default it downloads the Intel syntax version, use the 'att' argument to install AT&T syntax."""
-    flavor = None
-    if mx.get_arch() == "amd64":
-        flavor = mx.get_env('HSDIS_SYNTAX')
-        if flavor is None:
-            flavor = 'intel'
-        if 'att' in args:
-            flavor = 'att'
+    On amd64 platforms, it downloads the Intel syntax version"""
 
-    libpattern = mx.add_lib_suffix('hsdis-' + mx.get_arch() + '-' + mx.get_os() + '-%s')
+    parser = ArgumentParser(prog='hsdis')
+    parser.add_argument('-d', '--directory', action='store', help='Directory to copy hsdis to.')
+    parser.add_argument('-l', '--lib-prefix', action='store_true', help='Add lib prefix to filename if necessary.')
+    args = parser.parse_args(args)
 
-    sha1s = {
-        r'att\hsdis-amd64-windows-%s.dll' : 'bcbd535a9568b5075ab41e96205e26a2bac64f72',
-        r'att/hsdis-amd64-linux-%s.so' : '36a0b8e30fc370727920cc089f104bfb9cd508a0',
-        r'att/hsdis-amd64-darwin-%s.dylib' : 'c1865e9a58ca773fdc1c5eea0a4dfda213420ffb',
-        r'intel\hsdis-amd64-windows-%s.dll' : '6a388372cdd5fe905c1a26ced614334e405d1f30',
-        r'intel/hsdis-amd64-linux-%s.so' : '0d031013db9a80d6c88330c42c983fbfa7053193',
-        r'intel/hsdis-amd64-darwin-%s.dylib' : '67f6d23cbebd8998450a88b5bef362171f66f11a',
-        r'hsdis-aarch64-linux-%s.so': 'fcc9b70ac91c00db8a50b0d4345490a68e3743e1',
-    }
+    hsdis_syntax = mx.get_env('HSDIS_SYNTAX')
+    if hsdis_syntax:
+        mx.warn("The 'hsdis' function ignores the value of the 'HSDIS_SYNTAX' environment variable: " + hsdis_syntax)
 
-    if flavor:
-        flavoredLib = join(flavor, libpattern)
-    else:
-        flavoredLib = libpattern
-    if flavoredLib not in sha1s:
-        mx.warn("hsdis with flavor '{}' not supported on this platform or architecture".format(flavor))
-        return
+    hsdis_lib_file = get_hsdis_lib()
 
-    sha1 = sha1s[flavoredLib]
-    lib = flavoredLib % (sha1)
-    path = join(_suite.get_output_root(), lib)
-    if not exists(path):
-        sha1path = path + '.sha1'
-        mx.download_file_with_sha1('hsdis', path, [rewriteurl('https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/hsdis/' + lib.replace(os.sep, '/'))], sha1, sha1path, True, True, sources=False)
+    libname = mx.add_lib_suffix('hsdis-' + mx.get_arch())
+    if args.lib_prefix and args.directory:
+        libname = mx.add_lib_prefix(libname)
 
     overwrite = True
+    copyToDir = args.directory
     if copyToDir is None:
         # Try install hsdis into JAVA_HOME
         overwrite = False
@@ -145,27 +191,42 @@ def hsdis(args, copyToDir=None):
             copyToDir = join(base, 'lib')
         elif mx.get_os() == 'windows':
             copyToDir = join(base, 'bin')
+        elif jdk.javaCompliance >= '11':
+            copyToDir = join(base, 'lib')
         else:
-            if jdk.javaCompliance >= '11':
-                copyToDir = join(base, 'lib')
-            else:
-                copyToDir = join(base, 'lib', mx.get_arch())
+            copyToDir = join(base, 'lib', mx.get_arch())
 
     if exists(copyToDir):
-        dest = join(copyToDir, mx.add_lib_suffix('hsdis-' + mx.get_arch()))
+        dest = join(copyToDir, libname)
         if exists(dest) and not overwrite:
             import filecmp
             # Only issue warning if existing lib is different
-            if filecmp.cmp(path, dest) is False:
-                mx.warn('Not overwriting existing {} with {}'.format(dest, path))
+            if filecmp.cmp(hsdis_lib_file, dest) is False:
+                mx.warn(f'Not overwriting existing {dest} with {hsdis_lib_file}')
         else:
             try:
-                shutil.copy(path, dest)
-                mx.log('Copied {} to {}'.format(path, dest))
-            except IOError as e:
-                mx.warn('Could not copy {} to {}: {}'.format(path, dest, str(e)))
+                shutil.copy(hsdis_lib_file, dest)
+                mx.log(f'Copied {hsdis_lib_file} to {dest}')
+            except OSError as e:
+                mx.warn(f'Could not copy {hsdis_lib_file} to {dest}: {e}')
 
-def hcfdis(args):
+def distool(args):
+    """disassemble annotated machine code embedded in text files
+
+    Run a tool over the input files to convert in place HexCodeFiles
+    embedded in cfg files and MachCode sections in hs_err_pid files to a
+    disassembled format.
+    """
+
+    # Explicitly resolve GRAAL_TEST to get a clearer
+    # error message if it has not been built.
+    mx.distribution('GRAAL_TEST').classpath_repr(True)
+
+    path = mx.classpath('GRAAL_TEST')
+    mx.run_java(['-ea', '-cp', path, f"-Dtest.jdk.graal.compiler.disassembler.path={get_hsdis_lib()}",
+                 "--enable-native-access=ALL-UNNAMED", 'jdk.graal.compiler.disassembler.DisassemblerTool'] + args)
+
+def hcfdis(args, cp=None):
     """disassemble HexCodeFiles embedded in text files
 
     Run a tool over the input files to convert all embedded HexCodeFiles
@@ -177,14 +238,14 @@ def hcfdis(args):
 
     args = parser.parse_args(args)
 
-    path = mx.library('HCFDIS').get_path(resolve=True)
+    path = cp or mx.library('HCFDIS').get_path(resolve=True)
     mx.run_java(['-cp', path, 'com.oracle.max.hcfdis.HexCodeFileDis'] + args.files)
 
     if args.map is not None:
         addressRE = re.compile(r'0[xX]([A-Fa-f0-9]+)')
-        with open(args.map) as fp:
+        with open(args.map, encoding='utf-8') as fp:
             lines = fp.read().splitlines()
-        symbols = dict()
+        symbols = {}
         for l in lines:
             addressAndSymbol = l.split(' ', 1)
             if len(addressAndSymbol) == 2:
@@ -193,7 +254,7 @@ def hcfdis(args):
                     address = _long(address, 16)
                     symbols[address] = symbol
         for f in args.files:
-            with open(f) as fp:
+            with open(f, encoding='utf-8') as fp:
                 lines = fp.read().splitlines()
             updated = False
             for i in range(0, len(lines)):
@@ -208,7 +269,7 @@ def hcfdis(args):
                         lines[i] = l
             if updated:
                 mx.log('updating ' + f)
-                with open('new_' + f, "w") as fp:
+                with open('new_' + f, "w", encoding='utf-8') as fp:
                     for l in lines:
                         print(l, file=fp)
 
@@ -235,7 +296,8 @@ def jol(args):
 
 mx.update_commands(_suite, {
     'c1visualizer' : [c1visualizer, ''],
-    'hsdis': [hsdis, '[att]'],
+    'distool' : [distool, '[options]'],
+    'hsdis': [hsdis, ''],
     'hcfdis': [hcfdis, ''],
     'igv' : [igv, ''],
     'jol' : [jol, ''],

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2020, 2020, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -26,34 +26,35 @@
 
 package com.oracle.objectfile.debuginfo;
 
-import java.nio.file.Path;
 import java.util.List;
-import java.util.function.Consumer;
-import java.util.stream.Stream;
 
-import org.graalvm.compiler.debug.DebugContext;
+import com.oracle.objectfile.debugentry.CompiledMethodEntry;
+import com.oracle.objectfile.debugentry.TypeEntry;
 
 /**
  * Interfaces used to allow a native image to communicate details of types, code and data to the
  * underlying object file so that the latter can insert appropriate debug info.
  */
 public interface DebugInfoProvider {
-    boolean useHeapBase();
+
+    void installDebugInfo();
+
+    boolean isRuntimeCompilation();
 
     /**
      * Number of bits oops are left shifted by when using compressed oops.
      */
-    int oopCompressShift();
+    int compressionShift();
 
     /**
-     * Mask delecting low order bits used for tagging oops.
+     * Mask selecting low order bits used for tagging oops.
      */
-    int oopTagsMask();
+    int reservedHubBitsMask();
 
     /**
      * Number of bytes used to store an oop reference.
      */
-    int oopReferenceSize();
+    int referenceSize();
 
     /**
      * Number of bytes used to store a raw pointer.
@@ -63,295 +64,16 @@ public interface DebugInfoProvider {
     /**
      * Alignment of object memory area (and, therefore, of any oop) in bytes.
      */
-    int oopAlignment();
+    int objectAlignment();
 
-    /**
-     * An interface implemented by items that can be located in a file.
-     */
-    interface DebugFileInfo {
-        /**
-         * @return the name of the file containing a file element excluding any path.
-         */
-        String fileName();
+    List<TypeEntry> typeEntries();
 
-        /**
-         * @return a relative path to the file containing a file element derived from its package
-         *         name or {@code null} if the element is in the empty package.
-         */
-        Path filePath();
+    List<CompiledMethodEntry> compiledMethodEntries();
 
-        /**
-         * @return a relative path to the source cache containing the cached source file of a file
-         *         element or {@code null} if sources are not available.
-         */
-        Path cachePath();
+    String cachePath();
+
+    enum FrameSizeChangeType {
+        EXTEND,
+        CONTRACT;
     }
-
-    interface DebugTypeInfo extends DebugFileInfo {
-        enum DebugTypeKind {
-            PRIMITIVE,
-            ENUM,
-            INSTANCE,
-            INTERFACE,
-            ARRAY,
-            HEADER;
-
-            @Override
-            public String toString() {
-                switch (this) {
-                    case PRIMITIVE:
-                        return "primitive";
-                    case ENUM:
-                        return "enum";
-                    case INSTANCE:
-                        return "instance";
-                    case INTERFACE:
-                        return "interface";
-                    case ARRAY:
-                        return "array";
-                    case HEADER:
-                        return "header";
-                    default:
-                        return "???";
-                }
-            }
-        }
-
-        void debugContext(Consumer<DebugContext> action);
-
-        /**
-         * @return the fully qualified name of the debug type.
-         */
-        String typeName();
-
-        DebugTypeKind typeKind();
-
-        int size();
-    }
-
-    interface DebugInstanceTypeInfo extends DebugTypeInfo {
-        int headerSize();
-
-        Stream<DebugFieldInfo> fieldInfoProvider();
-
-        Stream<DebugMethodInfo> methodInfoProvider();
-
-        String superName();
-
-        Stream<String> interfaces();
-    }
-
-    interface DebugEnumTypeInfo extends DebugInstanceTypeInfo {
-    }
-
-    interface DebugInterfaceTypeInfo extends DebugInstanceTypeInfo {
-    }
-
-    interface DebugArrayTypeInfo extends DebugTypeInfo {
-        int baseSize();
-
-        int lengthOffset();
-
-        String elementType();
-
-        Stream<DebugFieldInfo> fieldInfoProvider();
-    }
-
-    interface DebugPrimitiveTypeInfo extends DebugTypeInfo {
-        /*
-         * NUMERIC excludes LOGICAL types boolean and void
-         */
-        int FLAG_NUMERIC = 1 << 0;
-        /*
-         * INTEGRAL excludes FLOATING types float and double
-         */
-        int FLAG_INTEGRAL = 1 << 1;
-        /*
-         * SIGNED excludes UNSIGNED type char
-         */
-        int FLAG_SIGNED = 1 << 2;
-
-        int bitCount();
-
-        char typeChar();
-
-        int flags();
-    }
-
-    interface DebugHeaderTypeInfo extends DebugTypeInfo {
-
-        Stream<DebugFieldInfo> fieldInfoProvider();
-    }
-
-    interface DebugMemberInfo extends DebugFileInfo {
-
-        String name();
-
-        String ownerType();
-
-        String valueType();
-
-        int modifiers();
-    }
-
-    interface DebugFieldInfo extends DebugMemberInfo {
-        int offset();
-
-        int size();
-    }
-
-    interface DebugMethodInfo extends DebugMemberInfo {
-        List<String> paramTypes();
-
-        List<String> paramNames();
-    }
-
-    /**
-     * Access details of a specific compiled method.
-     */
-    interface DebugCodeInfo extends DebugFileInfo {
-        void debugContext(Consumer<DebugContext> action);
-
-        /**
-         * @return the fully qualified name of the class owning the compiled method.
-         */
-        String className();
-
-        /**
-         * @return the name of the compiled method including signature.
-         */
-        String methodName();
-
-        /**
-         * @return the symbolNameForMethod string
-         */
-        String symbolNameForMethod();
-
-        /**
-         * @return the lowest address containing code generated for the method represented as an
-         *         offset into the code segment.
-         */
-        int addressLo();
-
-        /**
-         * @return the first address above the code generated for the method represented as an
-         *         offset into the code segment.
-         */
-        int addressHi();
-
-        /**
-         * @return the starting line number for the method.
-         */
-        int line();
-
-        /**
-         * @return a stream of records detailing line numbers and addresses within the compiled
-         *         method.
-         */
-        Stream<DebugLineInfo> lineInfoProvider();
-
-        /**
-         * @return a string identifying the method parameters.
-         */
-        String paramSignature();
-
-        /**
-         * @return a string identifying the method return type.
-         */
-        String returnTypeName();
-
-        /**
-         * @return the size of the method frame between prologue and epilogue.
-         */
-        int getFrameSize();
-
-        /**
-         * @return a list of positions at which the stack is extended to a full frame or torn down
-         *         to an empty frame
-         */
-        List<DebugFrameSizeChange> getFrameSizeChanges();
-
-        /**
-         * @return true if this method has been compiled in as a deoptimization target
-         */
-        boolean isDeoptTarget();
-
-        int getModifiers();
-    }
-
-    /**
-     * Access details of a specific heap object.
-     */
-    interface DebugDataInfo {
-        void debugContext(Consumer<DebugContext> action);
-
-        String getProvenance();
-
-        String getTypeName();
-
-        String getPartition();
-
-        long getOffset();
-
-        long getAddress();
-
-        long getSize();
-    }
-
-    /**
-     * Access details of code generated for a specific outer or inlined method at a given line
-     * number.
-     */
-    interface DebugLineInfo extends DebugFileInfo {
-        /**
-         * @return the fully qualified name of the class owning the outer or inlined method.
-         */
-        String className();
-
-        /**
-         * @return the name of the outer or inlined method including signature.
-         */
-        String methodName();
-
-        /**
-         * @return the symbolNameForMethod string
-         */
-        String symbolNameForMethod();
-
-        /**
-         * @return the lowest address containing code generated for an outer or inlined code segment
-         *         reported at this line represented as an offset into the code segment.
-         */
-        int addressLo();
-
-        /**
-         * @return the first address above the code generated for an outer or inlined code segment
-         *         reported at this line represented as an offset into the code segment.
-         */
-        int addressHi();
-
-        /**
-         * @return the line number for the outer or inlined segment.
-         */
-        int line();
-    }
-
-    interface DebugFrameSizeChange {
-        enum Type {
-            EXTEND,
-            CONTRACT
-        }
-
-        int getOffset();
-
-        DebugFrameSizeChange.Type getType();
-    }
-
-    @SuppressWarnings("unused")
-    Stream<DebugTypeInfo> typeInfoProvider();
-
-    Stream<DebugCodeInfo> codeInfoProvider();
-
-    @SuppressWarnings("unused")
-    Stream<DebugDataInfo> dataInfoProvider();
 }

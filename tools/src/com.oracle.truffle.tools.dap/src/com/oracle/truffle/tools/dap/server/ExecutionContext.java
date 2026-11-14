@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,15 +24,19 @@
  */
 package com.oracle.truffle.tools.dap.server;
 
+import com.oracle.truffle.api.TruffleContext;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.debug.DebuggerSession;
+import com.oracle.truffle.api.instrumentation.ContextsListener;
 import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.LoadSourceListener;
 import com.oracle.truffle.api.instrumentation.SourceFilter;
 import com.oracle.truffle.api.instrumentation.ThreadsListener;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
+import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.tools.dap.types.DebugProtocolClient;
 import java.io.PrintWriter;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * The execution context.
@@ -48,6 +52,7 @@ public final class ExecutionContext {
     private final boolean[] runPermission = new boolean[]{false};
 
     private volatile DebugProtocolClient client;
+    private volatile EventBinding<ContextsListener> contextsBinding;
     private volatile LoadedSourcesHandler loadedSourcesHandler;
     private volatile EventBinding<LoadSourceListener> srcBinding;
     private volatile ThreadsHandler threadsHandler;
@@ -57,6 +62,9 @@ public final class ExecutionContext {
     private volatile VariablesHandler variablesHandler;
     private boolean linesStartAt1 = true;
     private boolean columnsStartAt1 = true;
+    private volatile PathMappings pathMappings = PathMappings.EMPTY;
+
+    private final EconomicSet<TruffleContext> contexts = EconomicSet.create();
 
     public ExecutionContext(TruffleInstrument.Env env, PrintWriter info, PrintWriter err, boolean inspectInternal, boolean inspectInitialization) {
         this.env = env;
@@ -69,6 +77,7 @@ public final class ExecutionContext {
 
     public void initSession(DebuggerSession debuggerSession) {
         this.loadedSourcesHandler = new LoadedSourcesHandler(this, debuggerSession);
+        this.contextsBinding = env.getInstrumenter().attachContextsListener(new ContextTracker(), true);
         this.srcBinding = env.getInstrumenter().attachLoadSourceListener(SourceFilter.ANY, loadedSourcesHandler, true);
         this.threadsHandler = new ThreadsHandler(this, debuggerSession);
         this.thrBinding = env.getInstrumenter().attachThreadsListener(threadsHandler, true);
@@ -83,6 +92,16 @@ public final class ExecutionContext {
 
     public TruffleInstrument.Env getEnv() {
         return env;
+    }
+
+    public TruffleContext getATruffleContext() {
+        synchronized (contexts) {
+            if (contexts.isEmpty()) {
+                return null;
+            } else {
+                return contexts.iterator().next();
+            }
+        }
     }
 
     public PrintWriter getInfo() {
@@ -129,6 +148,30 @@ public final class ExecutionContext {
         return stackFramesHandler;
     }
 
+    public void configurePathMappings(Object mappings, Object localRoot, Object remoteRoot) {
+        pathMappings = PathMappings.parse(mappings, localRoot, remoteRoot);
+        LoadedSourcesHandler handler = loadedSourcesHandler;
+        if (handler != null) {
+            handler.refreshClientPaths();
+        }
+    }
+
+    public String clientToRuntimePath(String path) {
+        return pathMappings.toRuntime(path);
+    }
+
+    public String runtimeToClientPath(String path) {
+        return pathMappings.toClient(path);
+    }
+
+    boolean hasPathMappings() {
+        return pathMappings.hasMappings();
+    }
+
+    boolean isRuntimePathMapped(String path) {
+        return pathMappings.isMapped(path);
+    }
+
     public void setLinesStartAt1(Boolean value) {
         if (value != null && !value) {
             linesStartAt1 = false;
@@ -173,12 +216,53 @@ public final class ExecutionContext {
     }
 
     public void dispose() {
-        if (srcBinding != null && !srcBinding.isDisposed()) {
-            srcBinding.dispose();
+        client = null; // Do not call the client after dispose.
+        disposeBinding(srcBinding);
+        disposeBinding(thrBinding);
+        if (threadsHandler != null) {
+            threadsHandler.dispose();
         }
-        if (thrBinding != null && !thrBinding.isDisposed()) {
-            thrBinding.dispose();
+        disposeBinding(contextsBinding);
+        doRunIfWaitingForDebugger();
+    }
+
+    private static void disposeBinding(EventBinding<?> binding) {
+        if (binding != null && !binding.isDisposed()) {
+            binding.dispose();
         }
     }
 
+    private final class ContextTracker implements ContextsListener {
+
+        @Override
+        public void onContextCreated(TruffleContext context) {
+            synchronized (contexts) {
+                contexts.add(context);
+            }
+            loadedSourcesHandler.notifyNewTruffleContext(context);
+        }
+
+        @Override
+        public void onContextClosed(TruffleContext context) {
+            synchronized (contexts) {
+                contexts.remove(context);
+            }
+        }
+
+        @Override
+        public void onLanguageContextCreated(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextInitialized(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextFinalized(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextDisposed(TruffleContext context, LanguageInfo language) {
+        }
+    }
 }

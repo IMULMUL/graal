@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,21 +24,19 @@
  */
 package com.oracle.graal.pointsto.infrastructure;
 
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.nodes.StructuredGraph;
-
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 
-import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.nodes.StructuredGraph;
 
 public interface GraphProvider {
     enum Purpose {
         ANALYSIS,
-        AOT_COMPILATION,
         PREPARE_RUNTIME_COMPILATION,
     }
 
-    StructuredGraph buildGraph(DebugContext debug, ResolvedJavaMethod method, HostedProviders providers, Purpose purpose);
+    StructuredGraph buildGraph(DebugContext debug, AnalysisMethod method, HostedProviders providers, Purpose purpose);
 
     /**
      * Returns true if a graph can be provided for {@link Purpose#PREPARE_RUNTIME_COMPILATION}. Note
@@ -46,4 +44,13 @@ public interface GraphProvider {
      * points and deoptimization frame states.
      */
     boolean allowRuntimeCompilation();
+
+    /**
+     * @return true if a graph allows constant folding based on type flow analysis results.
+     * 
+     * @see com.oracle.graal.pointsto.results.StrengthenGraphs.Options#StrengthenGraphWithConstants
+     */
+    default boolean allowStrengthenGraphWithConstants() {
+        return true;
+    }
 }

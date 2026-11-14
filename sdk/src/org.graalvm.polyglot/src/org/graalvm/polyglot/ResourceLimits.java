@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,8 @@ package org.graalvm.polyglot;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
+import org.graalvm.polyglot.Engine.ToStringSupport;
+
 /**
  * Represents resource limits configuration that is used to configure contexts. Resource limit
  * instances are created using the {@link #newBuilder() builder} and activated by
@@ -85,10 +87,10 @@ public final class ResourceLimits {
 
     private static final ResourceLimits EMPTY = new ResourceLimits(null);
 
-    final Object impl;
+    final Object receiver;
 
-    ResourceLimits(Object impl) {
-        this.impl = impl;
+    ResourceLimits(Object receiver) {
+        this.receiver = receiver;
     }
 
     /**
@@ -101,6 +103,16 @@ public final class ResourceLimits {
     }
 
     /**
+     * {@inheritDoc}
+     *
+     * @since 25.3
+     */
+    @Override
+    public String toString() {
+        return receiver.toString();
+    }
+
+    /**
      * A builder used to construct resource limits. Builder instances are not thread-safe and may
      * not be used from multiple threads at the same time.
      *
@@ -109,8 +121,8 @@ public final class ResourceLimits {
     public final class Builder {
 
         long statementLimit;
-        Predicate<Source> statementLimitSourceFilter;
-        Consumer<ResourceLimitEvent> onLimit;
+        Predicate<?> statementLimitSourceFilter;
+        Consumer<?> onLimit;
 
         Builder() {
         }
@@ -174,13 +186,31 @@ public final class ResourceLimits {
         }
 
         /**
+         * {@inheritDoc}
+         *
+         * @since 25.3
+         */
+        @Override
+        public String toString() {
+            StringBuilder b = new StringBuilder("ResourceLimits.newBuilder()");
+            if (statementLimit != 0 || statementLimitSourceFilter != null) {
+                ToStringSupport.appendCall(b, "statementLimit", statementLimit, statementLimitSourceFilter);
+            }
+            if (onLimit != null) {
+                ToStringSupport.appendCall(b, "onLimit", onLimit);
+            }
+            return b.toString();
+        }
+
+        /**
          * Builds the limit configuration object.
          *
          * @see ResourceLimits Example Usage
          * @since 19.3
          */
+        @SuppressWarnings("unchecked")
         public ResourceLimits build() {
-            return new ResourceLimits(Engine.getImpl().buildLimits(statementLimit, statementLimitSourceFilter, onLimit));
+            return new ResourceLimits(Engine.getImpl().buildLimits(statementLimit, (Predicate<Object>) statementLimitSourceFilter, (Consumer<Object>) onLimit));
         }
     }
 }

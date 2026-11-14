@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,8 +29,6 @@
  */
 package com.oracle.truffle.llvm.parser.listeners;
 
-import java.math.BigInteger;
-
 import com.oracle.truffle.llvm.parser.model.IRScope;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.BinaryOperationConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.BlockAddressConstant;
@@ -41,6 +39,7 @@ import com.oracle.truffle.llvm.parser.model.symbols.constants.InlineAsmConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.NullConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.SelectConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.StringConstant;
+import com.oracle.truffle.llvm.parser.model.symbols.constants.UnaryOperationConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.UndefinedConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.aggregate.AggregateConstant;
 import com.oracle.truffle.llvm.parser.model.symbols.constants.floatingpoint.FloatingPointConstant;
@@ -51,8 +50,11 @@ import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
 import com.oracle.truffle.llvm.runtime.types.ArrayType;
 import com.oracle.truffle.llvm.runtime.types.Type;
 
+import java.math.BigInteger;
+
 public final class Constants implements ParserListener {
 
+    // see llvm/include/llvm/Bitcode/LLVMBitCodes.h, enum ConstantCodes
     private static final int CONSTANT_SETTYPE = 1;
     private static final int CONSTANT_NULL = 2;
     private static final int CONSTANT_UNDEF = 3;
@@ -64,7 +66,7 @@ public final class Constants implements ParserListener {
     private static final int CONSTANT_CSTRING = 9;
     private static final int CONSTANT_CE_BINOP = 10;
     private static final int CONSTANT_CE_CAST = 11;
-    private static final int CONSTANT_CE_GEP = 12;
+    private static final int CONSTANT_CE_GEP_OLD = 12;
     private static final int CONSTANT_CE_SELECT = 13;
     // private static final int CONSTANT_CE_EXTRACTELT = 14;
     // private static final int CONSTANT_CE_INSERTELT = 15;
@@ -75,8 +77,17 @@ public final class Constants implements ParserListener {
     private static final int CONSTANT_CE_INBOUNDS_GEP = 20;
     private static final int CONSTANT_BLOCKADDRESS = 21;
     private static final int CONSTANT_DATA = 22;
-    private static final int CONSTANT_INLINEASM = 23;
-    private static final int CONSTANT_CE_GEP_WITH_INRANGE_INDEX = 24;
+    private static final int CONSTANT_INLINEASM_OLD2 = 23;
+    private static final int CONSTANT_CE_GEP_WITH_INRANGE_INDEX_OLD = 24;
+    private static final int CONSTANT_CE_UNOP = 25;
+    private static final int CONSTANT_POISON = 26;
+    // private static final int CONSTANT_DSO_LOCAL_EQUIVALENT = 27;
+    // private static final int CONSTANT_INLINEASM_OLD3 = 28;
+    // private static final int CONSTANT_NO_CFI_VALUE = 29;
+    private static final int CONSTANT_INLINEASM = 30;
+    private static final int CONSTANT_CE_GEP_WITH_INRANGE = 31;
+    private static final int CONSTANT_CE_GEP = 32;
+    // private static final int CONSTANT_PTRAUTH = 30;
 
     private static final BigInteger WIDE_INTEGER_MASK = BigInteger.ONE.shiftLeft(Long.SIZE).subtract(BigInteger.ONE);
 
@@ -109,6 +120,7 @@ public final class Constants implements ParserListener {
                 return;
 
             case CONSTANT_UNDEF:
+            case CONSTANT_POISON:
                 scope.addSymbol(new UndefinedConstant(type), type);
                 return;
 
@@ -144,6 +156,13 @@ public final class Constants implements ParserListener {
             case CONSTANT_CSTRING:
                 scope.addSymbol(new StringConstant((ArrayType) type, buffer.readStringAsBytes(true)), type);
                 return;
+
+            case CONSTANT_CE_UNOP: {
+                int op = buffer.readInt();
+                int v = buffer.readInt();
+                scope.addSymbol(UnaryOperationConstant.fromSymbols(scope.getSymbols(), type, op, v), type);
+                return;
+            }
 
             case CONSTANT_CE_BINOP: {
                 int op = buffer.readInt();
@@ -183,13 +202,19 @@ public final class Constants implements ParserListener {
                 scope.addSymbol(AggregateConstant.createFromData(type, buffer), type);
                 return;
 
+            case CONSTANT_INLINEASM_OLD2:
+                scope.addSymbol(InlineAsmConstant.createFromData(type, null, buffer), type);
+                return;
             case CONSTANT_INLINEASM:
-                scope.addSymbol(InlineAsmConstant.createFromData(type, buffer), type);
+                final Type fnType = types.get(buffer.read());
+                scope.addSymbol(InlineAsmConstant.createFromData(type, fnType, buffer), type);
                 return;
 
-            case CONSTANT_CE_GEP:
+            case CONSTANT_CE_GEP_OLD:
             case CONSTANT_CE_INBOUNDS_GEP:
-            case CONSTANT_CE_GEP_WITH_INRANGE_INDEX:
+            case CONSTANT_CE_GEP_WITH_INRANGE_INDEX_OLD:
+            case CONSTANT_CE_GEP_WITH_INRANGE:
+            case CONSTANT_CE_GEP:
                 createGetElementPointerExpression(buffer);
                 return;
 
@@ -208,12 +233,26 @@ public final class Constants implements ParserListener {
 
     private void createGetElementPointerExpression(RecordBuffer buffer) {
         int opCode = buffer.getId();
-        if (opCode == CONSTANT_CE_GEP_WITH_INRANGE_INDEX || buffer.size() % 2 != 0) {
-            buffer.skip(); // type of pointee
+        Type gepType = null;
+        if (opCode == CONSTANT_CE_GEP_WITH_INRANGE_INDEX_OLD ||
+                        opCode == CONSTANT_CE_GEP_WITH_INRANGE ||
+                        opCode == CONSTANT_CE_GEP || buffer.size() % 2 != 0) {
+            gepType = types.get(buffer.read());
         }
 
         boolean isInbounds;
-        if (opCode == CONSTANT_CE_GEP_WITH_INRANGE_INDEX) {
+        // structure of this if on purpose kept very similar to the code in LLVMs BitcodeReader.cpp
+        if (opCode == CONSTANT_CE_GEP_WITH_INRANGE_INDEX_OLD) {
+            long op = buffer.read();
+            isInbounds = (op & 0x1) != 0;
+        } else if (opCode == CONSTANT_CE_GEP_WITH_INRANGE) {
+            long op = buffer.read();
+            // ignore nuw and nusw flags
+            isInbounds = (op & 0x1) != 0;
+            // ignore the range
+            long bitWidth = buffer.read();
+            buffer.skipConstantRange(bitWidth);
+        } else if (opCode == CONSTANT_CE_GEP) {
             long op = buffer.read();
             isInbounds = (op & 0x1) != 0;
         } else {
@@ -229,6 +268,6 @@ public final class Constants implements ParserListener {
             indices[j] = buffer.readInt();
         }
 
-        scope.addSymbol(GetElementPointerConstant.fromSymbols(scope.getSymbols(), type, pointer, indices, isInbounds), type);
+        scope.addSymbol(GetElementPointerConstant.fromSymbols(scope.getSymbols(), type, gepType, pointer, indices, isInbounds), type);
     }
 }

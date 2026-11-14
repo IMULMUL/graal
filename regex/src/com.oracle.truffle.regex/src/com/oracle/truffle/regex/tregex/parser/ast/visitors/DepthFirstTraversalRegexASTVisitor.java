@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.regex.tregex.parser.ast.visitors;
 
+import com.oracle.truffle.regex.tregex.parser.ast.AtomicGroup;
 import com.oracle.truffle.regex.tregex.parser.ast.BackReference;
 import com.oracle.truffle.regex.tregex.parser.ast.CharacterClass;
 import com.oracle.truffle.regex.tregex.parser.ast.Group;
@@ -48,6 +49,7 @@ import com.oracle.truffle.regex.tregex.parser.ast.LookBehindAssertion;
 import com.oracle.truffle.regex.tregex.parser.ast.PositionAssertion;
 import com.oracle.truffle.regex.tregex.parser.ast.RegexASTNode;
 import com.oracle.truffle.regex.tregex.parser.ast.Sequence;
+import com.oracle.truffle.regex.tregex.parser.ast.SubexpressionCall;
 
 /**
  * AST visitor base class that will visit a given subtree in depth-first order. Whenever all
@@ -107,6 +109,10 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
         return reverse;
     }
 
+    protected void done() {
+        done = true;
+    }
+
     private void run(RegexASTNode runRoot, boolean runReverse) {
         reverse = runReverse;
         root = runRoot;
@@ -114,6 +120,9 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
         done = false;
         init(runRoot);
         while (!done) {
+            if (cur instanceof RegexASTVisitorIterable) {
+                ((RegexASTVisitorIterable) cur).resetVisitorIterator();
+            }
             doVisit(cur);
             while (doAdvance()) {
                 // advance until we reach the next node to visit
@@ -126,7 +135,7 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
     }
 
     private boolean doAdvance() {
-        if (cur == null || cur == root.getParent()) {
+        if (cur == null || cur == root.getParent() || done) {
             done = true;
             return false;
         }
@@ -150,6 +159,10 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
     }
 
     @Override
+    protected void visit(SubexpressionCall subexpressionCall) {
+    }
+
+    @Override
     protected void visit(PositionAssertion assertion) {
     }
 
@@ -159,6 +172,10 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
 
     @Override
     protected void visit(LookAheadAssertion assertion) {
+    }
+
+    @Override
+    protected void visit(AtomicGroup atomicGroup) {
     }
 
     @Override
@@ -181,12 +198,15 @@ public abstract class DepthFirstTraversalRegexASTVisitor extends RegexASTVisitor
     protected void leave(LookAheadAssertion assertion) {
     }
 
+    @Override
+    protected void leave(AtomicGroup atomicGroup) {
+    }
+
     private boolean advance(RegexASTVisitorIterable iterable) {
         if (iterable.visitorHasNext()) {
             cur = iterable.visitorGetNext(reverse);
             return false;
         }
-        iterable.resetVisitorIterator();
         doLeave(cur);
         cur = ((RegexASTNode) iterable).getParent();
         return true;

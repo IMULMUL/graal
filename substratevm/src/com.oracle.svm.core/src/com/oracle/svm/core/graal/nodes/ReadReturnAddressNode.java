@@ -24,16 +24,16 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
-import org.graalvm.compiler.nodes.spi.LIRLowerable;
-import org.graalvm.compiler.nodes.spi.NodeLIRBuilderTool;
-
 import com.oracle.svm.core.FrameAccess;
+import com.oracle.svm.core.SubstrateTarget;
 
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.spi.LIRLowerable;
+import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import jdk.vm.ci.meta.Value;
 
 @NodeInfo(cycles = NodeCycles.CYCLES_1, size = NodeSize.SIZE_1)
@@ -41,13 +41,13 @@ public final class ReadReturnAddressNode extends FixedWithNextNode implements LI
     public static final NodeClass<ReadReturnAddressNode> TYPE = NodeClass.create(ReadReturnAddressNode.class);
 
     public ReadReturnAddressNode() {
-        super(TYPE, FrameAccess.getWordStamp());
+        super(TYPE, SubstrateTarget.getWordStamp());
     }
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
         assert FrameAccess.returnAddressSize() > 0;
-        Value result = gen.getLIRGeneratorTool().emitReadReturnAddress(FrameAccess.getWordStamp(), FrameAccess.returnAddressSize());
+        Value result = gen.getLIRGeneratorTool().emitReadReturnAddress(SubstrateTarget.getWordStamp(), FrameAccess.returnAddressSize());
         gen.setResult(this, result);
     }
 }

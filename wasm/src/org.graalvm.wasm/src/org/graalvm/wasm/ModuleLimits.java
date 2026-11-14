@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,54 +40,85 @@
  */
 package org.graalvm.wasm;
 
-import org.graalvm.wasm.exception.Failure;
-
 import static org.graalvm.wasm.Assert.assertUnsignedIntLessOrEqual;
+import static org.graalvm.wasm.Assert.assertUnsignedLongLessOrEqual;
+import static org.graalvm.wasm.constants.Sizes.MAX_ARRAY_INSTANCE_SIZE;
+import static org.graalvm.wasm.constants.Sizes.MAX_MEMORY_64_INSTANCE_SIZE;
 import static org.graalvm.wasm.constants.Sizes.MAX_MEMORY_INSTANCE_SIZE;
 import static org.graalvm.wasm.constants.Sizes.MAX_TABLE_INSTANCE_SIZE;
+
+import org.graalvm.wasm.exception.Failure;
 
 /**
  * Limits on various aspects of a module.
  */
 public final class ModuleLimits {
+
+    private static final int SINGLE_MEMORY_COUNT_LIMIT = 1;
+    private static final int SINGLE_RESULT_COUNT_LIMIT = 1;
+
     private final int moduleSizeLimit;
     private final int typeCountLimit;
+    private final int subtypeDepthLimit;
     private final int functionCountLimit;
     private final int importCountLimit;
     private final int exportCountLimit;
     private final int globalCountLimit;
+    private final int tagCountLimit;
     private final int dataSegmentCountLimit;
     private final int elementSegmentCountLimit;
-    private final int functionSizeLimit;
+    private final int tableCountLimit;
+    private final int multiMemoryCountLimit;
     private final int paramCountLimit;
-    private final int returnCountLimit;
+    private final int multiValueResultCountLimit;
+    private final int functionSizeLimit;
     private final int localCountLimit;
+    private final int structFieldCountLimit;
+    private final int arrayNewFixedLengthLimit;
+    private final long arrayInstanceSizeLimit;
     private final int tableInstanceSizeLimit;
     private final int memoryInstanceSizeLimit;
+    private final long memory64InstanceSizeLimit;
 
-    public ModuleLimits(int moduleSizeLimit, int typeCountLimit, int functionCountLimit, int importCountLimit, int exportCountLimit, int globalCountLimit, int dataSegmentCountLimit,
-                    int elementSegmentCountLimit, int functionSizeLimit, int paramCountLimit, int returnCountLimit, int localCountLimit, int tableInstanceSizeLimit, int memoryInstanceSizeLimit) {
+    public ModuleLimits(int moduleSizeLimit, int typeCountLimit, int subtypeDepthLimit, int functionCountLimit, int importCountLimit, int exportCountLimit, int globalCountLimit, int tagCountLimit,
+                    int dataSegmentCountLimit, int elementSegmentCountLimit, int tableCountLimit, int memoryCountLimit,
+                    int paramCountLimit, int resultCountLimit, int functionSizeLimit, int localCountLimit,
+                    int structFieldCountLimit, int arrayNewFixedLengthLimit, long arrayInstanceSizeLimit, int tableInstanceSizeLimit, int memoryInstanceSizeLimit, long memory64InstanceSizeLimit) {
         this.moduleSizeLimit = minUnsigned(moduleSizeLimit, Integer.MAX_VALUE);
-        this.typeCountLimit = minUnsigned(typeCountLimit, Integer.MAX_VALUE);
+        this.typeCountLimit = minUnsigned(typeCountLimit, WasmType.MAX_TYPE_INDEX);
+        this.subtypeDepthLimit = minUnsigned(subtypeDepthLimit, Integer.MAX_VALUE);
         this.functionCountLimit = minUnsigned(functionCountLimit, Integer.MAX_VALUE);
         this.importCountLimit = minUnsigned(importCountLimit, Integer.MAX_VALUE);
         this.exportCountLimit = minUnsigned(exportCountLimit, Integer.MAX_VALUE);
         this.globalCountLimit = minUnsigned(globalCountLimit, Integer.MAX_VALUE);
+        this.tagCountLimit = minUnsigned(tagCountLimit, Integer.MAX_VALUE);
         this.dataSegmentCountLimit = minUnsigned(dataSegmentCountLimit, Integer.MAX_VALUE);
         this.elementSegmentCountLimit = minUnsigned(elementSegmentCountLimit, Integer.MAX_VALUE);
-        this.functionSizeLimit = minUnsigned(functionSizeLimit, Integer.MAX_VALUE);
+        this.tableCountLimit = minUnsigned(tableCountLimit, Integer.MAX_VALUE);
+        this.multiMemoryCountLimit = minUnsigned(memoryCountLimit, Integer.MAX_VALUE);
         this.paramCountLimit = minUnsigned(paramCountLimit, Integer.MAX_VALUE);
-        this.returnCountLimit = minUnsigned(returnCountLimit, Integer.MAX_VALUE);
+        this.multiValueResultCountLimit = minUnsigned(resultCountLimit, Integer.MAX_VALUE);
+        this.functionSizeLimit = minUnsigned(functionSizeLimit, Integer.MAX_VALUE);
         this.localCountLimit = minUnsigned(localCountLimit, Integer.MAX_VALUE);
+        this.structFieldCountLimit = minUnsigned(structFieldCountLimit, Integer.MAX_VALUE);
+        this.arrayNewFixedLengthLimit = minUnsigned(arrayNewFixedLengthLimit, Integer.MAX_VALUE);
+        this.arrayInstanceSizeLimit = minUnsigned(arrayInstanceSizeLimit, MAX_ARRAY_INSTANCE_SIZE);
         this.tableInstanceSizeLimit = minUnsigned(tableInstanceSizeLimit, MAX_TABLE_INSTANCE_SIZE);
         this.memoryInstanceSizeLimit = minUnsigned(memoryInstanceSizeLimit, MAX_MEMORY_INSTANCE_SIZE);
+        this.memory64InstanceSizeLimit = minUnsigned(memory64InstanceSizeLimit, MAX_MEMORY_64_INSTANCE_SIZE);
     }
 
     private static int minUnsigned(int a, int b) {
         return Integer.compareUnsigned(a, b) < 0 ? a : b;
     }
 
-    static ModuleLimits DEFAULTS = new ModuleLimits(
+    private static long minUnsigned(long a, long b) {
+        return Long.compareUnsigned(a, b) < 0 ? a : b;
+    }
+
+    static final ModuleLimits DEFAULTS = new ModuleLimits(
+                    Integer.MAX_VALUE,
+                    WasmType.MAX_TYPE_INDEX,
                     Integer.MAX_VALUE,
                     Integer.MAX_VALUE,
                     Integer.MAX_VALUE,
@@ -100,8 +131,14 @@ public final class ModuleLimits {
                     Integer.MAX_VALUE,
                     Integer.MAX_VALUE,
                     Integer.MAX_VALUE,
+                    Integer.MAX_VALUE,
+                    Integer.MAX_VALUE,
+                    Integer.MAX_VALUE,
+                    Integer.MAX_VALUE,
+                    MAX_ARRAY_INSTANCE_SIZE,
                     MAX_TABLE_INSTANCE_SIZE,
-                    MAX_MEMORY_INSTANCE_SIZE);
+                    MAX_MEMORY_INSTANCE_SIZE,
+                    MAX_MEMORY_64_INSTANCE_SIZE);
 
     public void checkModuleSize(int size) {
         assertUnsignedIntLessOrEqual(size, moduleSizeLimit, Failure.MODULE_SIZE_LIMIT_EXCEEDED);
@@ -109,6 +146,10 @@ public final class ModuleLimits {
 
     public void checkTypeCount(int count) {
         assertUnsignedIntLessOrEqual(count, typeCountLimit, Failure.TYPE_COUNT_LIMIT_EXCEEDED);
+    }
+
+    public void checkSubtypeDepth(int depth) {
+        assertUnsignedIntLessOrEqual(depth, subtypeDepthLimit, Failure.SUB_TYPE_DEPTH_LIMIT_EXCEEDED);
     }
 
     public void checkFunctionCount(int count) {
@@ -127,6 +168,10 @@ public final class ModuleLimits {
         assertUnsignedIntLessOrEqual(count, globalCountLimit, Failure.GLOBAL_COUNT_LIMIT_EXCEEDED);
     }
 
+    public void checkTagCount(int count) {
+        assertUnsignedIntLessOrEqual(count, tagCountLimit, Failure.TAG_COUNT_LIMIT_EXCEEDED);
+    }
+
     public void checkDataSegmentCount(int count) {
         assertUnsignedIntLessOrEqual(count, dataSegmentCountLimit, Failure.DATA_SEGMENT_COUNT_LIMIT_EXCEEDED);
     }
@@ -135,27 +180,78 @@ public final class ModuleLimits {
         assertUnsignedIntLessOrEqual(count, elementSegmentCountLimit, Failure.ELEMENT_SEGMENT_COUNT_LIMIT_EXCEEDED);
     }
 
-    public void checkFunctionSize(int size) {
-        assertUnsignedIntLessOrEqual(size, functionSizeLimit, Failure.FUNCTION_SIZE_LIMIT_EXCEEDED);
+    public void checkTableCount(int count) {
+        assertUnsignedIntLessOrEqual(count, tableCountLimit, Failure.TABLE_COUNT_LIMIT_EXCEEDED);
+    }
+
+    public void checkMemoryCount(int count, boolean multiMemory) {
+        if (!multiMemory) {
+            assertUnsignedIntLessOrEqual(count, SINGLE_MEMORY_COUNT_LIMIT, Failure.MULTIPLE_MEMORIES);
+        }
+        assertUnsignedIntLessOrEqual(count, multiMemoryCountLimit, Failure.MEMORY_COUNT_LIMIT_EXCEEDED);
     }
 
     public void checkParamCount(int count) {
         assertUnsignedIntLessOrEqual(count, paramCountLimit, Failure.PARAMETERS_COUNT_LIMIT_EXCEEDED);
     }
 
-    public void checkReturnCount(int count) {
-        assertUnsignedIntLessOrEqual(count, returnCountLimit, Failure.RETURN_COUNT_LIMIT_EXCEEDED);
+    public void checkResultCount(int count, boolean multiValue) {
+        if (!multiValue) {
+            assertUnsignedIntLessOrEqual(count, SINGLE_RESULT_COUNT_LIMIT, Failure.INVALID_RESULT_ARITY);
+        }
+        assertUnsignedIntLessOrEqual(count, multiValueResultCountLimit, Failure.RESULT_COUNT_LIMIT_EXCEEDED);
+    }
+
+    public void checkFunctionSize(int size) {
+        assertUnsignedIntLessOrEqual(size, functionSizeLimit, Failure.FUNCTION_SIZE_LIMIT_EXCEEDED);
     }
 
     public void checkLocalCount(int count) {
         assertUnsignedIntLessOrEqual(count, localCountLimit, Failure.TOO_MANY_LOCALS);
     }
 
+    public void checkStructFieldCount(int count) {
+        assertUnsignedIntLessOrEqual(count, structFieldCountLimit, Failure.TOO_MANY_STRUCT_FIELDS);
+    }
+
+    public void checkArrayNewFixedLength(int length) {
+        assertUnsignedIntLessOrEqual(length, arrayNewFixedLengthLimit, Failure.ARRAY_NEW_FIXED_LIMIT_EXCEEDED);
+    }
+
+    public void checkArrayInstanceSize(int length, int elemType) {
+        assertUnsignedLongLessOrEqual(arrayInstanceByteLength(length, elemType), arrayInstanceSizeLimit, Failure.ARRAY_LENGTH_LIMIT_EXCEEDED);
+    }
+
+    public boolean exceedsArrayInstanceSizeLimit(int length, int elemType) {
+        return Long.compareUnsigned(arrayInstanceByteLength(length, elemType), arrayInstanceSizeLimit) > 0;
+    }
+
+    private static long arrayInstanceByteLength(int length, int elemType) {
+        int elemByteSize = WasmType.isReferenceType(elemType) ? Integer.BYTES : WasmType.storageByteSize(elemType);
+        return (long) length * elemByteSize;
+    }
+
+    public void checkTableInstanceSize(long size) {
+        assertUnsignedLongLessOrEqual(size, tableInstanceSizeLimit, Failure.TABLE_INSTANCE_SIZE_LIMIT_EXCEEDED);
+    }
+
+    public void checkMemoryInstanceSize(long size, boolean indexType64) {
+        if (indexType64) {
+            assertUnsignedLongLessOrEqual(size, memory64InstanceSizeLimit, Failure.MEMORY_INSTANCE_SIZE_LIMIT_EXCEEDED);
+        } else {
+            assertUnsignedLongLessOrEqual(size, memoryInstanceSizeLimit, Failure.MEMORY_INSTANCE_SIZE_LIMIT_EXCEEDED);
+        }
+    }
+
     public int tableInstanceSizeLimit() {
         return tableInstanceSizeLimit;
     }
 
-    public int memoryInstanceSizeLimit() {
-        return memoryInstanceSizeLimit;
+    public long memoryInstanceSizeLimit() {
+        return memoryInstanceSizeLimit(false);
+    }
+
+    public long memoryInstanceSizeLimit(boolean indexType64) {
+        return indexType64 ? memory64InstanceSizeLimit : memoryInstanceSizeLimit;
     }
 }

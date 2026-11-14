@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -75,32 +75,67 @@ public class DebugUtil {
         return ret.toString();
     }
 
-    @TruffleBoundary
-    public static StringBuilder appendNodeId(StringBuilder sb, int id) {
-        return sb.append(nodeID(id));
+    public static String regexSourceEscape(String pattern, String flags) {
+        StringBuilder sb = new StringBuilder(pattern.length() + 2);
+        sb.append('/');
+        javaStringEscape(sb, pattern);
+        return sb.append('/').append(flags).toString();
+    }
+
+    public static String javaStringEscape(String string) {
+        return javaStringEscape(new StringBuilder(string.length()), string).toString();
+    }
+
+    public static String pruneToSize(String s, int maxLength) {
+        return s.length() > maxLength ? s.substring(0, maxLength) + "..." : s;
+    }
+
+    private static StringBuilder javaStringEscape(StringBuilder sb, String string) {
+        for (int i = 0; i < string.length(); i++) {
+            int c = string.charAt(i);
+            if (0x20 <= c && c <= 0x7e) {
+                sb.appendCodePoint(c);
+            } else {
+                sb.append("\\u").append(String.format("%04x", c));
+            }
+        }
+        return sb;
     }
 
     @TruffleBoundary
-    public static String nodeID(int id) {
-        return String.format("%04x", id);
+    public static StringBuilder appendNodeId(StringBuilder sb, int id) {
+        return sb.append(id);
     }
 
     private static final Pattern specialChars = Pattern.compile("[\"\\\\\u0000-\u001F\u007F-\u009F]");
 
     @TruffleBoundary
     public static String jsStringEscape(String str) {
-        StringBuffer escapedString = new StringBuffer();
+        StringBuilder escapedString = new StringBuilder();
         Matcher m = specialChars.matcher(str);
         while (m.find()) {
             String replacement;
             char c = str.charAt(m.start());
-            if (c == '"') {
-                replacement = "\\\\\"";
-            } else if (c == '\\') {
-                replacement = "\\\\\\\\";
-            } else {
-                assert Character.isISOControl(c);
-                replacement = String.format("\\\\u%04x", (int) c);
+            switch (c) {
+                case '"':
+                    replacement = "\\\\\"";
+                    break;
+                case '\\':
+                    replacement = "\\\\\\\\";
+                    break;
+                case '\r':
+                    replacement = "\\\\r";
+                    break;
+                case '\n':
+                    replacement = "\\\\n";
+                    break;
+                case '\t':
+                    replacement = "\\\\t";
+                    break;
+                default:
+                    assert Character.isISOControl(c);
+                    replacement = String.format("\\\\u%04x", (int) c);
+                    break;
             }
             m.appendReplacement(escapedString, replacement);
         }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,8 @@
  */
 package com.oracle.svm.core.amd64;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.CContext;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunction.Transition;
@@ -31,13 +33,41 @@ import org.graalvm.nativeimage.c.function.CLibrary;
 import org.graalvm.nativeimage.c.struct.AllowNarrowingCast;
 import org.graalvm.nativeimage.c.struct.CField;
 import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.PointerBase;
 
+import com.oracle.svm.shared.util.BasedOnJDKFile;
+
+/*
+ * To be kept in sync with:
+ *  - substratevm/src/com.oracle.svm.native.libchelper/include/amd64hotspotcpuinfo.h
+ *  - substratevm/src/com.oracle.svm.native.libchelper/src/cpuid.c
+ */
+@BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-25.0.2+2/src/hotspot/cpu/x86/vm_version_x86.hpp#L41-L356")
 @CLibrary(value = "libchelper", requireStatic = true)
 public class AMD64LibCHelper {
+    @Platforms(Platform.AMD64.class)
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native void determineCPUFeatures(CPUFeatures features);
 
+    /**
+     * Returns {@code 1} if the runtime CPU supports the AVX-512 SIMD sort implementation and
+     * {@code 0} otherwise. In particular, AVX-512 SIMD sort is disabled on AMD Zen 4 processors
+     * because it has a severe performance penalty there.
+     */
+    @Platforms(Platform.AMD64.class)
+    @CFunction(transition = Transition.NO_TRANSITION)
+    public static native int supportsAvx512SimdSort();
+
+    @Platforms(Platform.AMD64.class)
+    @CFunction(transition = Transition.NO_TRANSITION)
+    public static native int checkCPUFeatures(CCharPointer buildtimeCPUFeatureMask);
+
+    @Platforms(Platform.AMD64.class)
+    @CFunction(transition = Transition.NO_TRANSITION)
+    public static native int checkCPUFeaturesOrExit(CCharPointer buildtimeCPUFeatureMask, CCharPointer errorMessage);
+
+    // Checkstyle: stop
     @CStruct
     @CContext(AMD64LibCHelperDirectives.class)
     public interface CPUFeatures extends PointerBase {
@@ -64,7 +94,7 @@ public class AMD64LibCHelper {
 
         @AllowNarrowingCast
         @CField
-        boolean fAMD3DNOWPREFETCH();
+        boolean fAMD_3DNOW_PREFETCH();
 
         @AllowNarrowingCast
         @CField
@@ -88,11 +118,11 @@ public class AMD64LibCHelper {
 
         @AllowNarrowingCast
         @CField()
-        boolean fSSE41();
+        boolean fSSE4_1();
 
         @AllowNarrowingCast
         @CField
-        boolean fSSE42();
+        boolean fSSE4_2();
 
         @AllowNarrowingCast
         @CField
@@ -109,6 +139,10 @@ public class AMD64LibCHelper {
         @AllowNarrowingCast
         @CField
         boolean fTSCINV();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fTSCINV_BIT();
 
         @AllowNarrowingCast
         @CField
@@ -181,6 +215,122 @@ public class AMD64LibCHelper {
         @AllowNarrowingCast
         @CField
         boolean fFMA();
-    }
 
+        @AllowNarrowingCast
+        @CField
+        boolean fVZEROUPPER();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VPOPCNTDQ();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VPCLMULQDQ();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VAES();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VNNI();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fFLUSH();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fFLUSHOPT();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fCLWB();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VBMI2();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_VBMI();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fHV();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fSERIALIZE();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fRDTSCP();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fRDPID();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fFSRM();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fGFNI();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_BITALG();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fPKU();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fOSPKE();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fCET_IBT();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fCET_SS();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fF16C();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_IFMA();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX_IFMA();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAPX_F();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fSHA512();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX512_FP16();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX10_1();
+
+        @AllowNarrowingCast
+        @CField
+        boolean fAVX10_2();
+    }
+    // Checkstyle: resume
 }

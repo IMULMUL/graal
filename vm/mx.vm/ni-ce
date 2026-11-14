@@ -1,4 +1,2 @@
 DYNAMIC_IMPORTS=/substratevm
-DISABLE_INSTALLABLES=true
-EXCLUDE_COMPONENTS=pbm
-NATIVE_IMAGES=native-image,lib:native-image-agent
+NATIVE_IMAGES=native-image,lib:native-image-agent,lib:native-image-diagnostics-agent

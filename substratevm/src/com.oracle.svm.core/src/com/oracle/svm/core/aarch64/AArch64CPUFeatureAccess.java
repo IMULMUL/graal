@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,117 +26,72 @@ package com.oracle.svm.core.aarch64;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.List;
 
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.struct.SizeOf;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.CPUFeatureAccess;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.CPUFeatureAccessImpl;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.nodes.spi.LoweringProvider;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.code.Architecture;
 
-@AutomaticFeature
-@Platforms(Platform.AARCH64.class)
-class AArch64CPUFeatureAccessFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(CPUFeatureAccess.class, new AArch64CPUFeatureAccess());
-    }
-}
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = CPUFeatureAccessImpl.LayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
+public class AArch64CPUFeatureAccess extends CPUFeatureAccessImpl {
 
-public class AArch64CPUFeatureAccess implements CPUFeatureAccess {
-
-    /**
-     * We include all flags which currently impact AArch64 performance.
-     */
     @Platforms(Platform.HOSTED_ONLY.class)
-    public static EnumSet<AArch64.Flag> enabledAArch64Flags() {
-        return EnumSet.of(AArch64.Flag.UseLSE);
+    public AArch64CPUFeatureAccess(EnumSet<?> buildtimeCPUFeatures, int[] offsets, byte[] errorMessageBytes, byte[] buildtimeFeatureMaskBytes) {
+        super(buildtimeCPUFeatures, offsets, errorMessageBytes, buildtimeFeatureMaskBytes);
     }
 
-    /**
-     * Determines whether a given JVMCI AArch64.CPUFeature is present on the current hardware.
-     * Because the CPUFeatures available vary across different JDK versions, the features are
-     * queried via their name, as opposed to the actual enum.
-     */
-    private static boolean isFeaturePresent(String featureName, AArch64LibCHelper.CPUFeatures cpuFeatures) {
-        switch (featureName) {
-            case "FP":
-                return cpuFeatures.fFP();
-            case "ASIMD":
-                return cpuFeatures.fASIMD();
-            case "EVTSTRM":
-                return cpuFeatures.fEVTSTRM();
-            case "AES":
-                return cpuFeatures.fAES();
-            case "PMULL":
-                return cpuFeatures.fPMULL();
-            case "SHA1":
-                return cpuFeatures.fSHA1();
-            case "SHA2":
-                return cpuFeatures.fSHA2();
-            case "CRC32":
-                return cpuFeatures.fCRC32();
-            case "LSE":
-                return cpuFeatures.fLSE();
-            case "STXR_PREFETCH":
-                return cpuFeatures.fSTXRPREFETCH();
-            case "A53MAC":
-                return cpuFeatures.fA53MAC();
-            case "DMB_ATOMICS":
-                return cpuFeatures.fDMBATOMICS();
-            default:
-                throw VMError.shouldNotReachHere("Missing feature check: " + featureName);
-        }
-    }
-
+    @Override
     @Platforms(Platform.AARCH64.class)
-    public static EnumSet<AArch64.CPUFeature> determineHostCPUFeatures() {
+    public EnumSet<AArch64.CPUFeature> determineHostCPUFeatures() {
         EnumSet<AArch64.CPUFeature> features = EnumSet.noneOf(AArch64.CPUFeature.class);
 
-        AArch64LibCHelper.CPUFeatures cpuFeatures = StackValue.get(AArch64LibCHelper.CPUFeatures.class);
+        AArch64LibCHelper.CPUFeatures cpuFeatures = UnsafeStackValue.get(AArch64LibCHelper.CPUFeatures.class);
 
         UnmanagedMemoryUtil.fill((Pointer) cpuFeatures, SizeOf.unsigned(AArch64LibCHelper.CPUFeatures.class), (byte) 0);
 
         AArch64LibCHelper.determineCPUFeatures(cpuFeatures);
 
+        ArrayList<String> unknownFeatures = new ArrayList<>();
         for (AArch64.CPUFeature feature : AArch64.CPUFeature.values()) {
-            if (isFeaturePresent(feature.name(), cpuFeatures)) {
+            if (isFeaturePresent(feature, (Pointer) cpuFeatures, unknownFeatures)) {
                 features.add(feature);
             }
+        }
+        if (!unknownFeatures.isEmpty()) {
+            throw VMError.shouldNotReachHere("Native image does not support the following JVMCI CPU features: " + unknownFeatures);
         }
 
         return features;
     }
 
+    @Uninterruptible(reason = "Thread state not set up yet.")
     @Override
-    public void verifyHostSupportsArchitecture(Architecture imageArchitecture) {
-        AArch64 architecture = (AArch64) imageArchitecture;
-        EnumSet<AArch64.CPUFeature> features = determineHostCPUFeatures();
+    public int verifyHostSupportsArchitectureEarly() {
+        return AArch64LibCHelper.checkCPUFeatures(BUILDTIME_CPU_FEATURE_MASK.get());
+    }
 
-        if (!features.containsAll(architecture.getFeatures())) {
-            List<AArch64.CPUFeature> missingFeatures = new ArrayList<>();
-            for (AArch64.CPUFeature feature : architecture.getFeatures()) {
-                if (!features.contains(feature)) {
-                    missingFeatures.add(feature);
-                }
-            }
-            throw VMError.shouldNotReachHere("Current target does not support the following CPU features that are required by the image: " + missingFeatures);
-        }
-
+    @Uninterruptible(reason = "Thread state not set up yet.")
+    @Override
+    public void verifyHostSupportsArchitectureEarlyOrExit() {
+        AArch64LibCHelper.checkCPUFeaturesOrExit(BUILDTIME_CPU_FEATURE_MASK.get(), IMAGE_CPU_FEATURE_ERROR_MSG.get());
     }
 
     @Override
-    public void enableFeatures(Architecture runtimeArchitecture) {
+    public void enableFeatures(Architecture runtimeArchitecture, LoweringProvider runtimeLowerer) {
         AArch64 architecture = (AArch64) runtimeArchitecture;
         EnumSet<AArch64.CPUFeature> features = determineHostCPUFeatures();
         architecture.getFeatures().addAll(features);

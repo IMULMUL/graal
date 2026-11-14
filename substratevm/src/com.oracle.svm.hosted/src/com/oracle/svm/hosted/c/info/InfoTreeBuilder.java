@@ -24,6 +24,12 @@
  */
 package com.oracle.svm.hosted.c.info;
 
+import com.oracle.svm.hosted.RawPointerToGuestValue;
+import com.oracle.svm.hosted.CTypedefGuestValue;
+import com.oracle.svm.hosted.CStructGuestValue;
+import com.oracle.svm.hosted.CPointerToGuestValue;
+import com.oracle.svm.hosted.CEnumGuestValue;
+import com.oracle.svm.hosted.CEnumConstantGuestValue;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
@@ -32,11 +38,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
-import org.graalvm.compiler.bytecode.BridgeMethodUtils;
-import org.graalvm.compiler.phases.util.Providers;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.constant.CEnum;
-import org.graalvm.nativeimage.c.constant.CEnumConstant;
 import org.graalvm.nativeimage.c.constant.CEnumLookup;
 import org.graalvm.nativeimage.c.constant.CEnumValue;
 import org.graalvm.nativeimage.c.struct.CBitfield;
@@ -56,20 +59,25 @@ import org.graalvm.word.PointerBase;
 import com.oracle.graal.pointsto.infrastructure.WrappedElement;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaType;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.c.CTypedef;
-import com.oracle.svm.core.c.struct.PinnedObjectField;
+import com.oracle.svm.guest.staging.core.c.struct.PinnedObjectField;
 import com.oracle.svm.hosted.c.BuiltinDirectives;
-import com.oracle.svm.hosted.c.GraalAccess;
 import com.oracle.svm.hosted.c.NativeCodeContext;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.c.info.AccessorInfo.AccessorKind;
 import com.oracle.svm.hosted.c.info.SizableInfo.ElementKind;
 import com.oracle.svm.hosted.cenum.CEnumCallWrapperMethod;
+import com.oracle.svm.hosted.substitute.AnnotationSubstitutionProcessor;
+import com.oracle.svm.shared.util.ClassUtil;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
+import jdk.graal.compiler.bytecode.BridgeMethodUtils;
+import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.JavaType;
-import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -88,7 +96,7 @@ public class InfoTreeBuilder {
 
         String name;
         if (codeCtx.getDirectives() != null) {
-            name = codeCtx.getDirectives().getClass().getSimpleName();
+            name = ClassUtil.getUnqualifiedName(codeCtx.getDirectives().getClass());
         } else {
             StringBuilder nameBuilder = new StringBuilder();
             String sep = "";
@@ -99,7 +107,7 @@ public class InfoTreeBuilder {
             name = nameBuilder.toString();
         }
         this.nativeCodeInfo = new NativeCodeInfo(name, codeCtx.getDirectives(), isBuiltin);
-        originalProviders = GraalAccess.getOriginalProviders();
+        originalProviders = GuestAccess.get().getProviders();
     }
 
     public NativeCodeInfo construct() {
@@ -124,10 +132,6 @@ public class InfoTreeBuilder {
         return nativeCodeInfo;
     }
 
-    private MetaAccessProvider getMetaAccess() {
-        return nativeLibs.getMetaAccess();
-    }
-
     protected void createConstantInfo(ResolvedJavaMethod method) {
         int actualParamCount = getParameterCount(method);
         if (actualParamCount != 0) {
@@ -137,7 +141,7 @@ public class InfoTreeBuilder {
         ResolvedJavaType returnType = AccessorInfo.getReturnType(method);
         if (returnType.getJavaKind() == JavaKind.Void ||
                         (returnType.getJavaKind() == JavaKind.Object && !nativeLibs.isString(returnType) && !nativeLibs.isByteArray(returnType) && !nativeLibs.isWordBase(returnType))) {
-            nativeLibs.addError("Wrong return type: expected a primitive type, String, or a Word type; found " + returnType.toJavaName(true), method);
+            nativeLibs.addError("Wrong return type: expected a primitive type, String, byte[], or a Word type; found " + returnType.toJavaName(true), method);
             return;
         }
 
@@ -154,7 +158,7 @@ public class InfoTreeBuilder {
         }
         List<AccessorInfo> accessorInfos = new ArrayList<>();
 
-        for (ResolvedJavaMethod method : type.getDeclaredMethods()) {
+        for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
             AccessorKind accessorKind = returnsDeclaringClass(method) ? AccessorKind.ADDRESS : getAccessorKind(method);
             boolean isIndexed = getParameterCount(method) > (accessorKind == AccessorKind.SETTER ? 1 : 0);
             AccessorInfo accessorInfo = new AccessorInfo(method, accessorKind, isIndexed, false, false);
@@ -178,7 +182,7 @@ public class InfoTreeBuilder {
         }
         List<AccessorInfo> accessorInfos = new ArrayList<>();
 
-        for (ResolvedJavaMethod method : type.getDeclaredMethods()) {
+        for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
             AccessorKind accessorKind = returnsDeclaringClass(method) ? AccessorKind.ADDRESS : getAccessorKind(method);
             boolean isIndexed = getParameterCount(method) > (accessorKind == AccessorKind.SETTER ? 1 : 0);
             AccessorInfo accessorInfo = new AccessorInfo(method, accessorKind, isIndexed, false, false);
@@ -208,7 +212,7 @@ public class InfoTreeBuilder {
     }
 
     public static String getTypedefName(ResolvedJavaType type) {
-        CTypedef typedefAnnotation = type.getAnnotation(CTypedef.class);
+        CTypedefGuestValue typedefAnnotation = CTypedefGuestValue.get(type);
         return typedefAnnotation != null ? typedefAnnotation.name() : null;
     }
 
@@ -221,14 +225,18 @@ public class InfoTreeBuilder {
         Map<String, List<AccessorInfo>> bitfieldAccessorInfos = new TreeMap<>();
         List<AccessorInfo> structAccessorInfos = new ArrayList<>();
 
-        for (ResolvedJavaMethod method : type.getDeclaredMethods()) {
-            final AccessorInfo accessorInfo;
-            final String fieldName;
+        for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
+            if (!AnnotationSubstitutionProcessor.isIncluded(method, method.getDeclaringClass(), method)) {
+                continue;
+            }
 
             CField fieldAnnotation = getMethodAnnotation(method, CField.class);
             CFieldAddress fieldAddressAnnotation = getMethodAnnotation(method, CFieldAddress.class);
             CFieldOffset fieldOffsetAnnotation = getMethodAnnotation(method, CFieldOffset.class);
             CBitfield bitfieldAnnotation = getMethodAnnotation(method, CBitfield.class);
+
+            final AccessorInfo accessorInfo;
+            final String fieldName;
             if (fieldAnnotation != null) {
                 accessorInfo = new AccessorInfo(method, getAccessorKind(method), false, hasLocationIdentityParameter(method), hasUniqueLocationIdentity(method));
                 fieldName = getStructFieldName(accessorInfo, fieldAnnotation.value());
@@ -254,11 +262,7 @@ public class InfoTreeBuilder {
                     structAccessorInfos.add(accessorInfo);
                 } else {
                     Map<String, List<AccessorInfo>> map = bitfieldAnnotation != null ? bitfieldAccessorInfos : fieldAccessorInfos;
-                    List<AccessorInfo> accessorInfos = map.get(fieldName);
-                    if (accessorInfos == null) {
-                        accessorInfos = new ArrayList<>();
-                        map.put(fieldName, accessorInfos);
-                    }
+                    List<AccessorInfo> accessorInfos = map.computeIfAbsent(fieldName, _ -> new ArrayList<>());
                     accessorInfos.add(accessorInfo);
                 }
 
@@ -296,7 +300,7 @@ public class InfoTreeBuilder {
         Map<String, List<AccessorInfo>> fieldAccessorInfos = new TreeMap<>();
         List<AccessorInfo> structAccessorInfos = new ArrayList<>();
 
-        for (ResolvedJavaMethod method : type.getDeclaredMethods()) {
+        for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
             final AccessorInfo accessorInfo;
             final String fieldName;
 
@@ -324,12 +328,7 @@ public class InfoTreeBuilder {
                 if (fieldName == null) {
                     structAccessorInfos.add(accessorInfo);
                 } else {
-                    Map<String, List<AccessorInfo>> map = fieldAccessorInfos;
-                    List<AccessorInfo> accessorInfos = map.get(fieldName);
-                    if (accessorInfos == null) {
-                        accessorInfos = new ArrayList<>();
-                        map.put(fieldName, accessorInfos);
-                    }
+                    List<AccessorInfo> accessorInfos = fieldAccessorInfos.computeIfAbsent(fieldName, _ -> new ArrayList<>());
                     accessorInfos.add(accessorInfo);
                 }
 
@@ -344,10 +343,38 @@ public class InfoTreeBuilder {
             StructFieldInfo fieldInfo = new StructFieldInfo(entry.getKey(), elementKind(entry.getValue()));
             fieldInfo.adoptChildren(entry.getValue());
             structInfo.adoptChild(fieldInfo);
+            verifyRawStructFieldAccessors(fieldInfo);
         }
 
         nativeCodeInfo.adoptChild(structInfo);
         nativeLibs.registerElementInfo(type, structInfo);
+    }
+
+    private void verifyRawStructFieldAccessors(StructFieldInfo fieldInfo) {
+        boolean hasGetter = false;
+        boolean hasSetter = false;
+        for (ElementInfo child : fieldInfo.getChildren()) {
+            if (child instanceof AccessorInfo) {
+                AccessorKind kind = ((AccessorInfo) child).getAccessorKind();
+                if (kind == AccessorKind.GETTER) {
+                    hasGetter = true;
+                } else if (kind == AccessorKind.SETTER) {
+                    hasSetter = true;
+                } else if (kind == AccessorKind.ADDRESS || kind == AccessorKind.OFFSET) {
+                    hasGetter = true;
+                    hasSetter = true;
+                } else {
+                    throw VMError.shouldNotReachHere("Unexpected accessor kind: " + kind);
+                }
+            }
+        }
+
+        if (!hasSetter) {
+            nativeLibs.addError(String.format("%s.%s does not have a setter. @RawStructure fields need both a getter and a setter.", fieldInfo.getParent().getName(), fieldInfo.getName()));
+        }
+        if (!hasGetter) {
+            nativeLibs.addError(String.format("%s.%s does not have a getter. @RawStructure fields need both a getter and a setter.", fieldInfo.getParent().getName(), fieldInfo.getName()));
+        }
     }
 
     private boolean hasLocationIdentityParameter(ResolvedJavaMethod method) {
@@ -368,16 +395,13 @@ public class InfoTreeBuilder {
         AccessorInfo overallKindAccessor = null;
 
         for (AccessorInfo accessorInfo : accessorInfos) {
-            final ResolvedJavaType type;
+            ResolvedJavaType type;
             switch (accessorInfo.getAccessorKind()) {
-                case GETTER:
-                    type = accessorInfo.getReturnType();
-                    break;
-                case SETTER:
-                    type = accessorInfo.getValueParameterType();
-                    break;
-                default:
+                case GETTER -> type = accessorInfo.getReturnType();
+                case SETTER -> type = accessorInfo.getValueParameterType();
+                default -> {
                     continue;
+                }
             }
 
             ResolvedJavaMethod method = accessorInfo.getAnnotatedElement();
@@ -394,18 +418,14 @@ public class InfoTreeBuilder {
 
     private ElementKind elementKind(ResolvedJavaType type, boolean isPinnedObject) {
         switch (type.getJavaKind()) {
-            case Boolean:
-            case Byte:
-            case Char:
-            case Short:
-            case Int:
-            case Long:
+            case Boolean, Byte, Char, Short, Int, Long -> {
                 return ElementKind.INTEGER;
-            case Float:
-            case Double:
+            }
+            case Float, Double -> {
                 return ElementKind.FLOAT;
-            case Object:
-                if (nativeLibs.isSigned(type) || nativeLibs.isUnsigned(type)) {
+            }
+            case Object -> {
+                if (nativeLibs.isIntegerType(type)) {
                     return ElementKind.INTEGER;
                 } else if (isPinnedObject) {
                     return ElementKind.OBJECT;
@@ -416,8 +436,10 @@ public class InfoTreeBuilder {
                 } else {
                     return ElementKind.POINTER;
                 }
-            default:
+            }
+            default -> {
                 return ElementKind.UNKNOWN;
+            }
         }
     }
 
@@ -437,8 +459,8 @@ public class InfoTreeBuilder {
 
         if (accessorInfo.isIndexed()) {
             ResolvedJavaType paramType = accessorInfo.getParameterType(accessorInfo.indexParameterNumber(false));
-            if (paramType.getJavaKind() != JavaKind.Int && paramType.getJavaKind() != JavaKind.Long && !nativeLibs.isSigned(paramType)) {
-                nativeLibs.addError("Wrong type of index parameter 0: expected int, long, or Signed; found " + paramType.toJavaName(true), method);
+            if (!nativeLibs.isIntegerType(paramType)) {
+                nativeLibs.addError("Wrong type of index parameter 0: expected an integer type; found " + paramType.toJavaName(true), method);
                 return false;
             }
         }
@@ -459,48 +481,56 @@ public class InfoTreeBuilder {
             return false;
         }
         switch (accessorInfo.getAccessorKind()) {
-            case ADDRESS:
-                if (!nativeLibs.isPointerBase(returnType) || nativeLibs.isSigned(returnType) || nativeLibs.isUnsigned(returnType)) {
+            case ADDRESS -> {
+                if (!nativeLibs.isPointerBase(returnType) || nativeLibs.isIntegerType(returnType)) {
                     nativeLibs.addError("Wrong return type: expected a pointer type; found " + returnType.toJavaName(true), method);
                     return false;
                 }
-                break;
-            case OFFSET:
-                if (!(returnType.getJavaKind().isNumericInteger() || nativeLibs.isUnsigned(returnType))) {
-                    nativeLibs.addError("Wrong return type: expected an integer numeric type or Unsigned; found " + returnType.toJavaName(true), method);
+            }
+            case OFFSET -> {
+                if (!nativeLibs.isIntegerType(returnType)) {
+                    nativeLibs.addError("Wrong return type: expected an integer type; found " + returnType.toJavaName(true), method);
                     return false;
                 }
-                break;
-            case SETTER:
+            }
+            case SETTER -> {
                 if (!checkObjectType(accessorInfo.getValueParameterType(), method)) {
                     return false;
                 }
-                break;
+            }
         }
         return true;
     }
 
-    private boolean checkObjectType(ResolvedJavaType returnType, ResolvedJavaMethod method) {
-        if (returnType.getJavaKind() == JavaKind.Object && !nativeLibs.isWordBase(returnType) && !isPinnedObjectFieldAccessor(method)) {
-            nativeLibs.addError("Wrong type: expected a primitive type or a Word type; found " + returnType.toJavaName(true) + ". Use the annotation @" + PinnedObjectField.class.getSimpleName() +
-                            " if you know what you are doing.", method);
+    private boolean checkObjectType(ResolvedJavaType type, ResolvedJavaMethod method) {
+        if (type.getJavaKind() == JavaKind.Void) {
+            return true;
+        } else if (type.getJavaKind() == JavaKind.Object && !nativeLibs.isWordBase(type)) {
+            if (!isPinnedObjectFieldAccessor(method)) {
+                nativeLibs.addError("Wrong type: expected a primitive type or a Word type; found " + type.toJavaName(true) + ". Use the annotation @" + PinnedObjectField.class.getSimpleName() +
+                                " if you know what you are doing.", method);
+                return false;
+            }
+        } else if (isPinnedObjectFieldAccessor(method)) {
+            nativeLibs.addError("Wrong type: expected an object type; found " + type.toJavaName(true) + ". The annotation @" + PinnedObjectField.class.getSimpleName() +
+                            " may only be used for object fields.", method);
             return false;
         }
         return true;
     }
 
     private boolean validInterfaceDefinition(ResolvedJavaType type, Class<? extends Annotation> annotationClass) {
-        assert type.getAnnotation(annotationClass) != null;
+        assert GuestAnnotationAccess.isAnnotationPresent(type, annotationClass);
 
         if (!type.isInterface() || !nativeLibs.isPointerBase(type)) {
-            nativeLibs.addError("Annotation @" + annotationClass.getSimpleName() + " can only be used on an interface that extends " + PointerBase.class.getSimpleName(), type);
+            nativeLibs.addError("Annotation @" + ClassUtil.getUnqualifiedName(annotationClass) + " can only be used on an interface that extends " + PointerBase.class.getSimpleName(), type);
             return false;
         }
         return true;
     }
 
     private static String removePrefix(String name, String prefix) {
-        assert prefix.length() > 0;
+        assert !prefix.isEmpty();
         String result = name;
         if (result.startsWith(prefix)) {
             result = result.substring(prefix.length());
@@ -514,7 +544,7 @@ public class InfoTreeBuilder {
     private static String getConstantName(ResolvedJavaMethod method) {
         CConstant constantAnnotation = getMethodAnnotation(method, CConstant.class);
         String name = constantAnnotation.value();
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = method.getName();
             /* Remove "get" prefix for automatically inferred names. */
             name = removePrefix(name, "get");
@@ -523,22 +553,22 @@ public class InfoTreeBuilder {
     }
 
     private String getCPointerToTypeName(ResolvedJavaType type) {
-        CPointerTo pointerToAnnotation = type.getAnnotation(CPointerTo.class);
-        Class<?> pointerToType = pointerToAnnotation.value();
+        CPointerToGuestValue pointerToAnnotation = CPointerToGuestValue.get(type);
+        ResolvedJavaType pointerToType = pointerToAnnotation.value();
         String nameOfCType = pointerToAnnotation.nameOfCType();
 
-        CStruct pointerToCStructAnnotation;
-        CPointerTo pointerToCPointerAnnotation;
+        boolean pointerToCStruct;
+        boolean pointerToCPointer;
         do {
-            pointerToCStructAnnotation = pointerToType.getAnnotation(CStruct.class);
-            pointerToCPointerAnnotation = pointerToType.getAnnotation(CPointerTo.class);
-            if (pointerToCStructAnnotation != null || pointerToCPointerAnnotation != null) {
+            pointerToCStruct = GuestAnnotationAccess.isAnnotationPresent(pointerToType, CStruct.class);
+            pointerToCPointer = GuestAnnotationAccess.isAnnotationPresent(pointerToType, CPointerTo.class);
+            if (pointerToCStruct || pointerToCPointer) {
                 break;
             }
             pointerToType = pointerToType.getInterfaces().length == 1 ? pointerToType.getInterfaces()[0] : null;
         } while (pointerToType != null);
 
-        int n = (nameOfCType.length() > 0 ? 1 : 0) + (pointerToCStructAnnotation != null ? 1 : 0) + (pointerToCPointerAnnotation != null ? 1 : 0);
+        int n = (!nameOfCType.isEmpty() ? 1 : 0) + (pointerToCStruct ? 1 : 0) + (pointerToCPointer ? 1 : 0);
         if (n != 1) {
             nativeLibs.addError("Exactly one of " +  //
                             "1) literal C type name, " +  //
@@ -547,31 +577,31 @@ public class InfoTreeBuilder {
             return "__error";
         }
 
-        if (pointerToCStructAnnotation != null) {
-            return getStructName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
-        } else if (pointerToCPointerAnnotation != null) {
-            return getCPointerToTypeName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+        if (pointerToCStruct) {
+            return getStructName(pointerToType) + "*";
+        } else if (pointerToCPointer) {
+            return getCPointerToTypeName(pointerToType) + "*";
         } else {
             return nameOfCType;
         }
     }
 
     private String getRawPointerToTypeName(ResolvedJavaType type) {
-        RawPointerTo pointerToAnnotation = type.getAnnotation(RawPointerTo.class);
-        Class<?> pointerToType = pointerToAnnotation.value();
+        RawPointerToGuestValue pointerToAnnotation = RawPointerToGuestValue.get(type);
+        ResolvedJavaType pointerToType = pointerToAnnotation.value();
 
-        RawStructure pointerToRawStructAnnotation;
-        RawPointerTo pointerToRawPointerAnnotation;
+        boolean pointerToRawStruct;
+        boolean pointerToRawPointer;
         do {
-            pointerToRawStructAnnotation = pointerToType.getAnnotation(RawStructure.class);
-            pointerToRawPointerAnnotation = pointerToType.getAnnotation(RawPointerTo.class);
-            if (pointerToRawStructAnnotation != null || pointerToRawPointerAnnotation != null) {
+            pointerToRawStruct = GuestAnnotationAccess.isAnnotationPresent(pointerToType, RawStructure.class);
+            pointerToRawPointer = GuestAnnotationAccess.isAnnotationPresent(pointerToType, RawPointerTo.class);
+            if (pointerToRawStruct || pointerToRawPointer) {
                 break;
             }
             pointerToType = pointerToType.getInterfaces().length == 1 ? pointerToType.getInterfaces()[0] : null;
         } while (pointerToType != null);
 
-        int n = (pointerToRawStructAnnotation != null ? 1 : 0) + (pointerToRawPointerAnnotation != null ? 1 : 0);
+        int n = (pointerToRawStruct ? 1 : 0) + (pointerToRawPointer ? 1 : 0);
         if (n != 1) {
             nativeLibs.addError("Exactly one of " +  //
                             "1) class annotated with @" + RawStructure.class.getSimpleName() + ", or " + //
@@ -579,26 +609,25 @@ public class InfoTreeBuilder {
             return "__error";
         }
 
-        if (pointerToRawStructAnnotation != null) {
-            return getStructName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+        if (pointerToRawStruct) {
+            return getStructName(pointerToType) + "*";
         } else {
-            assert pointerToRawPointerAnnotation != null;
-            return getRawPointerToTypeName(getMetaAccess().lookupJavaType(pointerToType)) + "*";
+            assert pointerToRawPointer;
+            return getRawPointerToTypeName(pointerToType) + "*";
         }
     }
 
     private static String getStructName(ResolvedJavaType type) {
-        CStruct structAnnotation = type.getAnnotation(CStruct.class);
+        CStructGuestValue structAnnotation = CStructGuestValue.get(type);
 
         if (structAnnotation == null) {
-            RawStructure rsanno = type.getAnnotation(RawStructure.class);
-            assert rsanno != null : "Unexpected struct type " + type;
+            assert GuestAnnotationAccess.isAnnotationPresent(type, RawStructure.class) : "Unexpected struct type " + type;
             return getSimpleJavaName(type);
         }
 
         String name = structAnnotation.value();
 
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = getSimpleJavaName(type);
         }
         if (structAnnotation.addStructKeyword()) {
@@ -619,7 +648,7 @@ public class InfoTreeBuilder {
     }
 
     private static String getStructFieldName(AccessorInfo info, String annotationValue) {
-        if (annotationValue.length() != 0) {
+        if (!annotationValue.isEmpty()) {
             return annotationValue;
         } else {
             return removePrefix(info.getAnnotatedElement().getName(), info.getAccessorPrefix());
@@ -632,15 +661,14 @@ public class InfoTreeBuilder {
             return;
         }
 
-        CEnum annotation = type.getAnnotation(CEnum.class);
+        CEnumGuestValue annotation = CEnumGuestValue.get(type);
         String name = annotation.value();
-        if (!name.isEmpty()) {
-            if (annotation.addEnumKeyword()) {
-                name = "enum " + name;
-            }
-        } else {
+        if (name.isEmpty()) {
             name = "int";
+        } else if (annotation.addEnumKeyword()) {
+            name = "enum " + name;
         }
+
         EnumInfo enumInfo = new EnumInfo(name, type);
 
         /* Use the wrapped type to avoid registering all CEnum annotated classes as reachable. */
@@ -651,14 +679,21 @@ public class InfoTreeBuilder {
                 createEnumConstantInfo(enumInfo, field);
             }
         }
-        for (ResolvedJavaMethod method : type.getDeclaredMethods()) {
-            if (getMethodAnnotation(method, CEnumValue.class) != null) {
-                createEnumValueInfo(enumInfo, method);
+
+        for (ResolvedJavaMethod method : type.getDeclaredMethods(false)) {
+            AnalysisMethod analysisMethod = (AnalysisMethod) method;
+
+            CEnumValue cEnumValue = getMethodAnnotation(method, CEnumValue.class);
+            if (cEnumValue != null) {
+                addCEnumValueMethod(enumInfo, analysisMethod);
             }
-            if (getMethodAnnotation(method, CEnumLookup.class) != null) {
-                createEnumLookupInfo(enumInfo, method);
+
+            CEnumLookup cEnumLookup = getMethodAnnotation(method, CEnumLookup.class);
+            if (cEnumLookup != null) {
+                addCEnumLookupMethod(enumInfo, analysisMethod);
             }
         }
+
         nativeCodeInfo.adoptChild(enumInfo);
         nativeLibs.registerElementInfo(type, enumInfo);
     }
@@ -668,14 +703,14 @@ public class InfoTreeBuilder {
         ResolvedJavaType originalType = originalProviders.getMetaAccess().lookupJavaType(enumValue);
         assert enumValue.isNonNull() && originalType.equals(((WrappedElement) enumInfo.getAnnotatedElement()).getWrapped());
 
-        CEnumConstant fieldAnnotation = field.getAnnotation(CEnumConstant.class);
+        CEnumConstantGuestValue fieldAnnotation = CEnumConstantGuestValue.get(field);
         String name = "";
         boolean includeInLookup = true;
         if (fieldAnnotation != null) {
             name = fieldAnnotation.value();
             includeInLookup = fieldAnnotation.includeInLookup();
         }
-        if (name.length() == 0) {
+        if (name.isEmpty()) {
             name = field.getName();
         }
 
@@ -684,58 +719,44 @@ public class InfoTreeBuilder {
         enumInfo.adoptChild(constantInfo);
     }
 
-    private static ResolvedJavaMethod originalMethod(ResolvedJavaMethod method) {
-        assert method instanceof AnalysisMethod;
-        AnalysisMethod analysisMethod = (AnalysisMethod) method;
-        assert analysisMethod.getWrapped() instanceof CEnumCallWrapperMethod;
-        CEnumCallWrapperMethod wrapperMethod = (CEnumCallWrapperMethod) analysisMethod.getWrapped();
-        return wrapperMethod.getOriginal();
-    }
-
-    private void createEnumValueInfo(EnumInfo enumInfo, ResolvedJavaMethod method) {
-
+    private void addCEnumValueMethod(EnumInfo enumInfo, AnalysisMethod method) {
         /* Check the modifiers of the original method. The synthetic method is not native. */
         ResolvedJavaMethod originalMethod = originalMethod(method);
         if (!Modifier.isNative(originalMethod.getModifiers()) || Modifier.isStatic(originalMethod.getModifiers())) {
             nativeLibs.addError("Method annotated with @" + CEnumValue.class.getSimpleName() + " must be a non-static native method", method);
             return;
-        }
-        if (getParameterCount(method) != 0) {
+        } else if (getParameterCount(method) != 0) {
             nativeLibs.addError("Method annotated with @" + CEnumValue.class.getSimpleName() + " cannot have parameters", method);
             return;
-        }
-        ElementKind elementKind = elementKind(AccessorInfo.getReturnType(method), false);
-        if (elementKind != ElementKind.INTEGER) {
-            nativeLibs.addError("Method annotated with @" + CEnumValue.class.getSimpleName() + " must have an integer return type", method);
+        } else if (!nativeLibs.isIntegerType(AccessorInfo.getReturnType(method))) {
+            nativeLibs.addError("Method annotated with @" + CEnumValue.class.getSimpleName() + " must return an integer type", method);
             return;
         }
 
-        EnumValueInfo valueInfo = new EnumValueInfo(method);
-        enumInfo.adoptChild(valueInfo);
-        nativeLibs.registerElementInfo(method, valueInfo);
+        enumInfo.addCEnumValueMethod(method);
     }
 
-    private void createEnumLookupInfo(EnumInfo enumInfo, ResolvedJavaMethod method) {
-
+    private void addCEnumLookupMethod(EnumInfo enumInfo, AnalysisMethod method) {
         /* Check the modifiers of the original method. The synthetic method is not native. */
         ResolvedJavaMethod originalMethod = originalMethod(method);
         if (!Modifier.isNative(originalMethod.getModifiers()) || !Modifier.isStatic(originalMethod.getModifiers())) {
             nativeLibs.addError("Method annotated with @" + CEnumLookup.class.getSimpleName() + " must be a static native method", method);
             return;
-        }
-        if (getParameterCount(method) != 1 || elementKind(AccessorInfo.getParameterType(method, 0), false) != ElementKind.INTEGER) {
+        } else if (getParameterCount(method) != 1 || elementKind(AccessorInfo.getParameterType(method, 0), false) != ElementKind.INTEGER) {
             nativeLibs.addError("Method annotated with @" + CEnumLookup.class.getSimpleName() + " must have exactly one integer parameter", method);
             return;
-        }
-        if (!returnsDeclaringClass(method)) {
+        } else if (!returnsDeclaringClass(method)) {
             nativeLibs.addError("Return type of method annotated with @" + CEnumLookup.class.getSimpleName() + " must be the annotation type", method);
             return;
         }
 
-        enumInfo.needsLookup = true;
-        EnumLookupInfo lookupInfo = new EnumLookupInfo(method);
-        enumInfo.adoptChild(lookupInfo);
-        nativeLibs.registerElementInfo(method, lookupInfo);
+        enumInfo.addCEnumLookupMethod(method);
+    }
+
+    private static ResolvedJavaMethod originalMethod(AnalysisMethod method) {
+        assert method.getWrapped() instanceof CEnumCallWrapperMethod;
+        CEnumCallWrapperMethod wrapperMethod = (CEnumCallWrapperMethod) method.getWrapped();
+        return wrapperMethod.getOriginal();
     }
 
     private static <T extends Annotation> T getMethodAnnotation(ResolvedJavaMethod method, Class<T> annotationClass) {
@@ -744,6 +765,13 @@ public class InfoTreeBuilder {
          * when overwriting a method with covariant return types. As a workaround, we look up the
          * original method and use the annotations of the original method.
          */
-        return BridgeMethodUtils.getAnnotation(annotationClass, method);
+        T annotation = OriginalMethodProvider.getJavaMethod(method).getAnnotation(annotationClass);
+        if (annotation == null && method.isBridge()) {
+            ResolvedJavaMethod bridged = BridgeMethodUtils.getBridgedMethod(method);
+            if (bridged != null) {
+                annotation = OriginalMethodProvider.getJavaMethod(bridged).getAnnotation(annotationClass);
+            }
+        }
+        return annotation;
     }
 }

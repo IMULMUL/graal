@@ -54,18 +54,22 @@ public class StringTable {
         this(ByteBuffer.wrap(bytes));
     }
 
+    @SuppressWarnings("this-escape")
     public StringTable(ByteBuffer buffer) {
         read(buffer);
     }
 
     public void read(ByteBuffer buffer) {
         try {
-            // FIXME: this is wrong if suffix encoding is used (?)
+            /*
+             * This records only explicit string start offsets. Suffix-encoded or shared-suffix
+             * string tables may require richer offset lookup support if they become relevant.
+             */
             while (buffer.position() < buffer.limit()) {
                 final int index = buffer.position();
                 String s = Utf8.utf8ToString(true, buffer);
                 if (stringMap.containsKey(index)) {
-                    throw new IllegalStateException("offset cannot be re-used");
+                    throw new IllegalStateException("Offset cannot be re-used");
                 }
                 stringMap.put(index, s);
                 stringToIndexMap.put(s, index);
@@ -105,9 +109,9 @@ public class StringTable {
 
     @Override
     public String toString() {
-        StringBuilder sb = new StringBuilder("str\nindex   string\n==========================================================================\n");
+        StringBuilder sb = new StringBuilder(String.format("str%nindex   string%n==========================================================================%n"));
         for (Integer idx : stringMap.keySet()) {
-            sb.append(String.format("%5d   %s\n", idx, stringMap.get(idx)));
+            sb.append(String.format("%5d   %s%n", idx, stringMap.get(idx)));
         }
         return sb.toString();
     }

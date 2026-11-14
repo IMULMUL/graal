@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,67 +24,70 @@
  */
 package com.oracle.svm.core.jdk.localization.substitutions;
 
-import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.Substitute;
-import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.TargetElement;
-import com.oracle.svm.core.jdk.JDK8OrEarlier;
-import com.oracle.svm.core.jdk.localization.LocalizationSupport;
-import org.graalvm.nativeimage.ImageSingletons;
-
 import java.nio.charset.Charset;
 import java.util.Collections;
-import java.util.Map;
+import java.util.Locale;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
+import com.oracle.svm.core.annotate.Alias;
+import com.oracle.svm.core.annotate.RecomputeFieldValue;
+import com.oracle.svm.core.annotate.Substitute;
+import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.jdk.localization.DefaultCharsetSingleton;
+import com.oracle.svm.core.jdk.localization.LocalizationSupport;
+
 @TargetClass(java.nio.charset.Charset.class)
 @SuppressWarnings({"unused"})
-final class Target_java_nio_charset_Charset {
+public final class Target_java_nio_charset_Charset {
+    @Alias //
+    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset) //
+    private static volatile Object[] cache1;
 
-    @Alias private static Charset defaultCharset;
+    @Alias //
+    @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset) //
+    private static volatile Object[] cache2;
 
     @Substitute
     private static Charset defaultCharset() {
-        /*
-         * The default charset is initialized during native image generation and therefore always
-         * available without any checks.
-         */
-        return defaultCharset;
+        return DefaultCharsetSingleton.singleton().getDefaultCharset();
     }
 
     @Substitute
     private static SortedMap<String, Charset> availableCharsets() {
         TreeMap<String, Charset> result = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        Map<String, Charset> charsets = ImageSingletons.lookup(LocalizationSupport.class).charsets;
-        for (Charset charset : charsets.values()) {
+        for (Charset charset : LocalizationSupport.getAllCharsets()) {
             result.put(charset.name(), charset);
         }
         return Collections.unmodifiableSortedMap(result);
     }
 
+    @Alias
+    public static native Charset forName(String charsetName, Charset fallback);
+
     @Substitute
-    private static Charset lookup(String charsetName) {
-        if (charsetName == null) {
-            throw new IllegalArgumentException("Null charset name");
+    private static Charset lookup2(String charsetName) {
+        Object[] a;
+        if ((a = cache2) != null && charsetName.equals(a[0])) {
+            cache2 = cache1;
+            cache1 = a;
+            return (Charset) a[1];
         }
 
-        Map<String, Charset> charsets = ImageSingletons.lookup(LocalizationSupport.class).charsets;
-        Charset result = charsets.get(charsetName.toLowerCase());
-
-        if (result == null) {
-            /* Only need to check the name if we didn't find a charset for it */
-            checkName(charsetName);
+        Charset cs = LocalizationSupport.getCharset(charsetName.toLowerCase(Locale.ROOT));
+        if (cs != null) {
+            cache(charsetName, cs);
+            return cs;
         }
-        return result;
+
+        /* Only need to check the name if we didn't find a charset for it */
+        checkName(charsetName);
+        return null;
     }
 
     @Alias
     private static native void checkName(String s);
 
-    @Substitute
-    @TargetElement(onlyWith = JDK8OrEarlier.class)
-    private static boolean atBugLevel(String bl) {
-        return false;
-    }
+    @Alias
+    private static native void cache(String charsetName, Charset cs);
 }

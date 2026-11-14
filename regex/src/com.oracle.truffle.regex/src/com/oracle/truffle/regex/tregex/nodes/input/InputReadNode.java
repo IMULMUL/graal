@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,59 +40,56 @@
  */
 package com.oracle.truffle.regex.tregex.nodes.input;
 
-import com.oracle.truffle.api.CompilerAsserts;
-import com.oracle.truffle.api.CompilerDirectives;
+import static com.oracle.truffle.regex.tregex.string.Encoding.UTF_16;
+import static com.oracle.truffle.regex.tregex.string.Encoding.UTF_16BE;
+import static com.oracle.truffle.regex.tregex.string.Encoding.UTF_16_RAW;
+import static com.oracle.truffle.regex.tregex.string.Encoding.UTF_32;
+import static com.oracle.truffle.regex.tregex.string.Encoding.UTF_32BE;
+
 import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.GenerateInline;
 import com.oracle.truffle.api.dsl.GenerateUncached;
+import com.oracle.truffle.api.dsl.NeverDefault;
 import com.oracle.truffle.api.dsl.Specialization;
-import com.oracle.truffle.api.interop.InteropLibrary;
-import com.oracle.truffle.api.interop.InvalidArrayIndexException;
-import com.oracle.truffle.api.interop.TruffleObject;
-import com.oracle.truffle.api.interop.UnsupportedMessageException;
-import com.oracle.truffle.api.interop.UnsupportedTypeException;
-import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.regex.runtime.nodes.ToCharNode;
+import com.oracle.truffle.api.strings.TruffleString;
+import com.oracle.truffle.regex.tregex.string.Encoding;
 
 @GenerateUncached
+@GenerateInline
 public abstract class InputReadNode extends Node {
 
+    public abstract int execute(Node node, TruffleString input, int index, Encoding encoding);
+
+    @Specialization(guards = "isUTF16(encoding)")
+    static int doTStringUTF16(TruffleString input, int index, @SuppressWarnings("unused") Encoding encoding,
+                    @Cached TruffleString.ReadCharUTF16Node readRawNode) {
+        return encoding == UTF_16BE ? readRawNode.executeBE(input, index) : readRawNode.execute(input, index);
+    }
+
+    @Specialization(guards = "isUTF32(encoding)")
+    static int doTStringUTF32(TruffleString input, int index, @SuppressWarnings("unused") Encoding encoding,
+                    @Cached TruffleString.CodePointAtIndexNode readRawNode) {
+        return readRawNode.execute(input, index, encoding.getTStringEncoding());
+    }
+
+    @Fallback
+    static int doByte(TruffleString input, int index, Encoding encoding,
+                    @Cached TruffleString.ReadByteNode readRawNode) {
+        return readRawNode.execute(input, index, encoding.getTStringEncoding());
+    }
+
+    @NeverDefault
     public static InputReadNode create() {
         return InputReadNodeGen.create();
     }
 
-    public abstract int execute(Object input, int index);
-
-    @Specialization
-    static int doBytes(byte[] input, int index) {
-        return Byte.toUnsignedInt(input[index]);
+    static boolean isUTF16(Encoding encoding) {
+        return encoding == UTF_16 || encoding == UTF_16_RAW || encoding == UTF_16BE;
     }
 
-    @Specialization
-    static int doString(String input, int index) {
-        return input.charAt(index);
-    }
-
-    @Specialization(guards = "inputs.hasArrayElements(input)", limit = "2")
-    static int doBoxedCharArray(Object input, int index,
-                    @CachedLibrary("input") InteropLibrary inputs,
-                    @Cached ToCharNode toCharNode) {
-        try {
-            return toCharNode.execute(inputs.readArrayElement(input, index));
-        } catch (UnsupportedMessageException | InvalidArrayIndexException | UnsupportedTypeException e) {
-            throw CompilerDirectives.shouldNotReachHere();
-        }
-    }
-
-    public static int readWithMask(TruffleObject input, int indexInput, String mask, int indexMask, InputReadNode charAtNode) {
-        CompilerAsserts.partialEvaluationConstant(mask == null);
-        int c = charAtNode.execute(input, indexInput);
-        return (mask == null ? c : (c | mask.charAt(indexMask)));
-    }
-
-    public static int readWithMask(TruffleObject input, int indexInput, byte[] mask, int indexMask, InputReadNode charAtNode) {
-        CompilerAsserts.partialEvaluationConstant(mask == null);
-        int c = charAtNode.execute(input, indexInput);
-        return (mask == null ? c : (c | Byte.toUnsignedInt(mask[indexMask])));
+    static boolean isUTF32(Encoding encoding) {
+        return encoding == UTF_32 || encoding == UTF_32BE;
     }
 }

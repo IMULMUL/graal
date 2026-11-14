@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,37 +24,46 @@
  */
 package com.oracle.svm.hosted.image;
 
+import static com.oracle.svm.core.image.DisallowedImageHeapObjects.CANCELLABLE_CLASS;
+import static com.oracle.svm.core.image.DisallowedImageHeapObjects.LEGACY_CLEANER_CLASS;
+import static com.oracle.svm.core.image.DisallowedImageHeapObjects.MEMORY_SEGMENT_CLASS;
+import static com.oracle.svm.core.image.DisallowedImageHeapObjects.SCOPE_CLASS;
+
+import java.io.File;
+import java.io.FileDescriptor;
 import java.lang.management.PlatformManagedObject;
+import java.lang.ref.Cleaner;
+import java.nio.Buffer;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Random;
+import java.util.SplittableRandom;
+import java.util.zip.ZipFile;
 
 import javax.management.MBeanServerConnection;
 
-import org.graalvm.nativeimage.hosted.Feature;
-
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
+import com.oracle.svm.core.ForeignSupport;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.image.DisallowedImageHeapObjects;
-import com.oracle.svm.core.jdk.management.ManagementFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
 import com.oracle.svm.core.jdk.management.ManagementSupport;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
 import com.oracle.svm.hosted.FeatureImpl;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationOptions;
 import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
-import com.oracle.svm.util.ImageGeneratorThreadMarker;
+import com.oracle.svm.shared.option.SubstrateOptionsParser;
 
 /**
  * Complain if there are types that can not move from the image generator heap to the image heap.
  */
-@AutomaticFeature
-public class DisallowedImageHeapObjectFeature implements Feature {
+@AutomaticallyRegisteredFeature
+public class DisallowedImageHeapObjectFeature implements InternalFeature {
 
     private ClassInitializationSupport classInitialization;
 
@@ -62,38 +71,51 @@ public class DisallowedImageHeapObjectFeature implements Feature {
     private Map<byte[], Charset> disallowedByteSubstrings;
 
     @Override
-    public List<Class<? extends Feature>> getRequiredFeatures() {
-        /*
-         * Ensure that object replaced registered by ManagementFeature runs before our object
-         * replacer.
-         */
-        return Arrays.asList(ManagementFeature.class);
-    }
+    public void duringSetup(DuringSetupAccess a) {
+        FeatureImpl.DuringSetupAccessImpl access = (FeatureImpl.DuringSetupAccessImpl) a;
+        classInitialization = access.getHostVM().getClassInitializationSupport();
+        boolean extensionLayer = ImageLayerBuildingSupport.buildingExtensionLayer();
+        access.registerObjectReachabilityHandler(obj -> onMBeanServerConnectionReachable(obj, this::error), MBeanServerConnection.class);
+        access.registerObjectReachabilityHandler(obj -> onPlatformManagedObjectReachable(obj, this::error, extensionLayer), PlatformManagedObject.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onRandomReachable(obj, this::error), Random.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onSplittableRandomReachable(obj, this::error), SplittableRandom.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onThreadReachable(obj, this::error), Thread.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onContinuationReachable(obj, this::error), DisallowedImageHeapObjects.CONTINUATION_CLASS);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onFileDescriptorReachable(obj, this::error), FileDescriptor.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onBufferReachable(obj, this::error), Buffer.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onCleanableReachable(obj, this::error), Cleaner.Cleanable.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onCleanableReachable(obj, this::error), LEGACY_CLEANER_CLASS);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onCleanerReachable(obj, this::error), Cleaner.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onZipFileReachable(obj, this::error), ZipFile.class);
+        access.registerObjectReachabilityHandler(obj -> DisallowedImageHeapObjects.onCancellableReachable(obj, this::error), CANCELLABLE_CLASS);
 
-    @Override
-    public void duringSetup(DuringSetupAccess access) {
-        classInitialization = ((FeatureImpl.DuringSetupAccessImpl) access).getHostVM().getClassInitializationSupport();
-        access.registerObjectReplacer(this::replacer);
+        if (ForeignSupport.isAvailable()) {
+            ForeignSupport foreignSupport = ForeignSupport.singleton();
+            access.registerObjectReachabilityHandler(obj -> foreignSupport.onMemorySegmentReachable(obj, this::error), MEMORY_SEGMENT_CLASS);
+            access.registerObjectReachabilityHandler(obj -> foreignSupport.onScopeReachable(obj, this::error), SCOPE_CLASS);
+        }
 
         if (SubstrateOptions.DetectUserDirectoriesInImageHeap.getValue()) {
+            access.registerObjectReachabilityHandler(this::onStringReachable, String.class);
+            access.registerObjectReachabilityHandler(this::onByteArrayReachable, byte[].class);
+
             /*
              * We do not check for the temp directory name and the user name because they have a too
              * high chance of being short or generic terms that appear in valid strings.
              */
-            disallowedSubstrings = new String[]{
+            disallowedSubstrings = getDisallowedSubstrings(
                             System.getProperty("user.home"),
                             System.getProperty("user.dir"),
-                            System.getProperty("java.home")};
+                            System.getProperty("java.home"));
 
             /* We cannot check all byte[] encodings of strings, but we want to check common ones. */
-            Set<Charset> encodings = new HashSet<>(Arrays.asList(
+            List<Charset> encodings = Arrays.asList(
                             StandardCharsets.UTF_8,
                             StandardCharsets.UTF_16,
-                            Charset.forName(System.getProperty("sun.jnu.encoding"))));
+                            Charset.forName(System.getProperty("sun.jnu.encoding")));
 
             disallowedByteSubstrings = new IdentityHashMap<>();
-            for (int i = 0; i < disallowedSubstrings.length; i++) {
-                String s = disallowedSubstrings[i];
+            for (String s : disallowedSubstrings) {
                 for (Charset encoding : encodings) {
                     disallowedByteSubstrings.put(s.getBytes(encoding), encoding);
                 }
@@ -101,15 +123,19 @@ public class DisallowedImageHeapObjectFeature implements Feature {
         }
     }
 
-    private Object replacer(Object original) {
-        if (original instanceof Thread && original instanceof ImageGeneratorThreadMarker) {
-            return ((ImageGeneratorThreadMarker) original).asTerminated();
-        }
+    private static String[] getDisallowedSubstrings(String... substrings) {
+        return Arrays.stream(substrings).filter(s -> {
+            /*
+             * To avoid false positives when detecting user directories in the image heap, we
+             * disallow substrings only if they have at least two name-separator characters.
+             */
+            return s.indexOf(File.separatorChar, s.indexOf(File.separatorChar) + 1) != -1;
+        }).toArray(String[]::new);
+    }
 
-        checkDisallowedMBeanObjects(original);
-
-        if (original instanceof String && disallowedSubstrings != null) {
-            String string = (String) original;
+    @SuppressWarnings("unused")
+    private void onStringReachable(String string) {
+        if (disallowedSubstrings != null) {
             for (String disallowedSubstring : disallowedSubstrings) {
                 if (string.contains(disallowedSubstring)) {
                     throw new UnsupportedFeatureException("Detected a string in the image heap that contains a user directory. " +
@@ -120,9 +146,11 @@ public class DisallowedImageHeapObjectFeature implements Feature {
                 }
             }
         }
+    }
 
-        if (original instanceof byte[] && disallowedByteSubstrings != null) {
-            byte[] bytes = (byte[]) original;
+    @SuppressWarnings("unused")
+    private void onByteArrayReachable(byte[] bytes) {
+        if (disallowedByteSubstrings != null) {
             for (Map.Entry<byte[], Charset> entry : disallowedByteSubstrings.entrySet()) {
                 byte[] disallowedSubstring = entry.getKey();
                 if (search(bytes, disallowedSubstring)) {
@@ -135,29 +163,32 @@ public class DisallowedImageHeapObjectFeature implements Feature {
                 }
             }
         }
-
-        DisallowedImageHeapObjects.check(original, this::error);
-        return original;
     }
 
-    /** See {@link ManagementSupport} for details why these objects are not allowed. */
-    private void checkDisallowedMBeanObjects(Object original) {
-        if (original instanceof MBeanServerConnection) {
-            throw error("Detected a MBean server in the image heap. This is currently not supported, but could be changed in the future. " +
-                            "Management beans are registered in many global caches that would need to be cleared and properly re-built at image build time. " +
-                            "Class of disallowed object: " + original.getClass().getTypeName(),
-                            original, "Try to avoid initializing the class that stores a MBean server or a MBean in a static field");
+    /**
+     * See {@link ManagementSupport} for details why these objects are not allowed.
+     */
+    private static void onMBeanServerConnectionReachable(MBeanServerConnection serverConnection, DisallowedImageHeapObjects.DisallowedObjectReporter reporter) {
+        throw reporter.raise("Detected a MBean server in the image heap. This is currently not supported, but could be changed in the future. " +
+                        "Management beans are registered in many global caches that would need to be cleared and properly re-built at image build time. " +
+                        "Class of disallowed object: " + serverConnection.getClass().getTypeName(),
+                        serverConnection, "Try to avoid initializing the class that stores a MBean server or a MBean in a static field");
+    }
 
-        } else if (original instanceof PlatformManagedObject && !ManagementSupport.getSingleton().isAllowedPlatformManagedObject((PlatformManagedObject) original)) {
-            throw error("Detected a PlatformManagedObject (a MXBean defined by the virtual machine) in the image heap. " +
+    /**
+     * See {@link ManagementSupport} for details why these objects are not allowed.
+     */
+    private static void onPlatformManagedObjectReachable(PlatformManagedObject platformManagedObject, DisallowedImageHeapObjects.DisallowedObjectReporter reporter, boolean extensionLayer) {
+        if (extensionLayer || !ManagementSupport.getSingleton().isAllowedPlatformManagedObject(platformManagedObject)) {
+            throw reporter.raise("Detected a PlatformManagedObject (a MXBean defined by the virtual machine) in the image heap. " +
                             "This bean is introspecting the VM that runs the image builder, i.e., a VM instance that is no longer available at image runtime. " +
-                            "Class of disallowed object: " + original.getClass().getTypeName(),
-                            original, "Try to avoid initializing the class that stores the object in a static field");
+                            "Class of disallowed object: " + platformManagedObject.getClass().getTypeName(),
+                            platformManagedObject, "Try to avoid initializing the class that stores the object in a static field");
         }
     }
 
     private RuntimeException error(String msg, Object obj, String initializerAction) {
-        throw new UnsupportedFeatureException(msg + " " + classInitialization.objectInstantiationTraceMessage(obj, initializerAction) + " " +
+        throw new UnsupportedFeatureException(msg + " " + classInitialization.objectInstantiationTraceMessage(obj, "", _ -> initializerAction) +
                         "The object was probably created by a class initializer and is reachable from a static field. " +
                         "You can request class initialization at image runtime by using the option " +
                         SubstrateOptionsParser.commandArgument(ClassInitializationOptions.ClassInitialization, "<class-name>", "initialize-at-run-time") + ". " +

@@ -27,22 +27,29 @@ package com.oracle.svm.core.jdk;
 // Checkstyle: allow reflection
 
 import java.lang.reflect.Array;
+import java.util.Objects;
 
-import org.graalvm.compiler.word.BarrieredAccess;
+import com.oracle.svm.shared.config.ObjectLayout;
 import org.graalvm.word.UnsignedWord;
 
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.guest.staging.configure.RuntimeDynamicAccessMetadata;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.core.metadata.MetadataTracer;
+import com.oracle.svm.core.reflect.MissingReflectionRegistrationUtils;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+
+import org.graalvm.word.impl.BarrieredAccess;
 
 @TargetClass(java.lang.reflect.Array.class)
 final class Target_java_lang_reflect_Array {
 
     @Substitute
-    private static boolean getBoolean(Object array, int index) {
+    private static boolean getBoolean(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof boolean[]) {
             return ((boolean[]) array)[index];
         }
@@ -50,7 +57,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setBoolean(Object array, int index, boolean value) {
+    private static void setBoolean(Object a, int index, boolean value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof boolean[]) {
             ((boolean[]) array)[index] = value;
             return;
@@ -59,7 +67,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static byte getByte(Object array, int index) {
+    private static byte getByte(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         }
@@ -67,7 +76,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setByte(Object array, int index, byte value) {
+    private static void setByte(Object a, int index, byte value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             ((byte[]) array)[index] = value;
             return;
@@ -91,7 +101,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static char getChar(Object array, int index) {
+    private static char getChar(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof char[]) {
             return ((char[]) array)[index];
         }
@@ -99,7 +110,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setChar(Object array, int index, char value) {
+    private static void setChar(Object a, int index, char value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof char[]) {
             ((char[]) array)[index] = value;
             return;
@@ -120,7 +132,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static short getShort(Object array, int index) {
+    private static short getShort(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         } else if (array instanceof short[]) {
@@ -130,7 +143,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setShort(Object array, int index, short value) {
+    private static void setShort(Object a, int index, short value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof short[]) {
             ((short[]) array)[index] = value;
             return;
@@ -151,7 +165,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static int getInt(Object array, int index) {
+    private static int getInt(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         } else if (array instanceof short[]) {
@@ -165,7 +180,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setInt(Object array, int index, int value) {
+    private static void setInt(Object a, int index, int value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof int[]) {
             ((int[]) array)[index] = value;
             return;
@@ -183,7 +199,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static long getLong(Object array, int index) {
+    private static long getLong(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         } else if (array instanceof short[]) {
@@ -199,7 +216,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setLong(Object array, int index, long value) {
+    private static void setLong(Object a, int index, long value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof long[]) {
             ((long[]) array)[index] = value;
             return;
@@ -214,7 +232,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static float getFloat(Object array, int index) {
+    private static float getFloat(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         } else if (array instanceof short[]) {
@@ -232,7 +251,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setFloat(Object array, int index, float value) {
+    private static void setFloat(Object a, int index, float value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof float[]) {
             ((float[]) array)[index] = value;
             return;
@@ -244,7 +264,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static double getDouble(Object array, int index) {
+    private static double getDouble(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof byte[]) {
             return ((byte[]) array)[index];
         } else if (array instanceof short[]) {
@@ -264,7 +285,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void setDouble(Object array, int index, double value) {
+    private static void setDouble(Object a, int index, double value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof double[]) {
             ((double[]) array)[index] = value;
             return;
@@ -273,7 +295,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static Object get(Object array, int index) {
+    private static Object get(Object a, int index) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof boolean[]) {
             return ((boolean[]) array)[index];
         } else if (array instanceof byte[]) {
@@ -299,7 +322,8 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
-    private static void set(Object array, int index, Object value) {
+    private static void set(Object a, int index, Object value) {
+        Object array = Objects.requireNonNull(a);
         if (array instanceof boolean[]) {
             if (value instanceof Boolean) {
                 ((boolean[]) array)[index] = ((Boolean) value).booleanValue();
@@ -362,32 +386,72 @@ final class Target_java_lang_reflect_Array {
     }
 
     @Substitute
+    private static Object newArray(Class<?> componentType, int length)
+                    throws NegativeArraySizeException {
+        if (componentType == null) {
+            throw new NullPointerException();
+        } else if (length < 0) {
+            throw new NegativeArraySizeException(String.valueOf(length));
+        } else if (componentType == void.class || (componentType.isArray() && SubstrateUtil.arrayTypeDimension(componentType) >= 255)) {
+            throw new IllegalArgumentException();
+        }
+        if (MetadataTracer.enabled() && Util_java_lang_reflect_Array.shouldTraceReflectionArrayType(componentType, 1)) {
+            MetadataTracer.singleton().traceReflectionArrayType(componentType);
+        }
+        return KnownIntrinsics.unvalidatedNewArray(componentType, length);
+    }
+
+    @Substitute
     private static Object multiNewArray(Class<?> componentType, int[] dimensions) {
         if (componentType == null) {
             throw new NullPointerException();
         } else if (dimensions.length == 0 || componentType == void.class) {
             throw new IllegalArgumentException();
         }
+        int requestedDimension = dimensions.length;
+        if (componentType.isArray()) {
+            requestedDimension += SubstrateUtil.arrayTypeDimension(componentType);
+        }
+        if (requestedDimension > 255) {
+            throw new IllegalArgumentException();
+        }
         for (int i = 0; i < dimensions.length; i++) {
             if (dimensions[i] < 0) {
-                throw new NegativeArraySizeException();
+                throw new NegativeArraySizeException(String.valueOf(dimensions[i]));
             }
+        }
+        if (MetadataTracer.enabled() && Util_java_lang_reflect_Array.shouldTraceReflectionArrayType(componentType, dimensions.length)) {
+            MetadataTracer.singleton().traceReflectionArrayType(componentType, dimensions.length);
         }
 
         // get the ultimate outer array type
         DynamicHub arrayHub = DynamicHub.fromClass(componentType);
         for (int i = 0; i < dimensions.length; i++) {
-            arrayHub = arrayHub.getArrayHub();
-            if (arrayHub == null) {
-                throw VMError.unsupportedFeature("Cannot allocate " + dimensions.length + "-dimensional array of " + componentType.getName());
+            DynamicHub maybeArrayHub = arrayHub.getOrCreateArrayHub();
+            if (maybeArrayHub == null) {
+                throw MissingReflectionRegistrationUtils.reportArrayInstantiation(componentType, dimensions.length);
             }
+            arrayHub = maybeArrayHub;
         }
 
         return Util_java_lang_reflect_Array.createMultiArrayAtIndex(0, arrayHub, dimensions);
     }
+
 }
 
 final class Util_java_lang_reflect_Array {
+
+    static boolean shouldTraceReflectionArrayType(Class<?> componentType, int dimensions) {
+        DynamicHub arrayHub = DynamicHub.fromClass(componentType);
+        for (int i = 0; i < dimensions; i++) {
+            arrayHub = arrayHub.getArrayHub();
+            if (arrayHub == null) {
+                return true;
+            }
+        }
+        RuntimeDynamicAccessMetadata dynamicAccessMetadata = arrayHub.getDynamicAccessMetadata();
+        return MetadataTracer.shouldTraceMetadata(dynamicAccessMetadata);
+    }
 
     static Object createMultiArrayAtIndex(int index, DynamicHub arrayHub, int[] dimensions) {
         final int length = dimensions[index];
@@ -403,7 +467,7 @@ final class Util_java_lang_reflect_Array {
                 Object subArray = createMultiArrayAtIndex(nextIndex, subArrayHub, dimensions);
                 // Each subArray could create a cross-generational reference.
                 BarrieredAccess.writeObject(result, offset, subArray);
-                offset = offset.add(ConfigurationValues.getObjectLayout().getReferenceSize());
+                offset = offset.add(ObjectLayout.singleton().getReferenceSize());
             }
         }
         return result;

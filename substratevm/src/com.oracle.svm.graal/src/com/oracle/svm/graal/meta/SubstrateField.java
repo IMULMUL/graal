@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,75 +24,87 @@
  */
 package com.oracle.svm.graal.meta;
 
-import static com.oracle.svm.core.util.VMError.unimplemented;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
 
-import java.lang.annotation.Annotation;
+import java.lang.reflect.Modifier;
+import java.util.function.Function;
 
-import com.oracle.svm.core.util.VMError;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.UnknownObjectField;
-import com.oracle.svm.core.annotate.UnknownPrimitiveField;
-import com.oracle.svm.core.hub.AnnotationsEncoding;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterAnalysis;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterCompilation;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.guest.staging.core.heap.UnknownPrimitiveField;
 import com.oracle.svm.core.meta.DirectSubstrateObjectConstant;
-import com.oracle.svm.core.meta.SharedField;
+import com.oracle.svm.jvmci.shared.meta.SharedField;
 import com.oracle.svm.core.util.HostedStringDeduplication;
-import com.oracle.truffle.api.nodes.Node.Child;
-import com.oracle.truffle.api.nodes.Node.Children;
-import com.oracle.truffle.api.nodes.NodeCloneable;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.OriginalFieldProvider;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
-import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.PrimitiveConstant;
 import jdk.vm.ci.meta.ResolvedJavaField;
-import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.annotation.AnnotationsInfo;
 
 public class SubstrateField implements SharedField {
 
     protected static final SubstrateField[] EMPTY_ARRAY = new SubstrateField[0];
 
-    SubstrateType type;
-    SubstrateType declaringClass;
+    @UnknownObjectField(availability = AfterAnalysis.class) SubstrateType type;
+    @UnknownObjectField(availability = AfterAnalysis.class) SubstrateType declaringClass;
     private final String name;
     private final int modifiers;
-    private int hashCode;
-    private Object annotationsEncoding;
+    private final int hashCode;
 
-    @UnknownPrimitiveField int location;
-    @UnknownPrimitiveField private boolean isAccessed;
-    @UnknownPrimitiveField private boolean isWritten;
-    @UnknownObjectField(types = {DirectSubstrateObjectConstant.class, PrimitiveConstant.class}, fullyQualifiedTypes = "jdk.vm.ci.meta.NullConstant")//
+    @UnknownPrimitiveField(availability = AfterCompilation.class) private int location;
+    @UnknownPrimitiveField(availability = AfterCompilation.class) private boolean isAccessed;
+    @UnknownPrimitiveField(availability = AfterCompilation.class) private boolean isWritten;
+    @UnknownObjectField(types = {DirectSubstrateObjectConstant.class, PrimitiveConstant.class}, fullyQualifiedTypes = "jdk.vm.ci.meta.NullConstant", //
+                    canBeNull = true, availability = AfterCompilation.class)//
     JavaConstant constantValue;
 
-    /* Truffle access this information frequently, so it is worth caching it in a field. */
-    final boolean truffleChildField;
-    final boolean truffleChildrenField;
-    final boolean truffleCloneableField;
+    @Platforms(Platform.HOSTED_ONLY.class)
+    public SubstrateField(AnalysisField aField, HostedStringDeduplication stringTable) {
+        VMError.guarantee(!aField.isInternal(), "Internal fields are not supported for JIT compilation");
 
-    public SubstrateField(MetaAccessProvider originalMetaAccess, ResolvedJavaField original, int modifiers, HostedStringDeduplication stringTable) {
-        VMError.guarantee(!original.isInternal(), "Internal fields are not supported for JIT compilation");
+        /*
+         * AliasField removes the "final" modifier for AOT compilation because the recomputed value
+         * is not guaranteed to be known yet. But for runtime compilation, we know that we can treat
+         * the field as "final".
+         */
+        ResolvedJavaField oField = OriginalFieldProvider.getOriginalField(aField);
+        boolean injectFinalForRuntimeCompilation = oField != null && oField.isFinal();
 
+        this.modifiers = aField.getModifiers() |
+                        (injectFinalForRuntimeCompilation ? Modifier.FINAL : 0);
+
+        this.name = stringTable.deduplicate(aField.getName(), true);
+        this.hashCode = aField.hashCode();
+    }
+
+    /**
+     * Must only be called at run-time from Ristretto.
+     */
+    protected SubstrateField() {
+        assert SubstrateOptions.useRistretto() : "Must only be initialized at runtime by ristretto";
+        name = null;
+        modifiers = -1;
+        hashCode = -1;
+        location = -1;
+    }
+
+    protected SubstrateField(String name, int modifiers, int hashCode, int location) {
+        assert SubstrateOptions.useRistretto() : "Must only be initialized at runtime by ristretto";
+        this.name = name;
         this.modifiers = modifiers;
-        this.name = stringTable.deduplicate(original.getName(), true);
-        this.hashCode = original.hashCode();
-
-        truffleChildField = original.getAnnotation(Child.class) != null;
-        truffleChildrenField = original.getAnnotation(Children.class) != null;
-        truffleCloneableField = originalMetaAccess.lookupJavaType(NodeCloneable.class).isAssignableFrom((ResolvedJavaType) original.getType());
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public boolean setAnnotationsEncoding(Object annotationsEncoding) {
-        boolean result = this.annotationsEncoding != annotationsEncoding;
-        this.annotationsEncoding = annotationsEncoding;
-        return result;
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public Object getAnnotationsEncoding() {
-        return annotationsEncoding;
+        this.hashCode = hashCode;
+        this.location = location;
     }
 
     public void setLinks(SubstrateType type, SubstrateType declaringClass) {
@@ -100,7 +112,7 @@ public class SubstrateField implements SharedField {
         this.declaringClass = declaringClass;
     }
 
-    public void setSubstrateData(int location, boolean isAccessed, boolean isWritten, JavaConstant constantValue) {
+    public void setSubstrateDataAfterCompilation(int location, boolean isAccessed, boolean isWritten, JavaConstant constantValue) {
         this.location = location;
         this.isAccessed = isAccessed;
         this.isWritten = isWritten;
@@ -118,6 +130,11 @@ public class SubstrateField implements SharedField {
     }
 
     @Override
+    public boolean isReachable() {
+        return isAccessed || isWritten;
+    }
+
+    @Override
     public boolean isWritten() {
         return isWritten;
     }
@@ -129,7 +146,7 @@ public class SubstrateField implements SharedField {
 
     @Override
     public JavaKind getStorageKind() {
-        return getType().getStorageKind();
+        return ((SubstrateType) getType()).getStorageKind();
     }
 
     @Override
@@ -138,7 +155,7 @@ public class SubstrateField implements SharedField {
     }
 
     @Override
-    public SubstrateType getType() {
+    public JavaType getType() {
         return type;
     }
 
@@ -162,28 +179,41 @@ public class SubstrateField implements SharedField {
         return declaringClass;
     }
 
-    @Override
-    public Annotation[] getAnnotations() {
-        return AnnotationsEncoding.decodeAnnotations(annotationsEncoding).getAnnotations();
+    private RuntimeException annotationsUnimplemented() {
+        return VMError.unimplemented("Annotations are not available for JIT compilation at image run time: " + format("%H.%n"));
     }
 
     @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return getAnnotations();
+    public <T> T getDeclaredAnnotationInfo(Function<AnnotationsInfo, T> parser) {
+        throw annotationsUnimplemented();
     }
 
     @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return AnnotationsEncoding.decodeAnnotations(annotationsEncoding).getAnnotation(annotationClass);
+    public AnnotationsInfo getTypeAnnotationInfo() {
+        throw annotationsUnimplemented();
     }
 
     @Override
     public boolean isSynthetic() {
-        throw unimplemented();
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public int getInstalledLayerNum() {
+        /*
+         * GR-62500: Layered images are not yet supported for runtime compilation.
+         */
+        return MultiLayeredImageSingleton.UNUSED_LAYER_NUMBER;
     }
 
     @Override
     public String toString() {
         return "SubstrateField<" + format("%h.%n") + " location: " + location + ">";
+    }
+
+    @Override
+    public Object getStaticFieldBaseForRuntimeLoadedClass() {
+        // only AOT known static fields available, those are in regular static arrays
+        return null;
     }
 }

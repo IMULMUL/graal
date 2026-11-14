@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -54,6 +54,10 @@ import java.util.function.Predicate;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.dynamicaccess.ForeignAccess;
+import org.graalvm.nativeimage.dynamicaccess.JNIAccess;
+import org.graalvm.nativeimage.dynamicaccess.ReflectiveAccess;
+import org.graalvm.nativeimage.dynamicaccess.ResourceAccess;
 
 /**
  * Features allow clients to intercept the native image generation and run custom initialization
@@ -89,6 +93,29 @@ import org.graalvm.nativeimage.Platforms;
 public interface Feature {
 
     /**
+     * A URL to documentation or the sources of the feature.
+     *
+     * The URL will be used as a link for the feature in the build output (if supported by the
+     * user's terminal).
+     *
+     * @since 22.2
+     */
+    default String getURL() {
+        return null;
+    }
+
+    /**
+     * A short description of the feature (e.g., "Enables Truffle support").
+     *
+     * The description is displayed to users as part of the build output.
+     *
+     * @since 22.2
+     */
+    default String getDescription() {
+        return null;
+    }
+
+    /**
      * Access methods that are available for all feature methods.
      *
      * @since 19.0
@@ -105,10 +132,10 @@ public interface Feature {
 
         /**
          * Returns the class path of the native image that is currently built.
-         * 
+         *
          * The returned list does not include the native image generator itself, and does not
          * include the JDK.
-         * 
+         *
          * @since 20.2
          */
         List<Path> getApplicationClassPath();
@@ -142,12 +169,47 @@ public interface Feature {
     }
 
     /**
+     * Access methods available for {@link Feature#onRegistration}.
+     *
+     * @since 25.1.3
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    interface OnRegistrationAccess extends FeatureAccess {
+    }
+
+    /**
      * Access methods available for {@link Feature#afterRegistration}.
      *
      * @since 19.0
      */
     @Platforms(Platform.HOSTED_ONLY.class)
     interface AfterRegistrationAccess extends FeatureAccess {
+
+        /**
+         * Returns the instance of {@link RuntimeReflection} used to register elements for
+         * reflection at run time. All registrations should happen in
+         * {@link Feature#afterRegistration}.
+         */
+        ReflectiveAccess getReflectiveAccess();
+
+        /**
+         * Returns the instance of {@link RuntimeResourceAccess} used to register resources for run
+         * time access. All registrations should happen in {@link Feature#afterRegistration}.
+         */
+        ResourceAccess getResourceAccess();
+
+        /**
+         * Returns the instance of {@link RuntimeJNIAccess} used to register elements for JNI access
+         * at run time. All registrations should happen in {@link Feature#afterRegistration}.
+         */
+        JNIAccess getJNIAccess();
+
+        /**
+         * Returns the instance of {@link RuntimeForeignAccess} used to register elements for
+         * foreign access at run time. All registrations should happen in
+         * {@link Feature#afterRegistration}.
+         */
+        ForeignAccess getForeignAccess();
     }
 
     /**
@@ -168,6 +230,41 @@ public interface Feature {
          * @since 19.0
          */
         void registerObjectReplacer(Function<Object, Object> replacer);
+
+        /**
+         * Register a callback that is executed when an object of type {@code clazz}, or any of its
+         * subtypes, is marked as reachable during heap scanning. The callback is executed before
+         * the object is added to the shadow heap. The callback may be executed for the same object
+         * by multiple worker threads concurrently.
+         * <p>
+         * Heap snapshot verification after analysis can scan and include an object in
+         * the image heap without marking it reachable through the analysis scanner. Consequently,
+         * this callback is not guaranteed for objects first encountered through such late
+         * verification.
+         *
+         * @since 24.2
+         */
+        <T> void registerObjectReachabilityHandler(Consumer<T> callback, Class<T> clazz);
+
+        /**
+         * Registers a method that is allowed to be executed at build time if called as the
+         * bootstrap method for an invokedynamic, in which case each call site outputted will be
+         * constant-folded. Other bootstrap methods will be executed at run time by default,
+         * creating the call site at run time.
+         *
+         * @since 25.4
+         */
+        void registerBuildTimeBootstrapIndy(Executable method);
+
+        /**
+         * Registers a method that is allowed to be executed at build time if called as the
+         * bootstrap method for a constantdynamic, in which case each call site outputted will be
+         * constant-folded. Other bootstrap methods will be executed at run time by default,
+         * creating the call site at run time.
+         *
+         * @since 25.4
+         */
+        void registerBuildTimeBootstrapCondy(Executable method);
     }
 
     /**
@@ -196,6 +293,14 @@ public interface Feature {
          * @since 19.0
          */
         void registerAsInHeap(Class<?> type);
+
+        /**
+         * Registers the provided type as allocatable without running a constructor, via
+         * Unsafe.allocateInstance or via the JNI function AllocObject.
+         *
+         * @since 24.1
+         */
+        void registerAsUnsafeAllocated(Class<?> type);
 
         /**
          * Registers the provided field as accesses, i.e., the static analysis assumes the field is
@@ -232,11 +337,24 @@ public interface Feature {
         void registerReachabilityHandler(Consumer<DuringAnalysisAccess> callback, Object... elements);
 
         /**
-         * Registers a callback that is invoked once {@link Feature#duringAnalysis during analysis}
-         * for each time a method that overrides the specified {param baseMethod} is determined to
-         * be reachable at run time. In addition the handler will also get invoked once when the
-         * {param baseMethod} itself becomes reachable. The specific method that becomes reachable
-         * is passed to the handler as the second parameter.
+         * Registers a callback that is invoked once during analysis for each time a method that
+         * overrides the specified {param baseMethod} is determined to be reachable at run time. In
+         * addition, the handler will also get invoked once when the {param baseMethod} itself
+         * becomes reachable. The specific method that becomes reachable is passed to the handler as
+         * the second parameter.
+         * <p/>
+         * A method is considered reachable at run time if it can be executed, as determined via
+         * static analysis.
+         * <p/>
+         * Therefore, if a method can be statically bound (usually, that means it is final or
+         * private or static, but not abstract, or the declaring class is final), or it is a
+         * constructors, and it is the target of a reachable invoke, or it is inlined, then it is
+         * considered run time reachable.
+         * <p/>
+         * A virtual methods is considered run time reachable if its declaring-class or any of its
+         * subtypes is instantiated and the method is the target of a reachable invoke, or it is
+         * inlined. Even if the declaring type itself is not marked as instantiated the method can
+         * still be reachable via special invokes, e.g., `super` calls.
          *
          * @since 19.3
          */
@@ -260,6 +378,14 @@ public interface Feature {
          * @since 21.0
          */
         void registerClassInitializerReachabilityHandler(Consumer<DuringAnalysisAccess> callback, Class<?> clazz);
+
+        /**
+         * Registers a field value transformer for the provided field. See the JavaDoc of
+         * {@link FieldValueTransformer} for details.
+         * 
+         * @since 22.3
+         */
+        void registerFieldValueTransformer(Field field, FieldValueTransformer transformer);
     }
 
     /**
@@ -349,7 +475,7 @@ public interface Feature {
 
     /**
      * Access methods available for {@link Feature#beforeUniverseBuilding}.
-     * 
+     *
      * @since 21.1
      */
     @Platforms(Platform.HOSTED_ONLY.class)
@@ -409,6 +535,15 @@ public interface Feature {
     }
 
     /**
+     * Access methods available for {@link Feature#beforeHeapLayout}.
+     *
+     * @since 23.2
+     */
+    @Platforms(Platform.HOSTED_ONLY.class)
+    interface BeforeHeapLayoutAccess extends CompilationAccess {
+    }
+
+    /**
      * Access methods available for {@link Feature#afterHeapLayout}.
      *
      * @since 19.0
@@ -457,12 +592,29 @@ public interface Feature {
 
     /**
      * Returns the list of features that this feature depends on. As long as the dependency chain is
-     * non-cyclic, all required features are processed before this feature.
+     * non-cyclic, all required features are processed before this feature for all lifecycle hooks
+     * after {@link #onRegistration(OnRegistrationAccess)}. The {@code onRegistration} hook is the
+     * exception: it is called as soon as a feature is registered, before its required features are
+     * processed.
      *
      * @since 19.0
      */
     default List<Class<? extends Feature>> getRequiredFeatures() {
         return Collections.emptyList();
+    }
+
+    /**
+     * Handler for initialization that must happen as soon as this feature is registered, before
+     * its required features are processed. Use this hook only for state that must be visible
+     * during feature registration. Prefer publishing dedicated support objects through
+     * {@link ImageSingletons}; publishing the feature instance itself should be reserved for
+     * compatibility with existing feature-singleton queries.
+     *
+     * @param access The supported operations that the feature can perform at this time
+     *
+     * @since 25.1.3
+     */
+    default void onRegistration(OnRegistrationAccess access) {
     }
 
     /**
@@ -535,9 +687,9 @@ public interface Feature {
     /**
      * Handler for code that needs to run before universe building, but after hosted meta-access has
      * been created.
-     * 
+     *
      * @param access The supported operations that the feature can perform at this time
-     * 
+     *
      * @since 21.1
      */
     default void beforeUniverseBuilding(BeforeUniverseBuildingAccess access) {
@@ -561,6 +713,16 @@ public interface Feature {
      * @since 19.0
      */
     default void afterCompilation(AfterCompilationAccess access) {
+    }
+
+    /**
+     * Handler for initializations before the native image heap and code layout.
+     *
+     * @param access The supported operations that the feature can perform at this time
+     *
+     * @since 23.2
+     */
+    default void beforeHeapLayout(BeforeHeapLayoutAccess access) {
     }
 
     /**

@@ -30,76 +30,84 @@ import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.function.Function;
 
-import org.graalvm.compiler.core.common.FieldIntrospection;
-import org.graalvm.compiler.core.common.Fields;
-import org.graalvm.compiler.graph.Edges;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.lir.CompositeValue;
-import org.graalvm.compiler.lir.CompositeValueClass;
-import org.graalvm.compiler.lir.LIRInstruction;
-import org.graalvm.compiler.lir.LIRInstructionClass;
-import org.graalvm.compiler.serviceprovider.GraalUnsafeAccess;
+import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.graal.pointsto.api.DefaultUnsafePartition;
-import com.oracle.svm.core.annotate.RecomputeFieldValue;
-import com.oracle.svm.core.graal.GraalEdgeUnsafePartition;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.graal.GraalSupport;
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.graal.GraalCompilerSupport;
 import com.oracle.svm.hosted.FeatureImpl.BeforeAnalysisAccessImpl;
-import com.oracle.svm.hosted.FeatureImpl.CompilationAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.DuringAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
-import com.oracle.svm.hosted.meta.HostedMetaAccess;
-import com.oracle.svm.util.UnsafePartitionKind;
+import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.JVMCIReflectionUtil;
 
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
-import sun.misc.Unsafe;
+import jdk.graal.compiler.core.common.FieldIntrospection;
+import jdk.graal.compiler.core.common.Fields;
+import jdk.graal.compiler.graph.Edges;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.lir.LIRInstruction;
+import jdk.graal.compiler.lir.LIRInstructionClass;
 
 /**
  * Graal uses unsafe memory accesses to access {@link Node}s and {@link LIRInstruction}s. The
  * offsets for these accesses are maintained in {@link Fields}, which are accessible from
  * meta-classes such as {@link NodeClass} and {@link LIRInstructionClass}. We do not want to replace
- * the whole meta-classes. Instead, we just replace the {@code long[]} arrays that hold the actual
- * offsets.
+ * the whole meta-classes. Instead, we recompute the {@code Fields.offsets} values for the Native
+ * Image object layout.
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class FieldsOffsetsFeature implements Feature {
 
-    private static final Unsafe UNSAFE = GraalUnsafeAccess.getUnsafe();
-
-    abstract static class IterationMaskRecomputation implements RecomputeFieldValue.CustomFieldValueComputer {
+    /** Recomputes the {@code Fields.offsets} value after the image field layout is available. */
+    private static final class OffsetsRecomputation implements FieldValueTransformerWithAvailability {
+        // JVMCI migration blocked by GR-72589: Migrate GraalCompilerFeature to terminus
         @Override
-        public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
-            Edges edges = getEdges((NodeClass<?>) receiver);
+        public boolean isAvailable() {
+            return BuildPhaseProvider.isReadyForCompilation();
+        }
+
+        @Override
+        public Object transform(Object receiver, Object originalValue) {
+            Fields fields = (Fields) receiver;
+            FieldsOffsetsReplacement replacement = FieldsOffsetsFeature.getReplacements().get(originalValue);
+            assert replacement != null : "All Fields instances must be registered before their offsets are accessed: " + fields;
+            assert replacement.fields == fields;
+            assert replacement.newOffsets != null : "Cannot access field offsets before they are assigned";
+            return replacement.newOffsets;
+        }
+    }
+
+    private static final class IterationMaskRecomputation implements FieldValueTransformerWithAvailability {
+        // JVMCI migration blocked by GR-72589: Migrate GraalCompilerFeature to terminus
+        @Override
+        public boolean isAvailable() {
+            return BuildPhaseProvider.isReadyForCompilation();
+        }
+
+        @Override
+        public Object transform(Object receiver, Object originalValue) {
+            Edges edges = (Edges) receiver;
             FieldsOffsetsReplacement replacement = FieldsOffsetsFeature.getReplacements().get(edges.getOffsets());
+            assert replacement != null : "All Edges instances must be registered before their iteration mask is accessed: " + edges;
             assert replacement.fields == edges;
-            assert replacement.newValuesAvailable : "Cannot access iteration mask before field offsets are assigned";
+            assert replacement.newOffsets != null : "Cannot access iteration mask before field offsets are assigned";
             return replacement.newIterationInitMask;
-        }
-
-        protected abstract Edges getEdges(NodeClass<?> nodeClass);
-    }
-
-    public static class InputsIterationMaskRecomputation extends IterationMaskRecomputation {
-        @Override
-        protected Edges getEdges(NodeClass<?> nodeClass) {
-            return nodeClass.getInputEdges();
-        }
-    }
-
-    public static class SuccessorsIterationMaskRecomputation extends IterationMaskRecomputation {
-        @Override
-        protected Edges getEdges(NodeClass<?> nodeClass) {
-            return nodeClass.getSuccessorEdges();
         }
     }
 
     static class FieldsOffsetsReplacement {
         protected final Fields fields;
-        protected boolean newValuesAvailable;
         protected long[] newOffsets;
         protected long newIterationInitMask;
 
@@ -108,9 +116,9 @@ public class FieldsOffsetsFeature implements Feature {
         }
     }
 
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
     static class FieldsOffsetsReplacements {
         protected final Map<long[], FieldsOffsetsReplacement> replacements = new IdentityHashMap<>();
-        protected boolean newValuesAvailable;
     }
 
     protected static Map<long[], FieldsOffsetsReplacement> getReplacements() {
@@ -122,54 +130,32 @@ public class FieldsOffsetsFeature implements Feature {
         DuringSetupAccessImpl access = (DuringSetupAccessImpl) a;
 
         ImageSingletons.add(FieldsOffsetsReplacements.class, new FieldsOffsetsReplacements());
-        access.registerObjectReplacer(FieldsOffsetsFeature::replaceFieldsOffsets);
+        var offsetsField = JVMCIReflectionUtil.getUniqueDeclaredField(GuestAccess.get().lookupType(Fields.class), "offsets");
+        var iterationMaskField = JVMCIReflectionUtil.getUniqueDeclaredField(GuestAccess.get().lookupType(Edges.class), "iterationMask");
+        FieldValueInterceptionSupport interceptionSupport = FieldValueInterceptionSupport.singleton();
+        interceptionSupport.registerFieldValueTransformer(offsetsField, new OffsetsRecomputation());
+        interceptionSupport.registerFieldValueTransformer(iterationMaskField, new IterationMaskRecomputation());
         access.registerClassReachabilityListener(FieldsOffsetsFeature::classReachabilityListener);
-    }
-
-    private static Object replaceFieldsOffsets(Object source) {
-        if (source instanceof Fields) {
-            /*
-             * All instances of Fields must have been registered before, otherwise we miss the
-             * substitution of its offsets array.
-             */
-            assert !ImageSingletons.lookup(FieldsOffsetsReplacements.class).newValuesAvailable || getReplacements().containsKey(((Fields) source).getOffsets()) : source;
-
-        } else if (source instanceof long[]) {
-            FieldsOffsetsReplacement replacement = getReplacements().get(source);
-            if (replacement != null) {
-                assert source == replacement.fields.getOffsets();
-
-                /*
-                 * We can only compute the new offsets after static analysis, i.e., after the object
-                 * layout is done and run-time field offsets are available. Until then, we return
-                 * the hosted offsets so that we have a return value. The actual offsets do not
-                 * matter at this point.
-                 */
-                if (replacement.newValuesAvailable) {
-                    return replacement.newOffsets;
-                }
-            }
-        }
-        return source;
     }
 
     /* Invoked once for every class that is reachable in the native image. */
     private static void classReachabilityListener(DuringAnalysisAccess a, Class<?> newlyReachableClass) {
         DuringAnalysisAccessImpl access = (DuringAnalysisAccessImpl) a;
+        if (BuildPhaseProvider.isAnalysisFinished()) {
+            throw VMError.shouldNotReachHere("New class reachable after analysis: " + newlyReachableClass);
+        }
 
         if (Node.class.isAssignableFrom(newlyReachableClass) && newlyReachableClass != Node.class) {
-            FieldsOffsetsFeature.<NodeClass<?>> registerClass(newlyReachableClass, GraalSupport.get().nodeClasses, NodeClass::get, false, access);
+            FieldsOffsetsFeature.<NodeClass<?>> registerClass(newlyReachableClass, GraalCompilerSupport.get().nodeClasses, NodeClass::get, false, access);
 
         } else if (LIRInstruction.class.isAssignableFrom(newlyReachableClass) && newlyReachableClass != LIRInstruction.class) {
-            FieldsOffsetsFeature.<LIRInstructionClass<?>> registerClass(newlyReachableClass, GraalSupport.get().instructionClasses, LIRInstructionClass::get, true, access);
+            FieldsOffsetsFeature.<LIRInstructionClass<?>> registerClass(newlyReachableClass, GraalCompilerSupport.get().instructionClasses, LIRInstructionClass::get, true, access);
 
-        } else if (CompositeValue.class.isAssignableFrom(newlyReachableClass) && newlyReachableClass != CompositeValue.class) {
-            FieldsOffsetsFeature.<CompositeValueClass<?>> registerClass(newlyReachableClass, GraalSupport.get().compositeValueClasses, CompositeValueClass::get, true, access);
         }
     }
 
-    private static <R extends FieldIntrospection<?>> void registerClass(Class<?> clazz, Map<Class<?>, R> registry, Function<Class<?>, R> lookup, boolean excludeAbstract,
-                    DuringAnalysisAccessImpl access) {
+    private static <R extends FieldIntrospection<?>> void registerClass(Class<?> clazz, EconomicMap<Class<?>, R> registry,
+                    Function<Class<?>, R> lookup, boolean excludeAbstract, DuringAnalysisAccessImpl access) {
         assert !registry.containsKey(clazz);
 
         if (!excludeAbstract || !Modifier.isAbstract(clazz.getModifiers())) {
@@ -185,69 +171,56 @@ public class FieldsOffsetsFeature implements Feature {
         if (introspection instanceof NodeClass<?>) {
             NodeClass<?> nodeClass = (NodeClass<?>) introspection;
 
+            /* The partial evaluator allocates Node classes via Unsafe. */
+            AnalysisType nodeType = config.getMetaAccess().lookupJavaType(nodeClass.getJavaClass());
+            nodeType.registerInstantiatedCallback(_ -> config.registerAsUnsafeAllocated(nodeType, false));
+
             Fields dataFields = nodeClass.getData();
-            registerFields(dataFields, DefaultUnsafePartition.get(), config);
+            registerFields(dataFields, config, "Graal node data field");
 
             Fields inputEdges = nodeClass.getInputEdges();
-            registerFields(inputEdges, GraalEdgeUnsafePartition.get(), config);
+            registerFields(inputEdges, config, "Graal node input edge");
 
             Fields successorEdges = nodeClass.getSuccessorEdges();
-            registerFields(successorEdges, GraalEdgeUnsafePartition.get(), config);
+            registerFields(successorEdges, config, "Graal node successor edge");
 
             /* Ensure field shortName is initialized, so that the instance is immutable. */
             nodeClass.shortName();
 
         } else {
             for (Fields fields : introspection.getAllFields()) {
-                registerFields(fields, DefaultUnsafePartition.get(), config);
+                registerFields(fields, config, "Graal field");
             }
         }
     }
 
-    private static void registerFields(Fields fields, UnsafePartitionKind partitionKind, BeforeAnalysisAccessImpl config) {
+    private static void registerFields(Fields fields, BeforeAnalysisAccessImpl config, Object reason) {
+        config.registerAsUsed(fields.getClass(), reason);
         getReplacements().put(fields.getOffsets(), new FieldsOffsetsReplacement(fields));
 
         for (int i = 0; i < fields.getCount(); i++) {
-            config.registerAsUnsafeAccessed(config.getMetaAccess().lookupJavaField(findField(fields, i)), partitionKind);
+            AnalysisField aField = config.getMetaAccess().lookupJavaField(findField(fields, i));
+            aField.getType().registerAsReachable(aField);
+            config.registerAsUnsafeAccessed(aField, reason);
         }
     }
 
     private static Field findField(Fields fields, int index) {
-        try {
-            return fields.getDeclaringClass(index).getDeclaredField(fields.getName(index));
-        } catch (NoSuchFieldException ex) {
-            throw VMError.shouldNotReachHere(ex);
-        }
+        return fields.getField(index);
     }
 
     @Override
     public void beforeCompilation(BeforeCompilationAccess a) {
-        CompilationAccessImpl config = (CompilationAccessImpl) a;
-        HostedMetaAccess hMetaAccess = config.getMetaAccess();
-
         for (FieldsOffsetsReplacement replacement : getReplacements().values()) {
-            Fields fields = replacement.fields;
-            long[] newOffsets = new long[fields.getCount()];
-            for (int i = 0; i < newOffsets.length; i++) {
-                Field field = findField(fields, i);
-                assert UNSAFE.objectFieldOffset(field) == fields.getOffsets()[i];
-                newOffsets[i] = hMetaAccess.lookupJavaField(field).getLocation();
-            }
-            replacement.newOffsets = newOffsets;
-
-            if (fields instanceof Edges) {
-                Edges edges = (Edges) fields;
-                replacement.newIterationInitMask = NodeClass.computeIterationMask(edges.type(), edges.getDirectCount(), newOffsets);
-            }
-
-            replacement.newValuesAvailable = true;
+            Map.Entry<long[], Long> e = replacement.fields.recomputeOffsetsAndIterationMask(a::objectFieldOffset);
+            replacement.newOffsets = e.getKey();
+            replacement.newIterationInitMask = e.getValue();
         }
-        ImageSingletons.lookup(FieldsOffsetsReplacements.class).newValuesAvailable = true;
     }
 
     @Override
     public void afterCompilation(AfterCompilationAccess access) {
-        access.registerAsImmutable(GraalSupport.get().nodeClasses.values(), o -> true);
-        access.registerAsImmutable(GraalSupport.get().instructionClasses.values(), o -> true);
+        access.registerAsImmutable(GraalCompilerSupport.get().nodeClasses.getValues(), _ -> true);
+        access.registerAsImmutable(GraalCompilerSupport.get().instructionClasses.getValues(), _ -> true);
     }
 }

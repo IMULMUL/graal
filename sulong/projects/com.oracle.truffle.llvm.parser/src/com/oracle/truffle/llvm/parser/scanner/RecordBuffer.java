@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -54,10 +54,15 @@ public final class RecordBuffer {
     }
 
     void ensureFits(long numOfAdditionalOps) {
+        assert numOfAdditionalOps >= 0;
         if (size >= opBuffer.length - numOfAdditionalOps) {
             int newLength = opBuffer.length;
             while (size >= newLength - numOfAdditionalOps) {
                 newLength *= 2;
+                if (newLength < 0) {
+                    // overflow
+                    throw new LLVMParserException("Record buffer too big!");
+                }
             }
             opBuffer = Arrays.copyOf(opBuffer, newLength);
         }
@@ -101,6 +106,28 @@ public final class RecordBuffer {
 
     public void skip() {
         index++;
+    }
+
+    public void skipConstantRange(long bitWidth) {
+        if (bitWidth > 64) {
+            long activeWords = read();
+            long lowerActiveWords = activeWords & ((1L << 32) - 1);
+            long upperActiveWords = activeWords >>> 32;
+            skip(lowerActiveWords);
+            skip(upperActiveWords);
+        } else {
+            skip(); // start
+            skip(); // end
+        }
+    }
+
+    public void skip(long nr) {
+        assert nr == (int) nr;
+        index += (int) nr;
+    }
+
+    public void setIndex(int index) {
+        this.index = index;
     }
 
     public int readInt() {

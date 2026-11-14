@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -49,15 +49,22 @@ import static org.junit.Assert.fail;
 
 import java.util.Arrays;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class ClassInteropTest extends ProxyLanguageEnvTest {
     private static final InteropLibrary INTEROP = InteropLibrary.getFactory().getUncached();
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
 
     private TruffleObject obj;
     private XYPlus xyp;
@@ -100,7 +107,7 @@ public class ClassInteropTest extends ProxyLanguageEnvTest {
     public void canReadValueAfterCreatingNewInstance() throws Exception {
         Object objInst = INTEROP.instantiate(obj);
         assertTrue("It is truffle object", objInst instanceof TruffleObject);
-        XYPlus inst = asJavaObject(XYPlus.class, (TruffleObject) objInst);
+        XYPlus inst = asJavaObject(XYPlus.class, objInst);
         assertEquals("Field read", 42, inst.value());
     }
 
@@ -114,7 +121,7 @@ public class ClassInteropTest extends ProxyLanguageEnvTest {
     public void canAccessStaticMemberTypes() throws InteropException {
         Object res = INTEROP.readMember(obj, "XYPlus");
         assertTrue("It is truffle object", res instanceof TruffleObject);
-        Class<?> c = asJavaObject(Class.class, (TruffleObject) res);
+        Class<?> c = asJavaObject(Class.class, res);
         assertSame(XYPlus.class, c);
     }
 
@@ -125,7 +132,7 @@ public class ClassInteropTest extends ProxyLanguageEnvTest {
         TruffleObject truffleType = (TruffleObject) type;
         Object objInst = INTEROP.instantiate(truffleType, 22);
         assertTrue("Created instance is a truffle object", objInst instanceof TruffleObject);
-        Object res = asJavaObject(Object.class, (TruffleObject) objInst);
+        Object res = asJavaObject(Object.class, objInst);
         assertTrue("Instance is of correct type", res instanceof Zed);
         assertEquals("Constructor was invoked", 22, ((Zed) res).val);
     }
@@ -134,7 +141,7 @@ public class ClassInteropTest extends ProxyLanguageEnvTest {
     public void canListStaticTypes() throws InteropException {
         Object type = INTEROP.getMembers(obj);
         assertTrue("Type is a truffle object", type instanceof TruffleObject);
-        String[] names = asJavaObject(String[].class, (TruffleObject) type);
+        String[] names = asJavaObject(String[].class, type);
         int zed = 0;
         int xy = 0;
         int eman = 0;
@@ -179,7 +186,7 @@ public class ClassInteropTest extends ProxyLanguageEnvTest {
 
         Object type = INTEROP.getMembers(obj);
         assertTrue("Type is a truffle object", type instanceof TruffleObject);
-        String[] names = asJavaObject(String[].class, (TruffleObject) type);
+        String[] names = asJavaObject(String[].class, type);
         assertEquals("Non-public member type not enumerated", -1, Arrays.asList(names).indexOf("NonStaticInterface"));
 
         INTEROP.readMember(obj, "NonStaticInterface");

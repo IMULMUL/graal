@@ -24,10 +24,9 @@
  */
 package com.oracle.svm.core.util;
 
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.compiler.core.common.util.UnsafeArrayTypeReader;
-
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.SubstrateTarget;
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.core.common.util.UnsafeArrayTypeReader;
 
 /**
  * Provides low-level read access to a byte[] array for signed and unsigned values of size 1, 2, 4,
@@ -65,6 +64,6 @@ public class ByteArrayReader {
 
     @Fold
     public static boolean supportsUnalignedMemoryAccess() {
-        return ConfigurationValues.getTarget().arch.supportsUnalignedMemoryAccess();
+        return SubstrateTarget.getArchitecture().supportsUnalignedMemoryAccess();
     }
 }

@@ -24,23 +24,24 @@
  */
 package com.oracle.svm.core.posix.headers;
 
-import com.oracle.svm.core.posix.linux.libc.GLibC;
-import com.oracle.svm.core.c.libc.LibC;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.CContext;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.function.CFunction.Transition;
 import org.graalvm.nativeimage.c.function.CLibrary;
 import org.graalvm.nativeimage.c.struct.CField;
 import org.graalvm.nativeimage.c.struct.CPointerTo;
 import org.graalvm.nativeimage.c.struct.CStruct;
-import org.graalvm.nativeimage.c.struct.CTypedefOfInfo;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.WordBase;
+
+import com.oracle.svm.core.c.libc.GLibC;
+import com.oracle.svm.core.c.libc.LibCSpecific;
 
 // Checkstyle: stop
 
@@ -78,6 +79,19 @@ public class Dlfcn {
     @CFunction
     public static native CCharPointer dlerror();
 
+    @CContext(PosixDirectives.class)
+    @CLibrary("dl")
+    public static class NoTransitions {
+        /**
+         * Only use this variant from code that must remain fully uninterruptible, such as early
+         * startup code before Java thread state is available. All ordinary runtime symbol lookups
+         * must use {@link Dlfcn#dlsym(PointerBase, CCharPointer)} because dlsym can block on the
+         * dynamic loader lock.
+         */
+        @CFunction(value = "dlsym", transition = Transition.NO_TRANSITION)
+        public static native <T extends PointerBase> T dlsym(PointerBase handle, CCharPointer name);
+    }
+
     @CStruct
     public interface Dl_info extends PointerBase {
         @CField
@@ -99,13 +113,12 @@ public class Dlfcn {
     @Platforms(Platform.LINUX.class)
     @CContext(PosixDirectives.class)
     @CLibrary("dl")
-    @LibC(GLibC.class)
+    @LibCSpecific(GLibC.class)
     public static class GNUExtensions {
 
         public interface Lmid_t extends SignedWord {
         }
 
-        @CTypedefOfInfo("long int")
         @CPointerTo(nameOfCType = "Lmid_t")
         public interface Lmid_tPointer extends PointerBase {
             Lmid_t read();

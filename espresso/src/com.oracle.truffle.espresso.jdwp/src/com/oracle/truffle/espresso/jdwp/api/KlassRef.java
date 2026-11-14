@@ -67,7 +67,7 @@ public interface KlassRef {
      * 
      * @return array of MethodRef
      */
-    MethodRef[] getDeclaredMethodRefs();
+    MethodRef[] getDeclaredMethods();
 
     /**
      * Returns a guest-language representation of the classloader for which loaded the class.
@@ -147,12 +147,13 @@ public interface KlassRef {
     int getModifiers();
 
     /**
-     * Returns the array klass for this klass with the given dimensions.
+     * Returns the array klass for this klass with the given dimensions iff the array type was
+     * loaded.
      *
      * @param dimensions array dimension
      * @return array klass
      */
-    KlassRef getArrayClass(int dimensions);
+    KlassRef getArrayClassNoCreate(int dimensions);
 
     /**
      * Returns the major version of the corresponding class file for this klass.
@@ -181,4 +182,11 @@ public interface KlassRef {
      * @return the extension
      */
     String getSourceDebugExtension();
+
+    /**
+     * Returns the Module reference of the class.
+     *
+     * @return the module reference
+     */
+    ModuleRef module();
 }

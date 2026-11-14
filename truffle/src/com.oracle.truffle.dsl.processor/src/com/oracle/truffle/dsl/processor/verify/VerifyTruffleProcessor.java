@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -71,6 +71,8 @@ import com.oracle.truffle.dsl.processor.java.ElementUtils;
 
 @SupportedAnnotationTypes({
                 TruffleTypes.CompilerDirectives_TruffleBoundary_Name,
+                TruffleTypes.CompilerDirectives_EarlyInline_Name,
+                TruffleTypes.CompilerDirectives_EarlyEscapeAnalysis_Name,
                 TruffleTypes.Node_Child_Name,
                 TruffleTypes.Node_Children_Name})
 public class VerifyTruffleProcessor extends AbstractProcessor {
@@ -125,13 +127,13 @@ public class VerifyTruffleProcessor extends AbstractProcessor {
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
         if (roundEnv.processingOver()) {
-            return false;
+            return true;
         }
 
-        ProcessorContext context = ProcessorContext.enter(processingEnv);
-        try {
+        try (ProcessorContext context = ProcessorContext.enter(processingEnv)) {
             TruffleTypes types = context.getTypes();
             TypeElement virtualFrameType = ElementUtils.castTypeElement(types.VirtualFrame);
+            TypeElement frameType = ElementUtils.castTypeElement(types.Frame);
 
             for (Element element : roundEnv.getElementsAnnotatedWith(ElementUtils.castTypeElement(types.CompilerDirectives_TruffleBoundary))) {
                 scope = element;
@@ -144,10 +146,12 @@ public class VerifyTruffleProcessor extends AbstractProcessor {
 
                     for (VariableElement parameter : method.getParameters()) {
                         Element paramType = processingEnv.getTypeUtils().asElement(parameter.asType());
-                        if (paramType != null && paramType.equals(virtualFrameType)) {
-                            errorMessage(element, "Method %s cannot be annotated with @%s and have a parameter of type %s", method.getSimpleName(),
-                                            types.CompilerDirectives_TruffleBoundary.asElement().getSimpleName().toString(),
-                                            paramType.getSimpleName());
+                        if (paramType != null && (paramType.equals(virtualFrameType) || paramType.equals(frameType))) {
+                            CharSequence truffleBoundarySimpleName = types.CompilerDirectives_TruffleBoundary.asElement().getSimpleName();
+                            errorMessage(element, "Method %s cannot be annotated with @%s and have a parameter of type %s.%n" +
+                                            "To resolve this, either change the parameter to a %s, remove the parameter or remove the @%s.", method.getSimpleName(),
+                                            truffleBoundarySimpleName, paramType.getSimpleName(), types.MaterializedFrame.asElement().getSimpleName(),
+                                            truffleBoundarySimpleName);
                         }
                     }
                 } catch (Throwable t) {
@@ -159,6 +163,7 @@ public class VerifyTruffleProcessor extends AbstractProcessor {
 
             TypeElement nodeType = ElementUtils.castTypeElement(types.Node);
             TypeElement nodeInterfaceType = ElementUtils.castTypeElement(types.NodeInterface);
+
             for (Element e : roundEnv.getElementsAnnotatedWith(ElementUtils.castTypeElement(types.Node_Child))) {
                 if (e.getModifiers().contains(Modifier.FINAL)) {
                     emitError("@Child field cannot be final", e);
@@ -188,7 +193,7 @@ public class VerifyTruffleProcessor extends AbstractProcessor {
                     reportError = true;
                 }
                 if (reportError) {
-                    emitError("@Children field must be an array of NodeInerface sub-types", annotatedField);
+                    emitError("@Children field must be an array of NodeInterface sub-types", annotatedField);
                     continue;
                 }
                 if (!processingEnv.getTypeUtils().isSubtype(annotatedField.getEnclosingElement().asType(), nodeType.asType())) {
@@ -199,18 +204,73 @@ public class VerifyTruffleProcessor extends AbstractProcessor {
                     assertNoErrorExpected(annotatedField);
                 }
             }
-            return false;
-        } finally {
-            ProcessorContext.leave();
+
+            for (Element element : roundEnv.getElementsAnnotatedWith(ElementUtils.castTypeElement(types.DenyReplace))) {
+                try {
+                    if (element.getKind() != ElementKind.CLASS) {
+                        continue;
+                    }
+                    TypeElement type = (TypeElement) element;
+
+                    if (!type.getModifiers().contains(Modifier.FINAL)) {
+                        emitError(String.format("@%s may only be used for final classes.", ElementUtils.getSimpleName(types.DenyReplace)), type);
+                        continue;
+                    }
+
+                } catch (Throwable t) {
+                    reportException(isBug367599(t) ? Kind.NOTE : Kind.ERROR, element, t);
+                }
+            }
+
+            for (Element element : roundEnv.getElementsAnnotatedWith(ElementUtils.castTypeElement(types.CompilerDirectives_EarlyInline))) {
+                if (!element.getKind().isExecutable()) {
+                    continue;
+                }
+
+                checkExclusivity(element, types.CompilerDirectives_EarlyInline, types.CompilerDirectives_TruffleBoundary,
+                                " Early inlined methods must be partial evaluatable and therefore cannot be boundary methods.");
+
+                checkExclusivity(element, types.CompilerDirectives_EarlyInline, types.CompilerDirectives_EarlyEscapeAnalysis,
+                                " If early escape analysis methods would get early inlined, the annotation would no longer have any effect.");
+
+                checkExclusivity(element, types.CompilerDirectives_EarlyInline, types.ExplodeLoop,
+                                " If exploded methods would get early inlined, the explode loop annotation would no longer have any effect. " +
+                                                "To resolve this it is typically necessary to extract another method.");
+
+                if (!ElementUtils.isFinal((ExecutableElement) element)) {
+                    emitError(String.format(
+                                    "Methods annotated with @%s cannot be overridable. " +
+                                                    "All calls to early inline methods must be resolvable as direct calls. " + //
+                                                    "Make them private, static or final to resolve this problem.",
+                                    ElementUtils.getSimpleName(types.CompilerDirectives_EarlyInline)), element);
+                }
+
+            }
+
+            for (Element element : roundEnv.getElementsAnnotatedWith(ElementUtils.castTypeElement(types.CompilerDirectives_EarlyEscapeAnalysis))) {
+                checkExclusivity(element, types.CompilerDirectives_EarlyEscapeAnalysis, types.CompilerDirectives_TruffleBoundary,
+                                " Early escape analysed methods must be partial evaluatable and therefore cannot be boundary methods.");
+
+            }
+
+            return true;
+        }
+    }
+
+    private void checkExclusivity(Element element, TypeMirror annotationType, TypeMirror otherAnnotationType, String hint) {
+        if (ElementUtils.findAnnotationMirror(element, annotationType) != null && ElementUtils.findAnnotationMirror(element, otherAnnotationType) != null) {
+            emitError(String.format("@%s and @%s are mutually exclusive and cannot be used on the same element.%s", ElementUtils.getSimpleName(annotationType),
+                            ElementUtils.getSimpleName(otherAnnotationType), hint), element);
+            return;
         }
     }
 
     void assertNoErrorExpected(Element element) {
-        ExpectError.assertNoErrorExpected(processingEnv, element);
+        ExpectError.assertNoErrorExpected(element);
     }
 
     void emitError(String message, Element element) {
-        if (ExpectError.isExpectedError(processingEnv, element, message)) {
+        if (ExpectError.isExpectedError(element, message)) {
             return;
         }
         processingEnv.getMessager().printMessage(Kind.ERROR, message, element);

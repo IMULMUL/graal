@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,8 +41,10 @@
 package org.graalvm.nativeimage.impl;
 
 import java.nio.file.Path;
+import java.util.Map;
 
 import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
+import org.graalvm.word.PointerBase;
 
 public interface ProcessPropertiesSupport {
     String getExecutableName();
@@ -53,9 +55,14 @@ public interface ProcessPropertiesSupport {
 
     String getObjectFile(String symbol);
 
-    String getObjectFile(CEntryPointLiteral<?> symbol);
+    default String getObjectFile(CEntryPointLiteral<?> symbol) {
+        return getObjectFile(symbol.getFunctionPointer());
+    }
 
-    String setLocale(String category, String locale);
+    @SuppressWarnings("unused")
+    default String getObjectFile(PointerBase symbolAddress) {
+        return null;
+    }
 
     boolean destroy(long processID);
 
@@ -66,6 +73,8 @@ public interface ProcessPropertiesSupport {
     int waitForProcessExit(long processID);
 
     void exec(Path executable, String[] args);
+
+    void exec(Path executable, String[] args, Map<String, String> env);
 
     int getArgumentVectorBlockSize();
 

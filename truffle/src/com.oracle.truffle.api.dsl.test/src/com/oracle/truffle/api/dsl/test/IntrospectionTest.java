@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.api.dsl.test;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -58,11 +59,13 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.dsl.TypeSystem;
 import com.oracle.truffle.api.dsl.TypeSystemReference;
 import com.oracle.truffle.api.dsl.UnsupportedSpecializationException;
+import com.oracle.truffle.api.dsl.test.IntrospectionTestFactory.ArrayCachedNodeGen;
 import com.oracle.truffle.api.dsl.test.IntrospectionTestFactory.FallbackNodeGen;
 import com.oracle.truffle.api.dsl.test.IntrospectionTestFactory.Introspection1NodeGen;
 import com.oracle.truffle.api.dsl.test.IntrospectionTestFactory.TrivialNodeGen;
 import com.oracle.truffle.api.nodes.Node;
 
+@SuppressWarnings("truffle")
 public class IntrospectionTest {
 
     @TypeSystem
@@ -78,7 +81,6 @@ public class IntrospectionTest {
 
     @SuppressWarnings("unused")
     @TypeSystemReference(IntrospectionTypeSystem.class)
-    // BEGIN: com.oracle.truffle.api.dsl.test.IntrospectionTest
     @Introspectable
     abstract static class NegateNode extends Node {
 
@@ -116,7 +118,6 @@ public class IntrospectionTest {
         info = Introspection.getSpecialization(node, "doGeneric");
         assertEquals(1, info.getInstances());
     }
-    // END: com.oracle.truffle.api.dsl.test.IntrospectionTest
 
     public abstract static class Introspection1Node extends ReflectableNode {
 
@@ -248,6 +249,33 @@ public class IntrospectionTest {
         assertFalse(specialization.isExcluded());
         assertEquals(1, specialization.getInstances());
         assertEquals(0, specialization.getCachedData(0).size());
+    }
+
+    public abstract static class ArrayCachedNode extends ReflectableNode {
+
+        abstract Object execute(Object o);
+
+        @Specialization
+        protected static int doInt(int o, @Cached(value = "createArray(o)", dimensions = 1) Object[] cachedArray) {
+            return (int) cachedArray[0] + o;
+        }
+
+        static Object[] createArray(int o) {
+            return new Object[]{o, o};
+        }
+    }
+
+    @Test
+    public void testArrayCacheReflection() {
+        ArrayCachedNode node = ArrayCachedNodeGen.create();
+        node.execute(21);
+
+        SpecializationInfo specialization = Introspection.getSpecialization(node, "doInt");
+        assertEquals(1, specialization.getInstances());
+
+        List<Object> cachedData = specialization.getCachedData(0);
+        assertEquals(1, cachedData.size());
+        assertArrayEquals(new Object[]{21, 21}, (Object[]) cachedData.get(0));
     }
 
     @Test

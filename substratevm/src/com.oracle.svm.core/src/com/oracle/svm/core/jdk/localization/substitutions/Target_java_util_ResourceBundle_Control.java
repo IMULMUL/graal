@@ -24,13 +24,30 @@
  */
 package com.oracle.svm.core.jdk.localization.substitutions;
 
-import com.oracle.svm.core.annotate.Substitute;
-import com.oracle.svm.core.annotate.TargetClass;
-
+import java.io.IOException;
+import java.util.List;
 import java.util.Locale;
 import java.util.ResourceBundle;
+import java.util.concurrent.ConcurrentHashMap;
 
-@TargetClass(value = java.util.ResourceBundle.class, innerClass = "Control")
+import com.oracle.svm.core.annotate.Alias;
+import com.oracle.svm.core.annotate.RecomputeFieldValue;
+import com.oracle.svm.core.annotate.Substitute;
+import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.jdk.localization.BundleContentSubstitutedLocalizationSupport;
+
+import jdk.internal.util.ReferencedKeyMap;
+import sun.util.locale.BaseLocale;
+import sun.util.resources.Bundles;
+
+/**
+ * In the no-runtime-class-loading mode, resource bundles are limited to the classes and resources
+ * already included in the image. Runtime class loading keeps the JDK implementation so classes
+ * loaded after image build can use the standard runtime lookup path.
+ */
+@TargetClass(value = java.util.ResourceBundle.class, innerClass = "Control", onlyWith = RuntimeClassLoading.NoRuntimeClassLoading.class)
 @SuppressWarnings({"unused", "static-method"})
 final class Target_java_util_ResourceBundle_Control {
 
@@ -45,4 +62,47 @@ final class Target_java_util_ResourceBundle_Control {
 
         return false;
     }
+
+    @Substitute
+    public ResourceBundle newBundle(String baseName, Locale locale, String format, ClassLoader loader, boolean reload)
+                    throws IllegalAccessException, InstantiationException, IOException {
+        /*
+         * Legacy mechanism to locate resource bundle in unnamed module only that is visible to the
+         * given loader and accessible to the given caller.
+         */
+        String bundleName = toBundleName(baseName, locale);
+        if (format.equals("java.class") && BundleContentSubstitutedLocalizationSupport.isNotIncluded(bundleName)) {
+            return null;
+        }
+        var bundle = newBundle0(bundleName, format, loader, reload);
+        if (bundle == null) {
+            // Try loading legacy ISO language's other bundles
+            var otherBundleName = Bundles.toOtherBundleName(baseName, bundleName, locale);
+            if (!bundleName.equals(otherBundleName)) {
+                bundle = newBundle0(otherBundleName, format, loader, reload);
+            }
+        }
+
+        return bundle;
+    }
+
+    @Alias
+    public native String toBundleName(String baseName, Locale locale);
+
+    @Alias
+    private native ResourceBundle newBundle0(String bundleName, String format, ClassLoader loader, boolean reload)
+                    throws IllegalAccessException, InstantiationException, IOException;
+}
+
+@TargetClass(value = java.util.ResourceBundle.class, innerClass = "Control")
+@SuppressWarnings("unused")
+final class Target_java_util_ResourceBundle_Control_Cache {
+
+    /*
+     * This cache only memoizes candidate locale lists derived by Control.createCandidateList().
+     * That computation is pure and fully reconstructible from the BaseLocale key, so a fresh cache
+     * preserves the default JDK behavior while avoiding analysis-time cache rescans.
+     */
+    @Alias @TargetElement(name = "CANDIDATES_CACHE") @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FromAlias, isFinal = true)//
+    private static ReferencedKeyMap<BaseLocale, List<Locale>> candidatesCache = ReferencedKeyMap.create(true, ConcurrentHashMap::new);
 }

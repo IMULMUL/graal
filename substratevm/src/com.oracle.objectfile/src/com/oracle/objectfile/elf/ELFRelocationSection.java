@@ -30,10 +30,8 @@ import static java.lang.Math.toIntExact;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.EnumSet;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Function;
 
@@ -51,6 +49,7 @@ import com.oracle.objectfile.elf.ELFObjectFile.ELFSectionFlag;
 import com.oracle.objectfile.elf.ELFObjectFile.SectionType;
 import com.oracle.objectfile.io.AssemblyBuffer;
 import com.oracle.objectfile.io.OutputAssembler;
+import org.graalvm.collections.EconomicSet;
 
 public class ELFRelocationSection extends ELFSection {
 
@@ -107,6 +106,19 @@ public class ELFRelocationSection extends ELFSection {
     }
 
     interface ELFRelocationMethod extends RelocationMethod {
+
+        /*
+         * For now, ELF relocations are always using explicit addends. This can change in the
+         * future.
+         */
+
+        default boolean canUseImplicitAddend() {
+            return false;
+        }
+
+        default boolean canUseExplicitAddend() {
+            return true;
+        }
 
         long toLong();
     }
@@ -172,24 +184,24 @@ public class ELFRelocationSection extends ELFSection {
         }
     }
 
-    public Entry addEntry(ELFSection s, long offset, ELFRelocationMethod t, ELFSymtab.Entry sym, Long explicitAddend) {
-        if (explicitAddend != null) {
+    void addEntry(ELFSection s, long offset, ELFRelocationMethod t, ELFSymtab.Entry sym, long addend) {
+        if (ELFObjectFile.useExplicitAddend(addend)) {
             if (!t.canUseExplicitAddend()) {
-                throw new IllegalArgumentException("cannot use relocation method " + t + " with explicit addends");
+                throw new IllegalArgumentException("Cannot use relocation method " + t + " with explicit addends");
             }
             if (!withExplicitAddends) {
-                throw new IllegalStateException("cannot create relocation with addend in .rel section");
+                throw new IllegalStateException("Cannot create relocation with addend in .rel section");
             }
         } else {
+            // use implicit addend
             if (!t.canUseImplicitAddend()) {
-                throw new IllegalArgumentException("cannot use relocation method " + t + " with implicit addends");
+                throw new IllegalArgumentException("Cannot use relocation method " + t + " with implicit addends");
             }
             if (withExplicitAddends) {
-                throw new IllegalStateException("cannot create relocation without addend in .rela section");
+                throw new IllegalStateException("Cannot create relocation without addend in .rela section");
             }
         }
-        long addend = (explicitAddend != null) ? explicitAddend : 0L;
-        return entries.computeIfAbsent(new Entry(s, offset, t, sym, addend), Function.identity());
+        entries.computeIfAbsent(new Entry(s, offset, t, sym, addend), Function.identity());
     }
 
     public boolean isDynamic() {
@@ -214,7 +226,7 @@ public class ELFRelocationSection extends ELFSection {
     @Override
     public Iterable<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
         /* We use minimal deps because our size doesn't depend on our bytewise content. */
-        HashSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
+        EconomicSet<BuildDependency> deps = ObjectFile.minimalDependencies(decisions, this);
         /*
          * Our content depends on the content of our symtab. WHY? it's only the abstract content,
          * not the physical content. Try removing this one.
@@ -234,7 +246,7 @@ public class ELFRelocationSection extends ELFSection {
         }
 
         if (isDynamic()) {
-            Set<ELFSection> referenced = new HashSet<>();
+            EconomicSet<ELFSection> referenced = EconomicSet.create();
             for (Entry ent : entries.keySet()) {
                 referenced.add(ent.section);
             }

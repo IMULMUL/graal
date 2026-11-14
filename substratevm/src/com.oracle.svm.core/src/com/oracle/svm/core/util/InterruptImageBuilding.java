@@ -24,14 +24,19 @@
  */
 package com.oracle.svm.core.util;
 
+import org.graalvm.nativeimage.Platform;
+import org.graalvm.nativeimage.Platforms;
+
 import java.util.Optional;
 
 /**
  * Used to report valid interruption of compilation.
  */
+@Platforms(Platform.HOSTED_ONLY.class)
 public class InterruptImageBuilding extends RuntimeException {
     static final long serialVersionUID = 754312906378380L;
     private final boolean hasMessage;
+    private final ExitStatus exitStatus;
 
     /**
      * Print an error message upon exit.
@@ -39,8 +44,13 @@ public class InterruptImageBuilding extends RuntimeException {
      * @param message reason for interruption.
      */
     public InterruptImageBuilding(String message) {
+        this(null, message);
+    }
+
+    public InterruptImageBuilding(ExitStatus exitStatus, String message) {
         super(message);
         this.hasMessage = true;
+        this.exitStatus = exitStatus;
     }
 
     /**
@@ -52,6 +62,7 @@ public class InterruptImageBuilding extends RuntimeException {
     public InterruptImageBuilding(Throwable cause) {
         super(cause);
         this.hasMessage = cause != null && cause.getMessage() != null;
+        this.exitStatus = null;
     }
 
     /**
@@ -63,5 +74,9 @@ public class InterruptImageBuilding extends RuntimeException {
 
     public Optional<String> getReason() {
         return hasMessage ? Optional.of(getMessage()) : Optional.empty();
+    }
+
+    public Optional<ExitStatus> getExitStatus() {
+        return Optional.ofNullable(exitStatus);
     }
 }

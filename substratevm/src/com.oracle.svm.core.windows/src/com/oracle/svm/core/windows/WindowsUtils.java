@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,34 +24,39 @@
  */
 package com.oracle.svm.core.windows;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 import static com.oracle.svm.core.annotate.RecomputeFieldValue.Kind.Custom;
+import static com.oracle.svm.core.windows.headers.WinBase.INVALID_HANDLE_VALUE;
 
 import java.io.FileDescriptor;
-import java.io.IOException;
 
-import org.graalvm.nativeimage.PinnedObject;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
+import org.graalvm.nativeimage.c.struct.CPointerTo;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.CLongPointer;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
+import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
-import com.oracle.svm.core.annotate.RecomputeFieldValue.CustomFieldValueComputer;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.handles.PrimitiveArrayView;
+import com.oracle.svm.shared.util.BasedOnJDKFile;
 import com.oracle.svm.core.windows.headers.FileAPI;
+import com.oracle.svm.core.windows.headers.LibLoaderAPI;
 import com.oracle.svm.core.windows.headers.WinBase;
+import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
+import com.oracle.svm.core.windows.headers.WinBase.HMODULE;
+import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
 
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
-
-@Platforms(Platform.WINDOWS.class)
 public class WindowsUtils {
 
     @TargetClass(className = "java.lang.ProcessImpl")
@@ -61,15 +66,15 @@ public class WindowsUtils {
 
     public static int getpid(java.lang.Process process) {
         Target_java_lang_ProcessImpl processImpl = SubstrateUtil.cast(process, Target_java_lang_ProcessImpl.class);
-        return com.oracle.svm.core.windows.headers.Process.GetProcessId(WordFactory.pointer(processImpl.handle));
+        return com.oracle.svm.core.windows.headers.Process.NoTransitions.GetProcessId(Word.pointer(processImpl.handle));
     }
 
     @TargetClass(java.io.FileDescriptor.class)
     private static final class Target_java_io_FileDescriptor {
         /** Invalidates the standard FileDescriptors, which are allowed in the image heap. */
-        static class InvalidHandleValueComputer implements CustomFieldValueComputer {
+        static class InvalidHandleValueComputer implements FieldValueTransformer {
             @Override
-            public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+            public Object transform(Object receiver, Object originalValue) {
                 return -1L;
             }
         }
@@ -78,12 +83,8 @@ public class WindowsUtils {
         long handle;
     }
 
-    static void setHandle(FileDescriptor descriptor, long handle) {
-        SubstrateUtil.cast(descriptor, Target_java_io_FileDescriptor.class).handle = handle;
-    }
-
-    static boolean outOfBounds(int off, int len, byte[] array) {
-        return off < 0 || len < 0 || array.length - off < len;
+    static void setHandle(FileDescriptor descriptor, HANDLE handle) {
+        SubstrateUtil.cast(descriptor, Target_java_io_FileDescriptor.class).handle = handle.rawValue();
     }
 
     /** Return the error string for the last error, or a default message. */
@@ -96,24 +97,23 @@ public class WindowsUtils {
      * Low-level output of bytes already in native memory. This method is allocation free, so that
      * it can be used, e.g., in low-level logging routines.
      */
-    public static boolean writeBytes(int handle, CCharPointer bytes, UnsignedWord length) {
+    public static boolean write(HANDLE handle, CCharPointer bytes, UnsignedWord length) {
+        if (handle == INVALID_HANDLE_VALUE()) {
+            return false;
+        }
+
         CCharPointer curBuf = bytes;
         UnsignedWord curLen = length;
         while (curLen.notEqual(0)) {
-            if (handle == -1) {
-                return false;
-            }
-
-            CIntPointer bytesWritten = StackValue.get(CIntPointer.class);
-
-            int ret = FileAPI.WriteFile(handle, curBuf, curLen, bytesWritten, WordFactory.nullPointer());
-
+            int writeSize = bytesToTransfer(curLen);
+            CIntPointer bytesWritten = UnsafeStackValue.get(CIntPointer.class);
+            int ret = FileAPI.WriteFile(handle, curBuf, writeSize, bytesWritten, Word.nullPointer());
             if (ret == 0) {
                 return false;
             }
 
             int writtenCount = bytesWritten.read();
-            if (curLen.notEqual(writtenCount)) {
+            if (writtenCount <= 0 || writtenCount > writeSize) {
                 return false;
             }
 
@@ -123,63 +123,174 @@ public class WindowsUtils {
         return true;
     }
 
-    static boolean flush(int handle) {
-        if (handle == -1) {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean writeUninterruptibly(HANDLE handle, CCharPointer bytes, UnsignedWord length) {
+        if (handle == INVALID_HANDLE_VALUE()) {
             return false;
         }
-        int result = FileAPI.FlushFileBuffers(handle);
-        return (result != 0);
-    }
 
-    @SuppressWarnings("unused")
-    static void writeBytes(FileDescriptor descriptor, byte[] bytes, int off, int len, boolean append) throws IOException {
-        if (bytes == null) {
-            throw new NullPointerException();
-        } else if (WindowsUtils.outOfBounds(off, len, bytes)) {
-            throw new IndexOutOfBoundsException();
-        }
-        if (len == 0) {
-            return;
-        }
-
-        try (PinnedObject bytesPin = PinnedObject.create(bytes)) {
-            CCharPointer curBuf = bytesPin.addressOfArrayElement(off);
-            UnsignedWord curLen = WordFactory.unsigned(len);
-            /** Temp fix until we complete FileDescriptor substitutions. */
-            int handle = FileAPI.GetStdHandle(FileAPI.STD_ERROR_HANDLE());
-
-            CIntPointer bytesWritten = StackValue.get(CIntPointer.class);
-
-            int ret = FileAPI.WriteFile(handle, curBuf, curLen, bytesWritten, WordFactory.nullPointer());
-
+        CCharPointer curBuf = bytes;
+        UnsignedWord curLen = length;
+        while (curLen.notEqual(0)) {
+            int writeSize = bytesToTransfer(curLen);
+            CIntPointer bytesWritten = UnsafeStackValue.get(CIntPointer.class);
+            int ret = FileAPI.NoTransition.WriteFile(handle, curBuf, writeSize, bytesWritten, Word.nullPointer());
             if (ret == 0) {
-                throw new IOException(lastErrorString("Write error"));
+                return false;
             }
 
             int writtenCount = bytesWritten.read();
-            if (curLen.notEqual(writtenCount)) {
-                throw new IOException(lastErrorString("Write error"));
+            if (writtenCount <= 0 || writtenCount > writeSize) {
+                return false;
             }
+
+            curBuf = curBuf.addressOf(writtenCount);
+            curLen = curLen.subtract(writtenCount);
         }
+        return true;
     }
 
-    private static long performanceFrequency = 0L;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long readUninterruptibly(HANDLE handle, CCharPointer buffer, UnsignedWord length) {
+        if (handle == INVALID_HANDLE_VALUE()) {
+            return -1;
+        }
+
+        CIntPointer bytesRead = UnsafeStackValue.get(CIntPointer.class);
+        if (FileAPI.NoTransition.ReadFile(handle, buffer, bytesToTransfer(length), bytesRead, Word.nullPointer()) == 0) {
+            return -1;
+        }
+        return bytesRead.read();
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    private static int bytesToTransfer(UnsignedWord length) {
+        return length.aboveThan(Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) length.rawValue();
+    }
+
+    static boolean flush(HANDLE handle) {
+        if (handle == INVALID_HANDLE_VALUE()) {
+            return false;
+        }
+        return FileAPI.FlushFileBuffers(handle) != 0;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean flushUninterruptibly(HANDLE handle) {
+        if (handle == INVALID_HANDLE_VALUE()) {
+            return false;
+        }
+        return FileAPI.NoTransition.FlushFileBuffers(handle) != 0;
+    }
+
+    private static double nanosPerCount = 0L;
     public static final long NANOSECS_PER_SEC = 1000000000L;
     public static final int NANOSECS_PER_MILLISEC = 1000000;
 
     /** Retrieve a nanosecond counter for elapsed time measurement. */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23+26/src/hotspot/os/windows/os_windows.cpp#L1089-L1096")
+    @BasedOnJDKFile("https://github.com/graalvm/labs-openjdk/blob/jdk-23+26/src/hotspot/os/windows/os_windows.cpp#L1194-L1200")
     public static long getNanoCounter() {
-        if (performanceFrequency == 0L) {
-            CLongPointer count = StackValue.get(CLongPointer.class);
-            WinBase.QueryPerformanceFrequency(count);
-            performanceFrequency = count.read();
+        CLongPointer count = StackValue.get(CLongPointer.class);
+        if (nanosPerCount == 0d) {
+            int code = WinBase.QueryPerformanceFrequency(count);
+            assert code != 0 : "QueryPerformanceFrequency failed.";
+            long performanceFrequency = count.read();
+            nanosPerCount = NANOSECS_PER_SEC / (double) performanceFrequency;
         }
 
-        CLongPointer currentCount = StackValue.get(CLongPointer.class);
-        WinBase.QueryPerformanceCounter(currentCount);
-        double current = currentCount.read();
-        double freq = performanceFrequency;
-        return (long) ((current / freq) * NANOSECS_PER_SEC);
+        int code = WinBase.QueryPerformanceCounter(count);
+        assert code != 0 : "QueryPerformanceCounter failed.";
+        double current = count.read();
+        return (long) (current * nanosPerCount);
+    }
+
+    /** Sentinel value denoting the uninitialized kernel handle. */
+    public static final PointerBase UNINITIALIZED_HANDLE = Word.pointer(1);
+
+    @CPointerTo(nameOfCType = "void*")
+    interface CFunctionPointerPointer<T extends CFunctionPointer> extends PointerBase {
+        T read();
+
+        void write(T value);
+    }
+
+    /** Sentinel value denoting the uninitialized pointer. */
+    static final PointerBase UNINITIALIZED_POINTER = Word.pointer(0xBAD);
+
+    /**
+     * Retrieves and caches the address of an exported function from an already loaded DLL if the
+     * cached function pointer is {@linkplain #UNINITIALIZED_POINTER uninitialized}, otherwise it
+     * returns the cached value.
+     */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    static <T extends CFunctionPointer> T getAndCacheFunctionPointer(CFunctionPointerPointer<T> cachedFunctionPointer,
+                    CCharPointer dllName, CCharPointer functionName) {
+        T functionPointer = cachedFunctionPointer.read();
+        if (functionPointer.equal(UNINITIALIZED_POINTER)) {
+            functionPointer = getFunctionPointer(dllName, functionName, false);
+            cachedFunctionPointer.write(functionPointer);
+        }
+        return functionPointer;
+    }
+
+    /** Retrieves the address of an exported function from an already loaded DLL. */
+    @SuppressWarnings("unchecked")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    static <T extends CFunctionPointer> T getFunctionPointer(CCharPointer dllName, CCharPointer functionName, boolean failOnError) {
+        PointerBase functionPointer = LibLoaderAPI.GetProcAddress(getDLLHandle(dllName), functionName);
+        if (functionPointer.isNull() && failOnError) {
+            CEntryPointActions.failFatally(WinBase.GetLastError(), functionName);
+        }
+        return (T) functionPointer;
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private static HMODULE getDLLHandle(CCharPointer dllName) {
+        HMODULE dllHandle = LibLoaderAPI.GetModuleHandleA(dllName);
+        if (dllHandle.isNull()) {
+            CEntryPointActions.failFatally(WinBase.GetLastError(), dllName);
+        }
+        return dllHandle;
+    }
+
+    /**
+     * Returns a holder that exposes a {@linkplain WCharPointer WCharPointer} to a null-terminated
+     * wide C string created from the given Java String.
+     */
+    public static WCharPointerHolder toWideCString(String javaString) {
+        assert javaString != null;
+        return new WCharPointerHolder(javaString);
+    }
+
+    /**
+     * Holder for a null-terminated wide C string. The exposed {@linkplain WCharPointer
+     * WCharPointer} remains valid only while this holder is open.
+     */
+    public static final class WCharPointerHolder implements AutoCloseable {
+        private final PrimitiveArrayView wideCString;
+
+        private WCharPointerHolder(String javaString) {
+            /*
+             * Windows wide C strings use UTF-16LE, matching Java char[]. So we add a trailing NUL
+             * and then reinterpret the Java char[] as a wchar_t[].
+             */
+            int length = javaString.length();
+            char[] chars = new char[length + 1]; // trailing NUL
+            javaString.getChars(0, length, chars, 0);
+            wideCString = PrimitiveArrayView.createForReading(chars);
+        }
+
+        /** Returns the pointer to the null-terminated wide C string. */
+        public WCharPointer get() {
+            return wideCString.addressOfArrayElement(0);
+        }
+
+        /** Invalidates the pointer. */
+        @Override
+        public void close() {
+            wideCString.close();
+        }
     }
 }

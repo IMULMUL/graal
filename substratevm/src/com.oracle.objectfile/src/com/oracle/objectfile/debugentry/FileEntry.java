@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2020, 2020, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -26,32 +26,15 @@
 
 package com.oracle.objectfile.debugentry;
 
-import java.nio.file.Path;
-
 /**
  * Tracks debug info associated with a Java source file.
+ *
+ * @param fileName The name of the associated file excluding path elements.
+ * @param dirEntry The directory entry associated with this file entry.
  */
-public class FileEntry {
-    private String fileName;
-    private DirEntry dirEntry;
-    private Path cachePath;
-
-    public FileEntry(String fileName, DirEntry dirEntry, Path cachePath) {
-        this.fileName = fileName;
-        this.dirEntry = dirEntry;
-        this.cachePath = cachePath;
-    }
-
-    /**
-     * The name of the associated file excluding path elements.
-     */
-    public String getFileName() {
-        return fileName;
-    }
+public record FileEntry(String fileName, DirEntry dirEntry) {
 
     public String getPathName() {
-        @SuppressWarnings("hiding")
-        DirEntry dirEntry = getDirEntry();
         if (dirEntry == null) {
             return "";
         } else {
@@ -63,29 +46,15 @@ public class FileEntry {
         if (dirEntry == null) {
             return fileName;
         } else {
-            return dirEntry.getPath().resolve(getFileName()).toString();
+            return dirEntry.path().resolve(fileName).toString();
         }
-    }
-
-    /**
-     * The directory entry associated with this file entry.
-     */
-    public DirEntry getDirEntry() {
-        return dirEntry;
-    }
-
-    /**
-     * The compilation directory in which to look for source files as a {@link String}.
-     */
-    public Path getCachePath() {
-        return cachePath;
     }
 
     @Override
     public String toString() {
-        if (getDirEntry() == null) {
-            return getFileName() == null ? "-" : getFileName();
-        } else if (getFileName() == null) {
+        if (dirEntry == null) {
+            return fileName == null ? "-" : fileName;
+        } else if (fileName == null) {
             return "--";
         }
         return String.format("FileEntry(%s)", getFullName());

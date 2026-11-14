@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -64,26 +64,6 @@ public interface ExecutionEventListener {
     void onEnter(EventContext context, VirtualFrame frame);
 
     /**
-     * Invoked immediately after each return value event of child nodes that match the
-     * {@link Instrumenter#attachExecutionEventListener(SourceSectionFilter, SourceSectionFilter, ExecutionEventListener)
-     * input filter}. Event listeners cannot save input values for later events. If that is required
-     * attach an event node factory instead.
-     *
-     * @param context indicating the current location in the guest language AST
-     * @param frame the current frame in use
-     * @param inputContext the event context of the input child node
-     * @param inputIndex the child index of the input
-     * @param inputValue the return value of the input child
-     * @since 0.30
-     * @deprecated in 20.0. input value notifications are not functional for
-     *             {@link ExecutionEventListener listeners}. Use {@link ExecutionEventNodeFactory
-     *             event node factories} instead.
-     */
-    @Deprecated
-    default void onInputValue(EventContext context, VirtualFrame frame, EventContext inputContext, int inputIndex, Object inputValue) {
-    }
-
-    /**
      * Invoked immediately after an {@link EventContext#getInstrumentedNode() instrumented node} is
      * successfully executed. The order in which multiple event listeners are notified matches the
      * order they are
@@ -133,5 +113,34 @@ public interface ExecutionEventListener {
      */
     default Object onUnwind(EventContext context, VirtualFrame frame, Object info) {
         return null;
+    }
+
+    /**
+     * Invoked on a yield of the current thread. A yield interrupts the current execution, which is
+     * {@link #onResume(EventContext, VirtualFrame) resumed} later on. Delegates to
+     * {@link #onReturnValue(EventContext, VirtualFrame, Object)} by default.
+     *
+     * @param context indicating the current location in the guest language AST
+     * @param frame the frame that was used for executing instrumented node
+     * @since 24.0
+     */
+    default void onYield(EventContext context, VirtualFrame frame, Object value) {
+        onReturnValue(context, frame, value);
+    }
+
+    /**
+     * Invoked on a resume of the execution on the current thread after a
+     * {@link #onYield(EventContext, VirtualFrame, Object) yield}. Delegates to
+     * {@link #onEnter(EventContext, VirtualFrame)} by default.
+     * <p>
+     * Use {@link TruffleInstrument.Env#isSameFrame(RootNode, Frame, Frame)} to match the
+     * interrupted and resumed execution.
+     *
+     * @param context indicating the current location in the guest language AST
+     * @param frame the frame that was used for executing instrumented node
+     * @since 24.0
+     */
+    default void onResume(EventContext context, VirtualFrame frame) {
+        onEnter(context, frame);
     }
 }

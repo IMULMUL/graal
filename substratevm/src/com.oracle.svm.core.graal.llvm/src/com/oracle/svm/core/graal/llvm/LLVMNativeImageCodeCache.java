@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,8 +24,15 @@
  */
 package com.oracle.svm.core.graal.llvm;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmAddTextSectionSymbols;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCleanupRISCVAttributes;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCleanupStackMaps;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmCompile;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmLink;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.llvmOptimize;
+import static com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.nativeLink;
 import static com.oracle.svm.hosted.image.NativeImage.RWDATA_CGLOBALS_PARTITION_OFFSET;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereUnexpectedInput;
 
 import java.io.FileOutputStream;
 import java.io.FileWriter;
@@ -34,51 +41,49 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ForkJoinPool;
-import java.util.function.Function;
-import java.util.function.IntFunction;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import org.graalvm.compiler.code.CompilationResult;
-import org.graalvm.compiler.core.common.NumUtil;
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.debug.GraalError;
-import org.graalvm.compiler.debug.Indent;
+import org.graalvm.collections.Pair;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.util.CompletionExecutor;
-import com.oracle.graal.pointsto.util.CompletionExecutor.DebugContextRunnable;
-import com.oracle.graal.pointsto.util.Timer;
 import com.oracle.graal.pointsto.util.Timer.StopTimer;
+import com.oracle.graal.pointsto.util.TimerCollection;
+import com.oracle.objectfile.LayoutDecisionMap;
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.objectfile.ObjectFile.Element;
 import com.oracle.objectfile.SectionName;
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.graal.code.CGlobalDataReference;
+import com.oracle.svm.core.Isolates;
+import com.oracle.svm.core.graal.code.CGlobalDataDirectReference;
+import com.oracle.svm.core.graal.code.CGlobalDataInfo;
+import com.oracle.svm.core.graal.llvm.LLVMToolchainUtils.BatchExecutor;
+import com.oracle.svm.core.graal.llvm.objectfile.LLVMObjectFile;
 import com.oracle.svm.core.graal.llvm.util.LLVMObjectFileReader;
 import com.oracle.svm.core.graal.llvm.util.LLVMObjectFileReader.LLVMTextSectionInfo;
 import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
 import com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo;
-import com.oracle.svm.core.graal.llvm.util.LLVMTargetSpecific;
-import com.oracle.svm.core.graal.llvm.util.LLVMToolchain;
-import com.oracle.svm.core.graal.llvm.util.LLVMToolchain.RunFailureException;
 import com.oracle.svm.core.heap.SubstrateReferenceMap;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicInteger;
+import com.oracle.svm.guest.staging.c.CGlobalDataImpl;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicInteger;
+import com.oracle.svm.hosted.NativeImageOptions;
+import com.oracle.svm.hosted.image.NativeImage;
 import com.oracle.svm.hosted.image.NativeImage.NativeTextSectionImpl;
 import com.oracle.svm.hosted.image.NativeImageCodeCache;
 import com.oracle.svm.hosted.image.NativeImageHeap;
 import com.oracle.svm.hosted.image.RelocatableBuffer;
 import com.oracle.svm.hosted.meta.HostedMethod;
-import com.oracle.svm.hosted.meta.MethodPointer;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.code.CompilationResult;
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.GraalError;
+import jdk.graal.compiler.debug.Indent;
 import jdk.vm.ci.code.site.Call;
 import jdk.vm.ci.code.site.DataPatch;
 import jdk.vm.ci.code.site.DataSectionReference;
@@ -108,39 +113,49 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
     @Override
     public int getCodeCacheSize() {
-        return 0;
+        return getCodeAreaSize();
+    }
+
+    @Override
+    public boolean definesTextSectionBoundarySymbols() {
+        return false;
+    }
+
+    @Override
+    public int codeSizeFor(HostedMethod method) {
+        return compilationResultFor(method).getTargetCodeSize();
     }
 
     @Override
     @SuppressWarnings({"unused", "try"})
-    public void layoutMethods(DebugContext debug, String imageName, BigBang bb, ForkJoinPool threadPool) {
+    public void layoutMethods(DebugContext debug, BigBang bb) {
         try (Indent indent = debug.logAndIndent("layout methods")) {
-            BatchExecutor executor = new BatchExecutor(bb, threadPool);
-            try (StopTimer t = new Timer(imageName, "(bitcode)").start()) {
+            BatchExecutor executor = new BatchExecutor(debug, bb);
+            try (StopTimer t = TimerCollection.createTimerAndStart("(bitcode)")) {
                 writeBitcode(executor);
             }
             int numBatches;
-            try (StopTimer t = new Timer(imageName, "(prelink)").start()) {
+            try (StopTimer t = TimerCollection.createTimerAndStart("(prelink)")) {
                 numBatches = createBitcodeBatches(executor, debug);
             }
-            try (StopTimer t = new Timer(imageName, "(llvm)").start()) {
+            try (StopTimer t = TimerCollection.createTimerAndStart("(llvm)")) {
                 compileBitcodeBatches(executor, debug, numBatches);
             }
-            try (StopTimer t = new Timer(imageName, "(postlink)").start()) {
-                linkCompiledBatches(executor, debug, numBatches);
+            try (StopTimer t = TimerCollection.createTimerAndStart("(postlink)")) {
+                linkCompiledBatches(debug, executor, numBatches);
             }
         }
     }
 
     private void writeBitcode(BatchExecutor executor) {
-        methodIndex = new HostedMethod[compilations.size()];
+        methodIndex = new HostedMethod[getOrderedCompilations().size()];
         AtomicInteger num = new AtomicInteger(-1);
-        executor.forEach(compilations.entrySet(), entry -> (debugContext) -> {
+        executor.forEach(getOrderedCompilations(), pair -> _ -> {
             int id = num.incrementAndGet();
-            methodIndex[id] = entry.getKey();
+            methodIndex[id] = pair.getLeft();
 
             try (FileOutputStream fos = new FileOutputStream(getBitcodePath(id).toString())) {
-                fos.write(entry.getValue().getTargetCode());
+                fos.write(pair.getRight().getTargetCode());
             } catch (IOException e) {
                 throw new GraalError(e);
             }
@@ -149,7 +164,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
     private int createBitcodeBatches(BatchExecutor executor, DebugContext debug) {
         batchSize = LLVMOptions.LLVMMaxFunctionsPerBatch.getValue();
-        int numThreads = executor.executor.getExecutorService().getParallelism();
+        int numThreads = NativeImageOptions.getActualNumberOfThreads();
         int idealSize = NumUtil.divideAndRoundUp(methodIndex.length, numThreads);
         if (idealSize < batchSize) {
             batchSize = idealSize;
@@ -163,10 +178,10 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
             /* Avoid empty batches with small batch sizes */
             numBatches -= (numBatches * batchSize - methodIndex.length) / batchSize;
 
-            executor.forEach(numBatches, batchId -> (debugContext) -> {
+            executor.forEach(numBatches, batchId -> _ -> {
                 List<String> batchInputs = IntStream.range(getBatchStart(batchId), getBatchEnd(batchId)).mapToObj(this::getBitcodeFilename)
                                 .collect(Collectors.toList());
-                llvmLink(debug, getBatchBitcodeFilename(batchId), batchInputs);
+                llvmLink(debug, getBatchBitcodeFilename(batchId), batchInputs, basePath, this::getFunctionName);
             });
         }
 
@@ -176,127 +191,50 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
     private void compileBitcodeBatches(BatchExecutor executor, DebugContext debug, int numBatches) {
         stackMapDumper.startDumpingFunctions();
 
-        executor.forEach(numBatches, batchId -> (debugContext) -> {
-            llvmOptimize(debug, getBatchOptimizedFilename(batchId), getBatchBitcodeFilename(batchId));
-            llvmCompile(debug, getBatchCompiledFilename(batchId), getBatchOptimizedFilename(batchId));
+        executor.forEach(numBatches, batchId -> _ -> {
+            llvmOptimize(debug, getBatchOptimizedFilename(batchId), getBatchBitcodeFilename(batchId), basePath, this::getFunctionName);
+            llvmCompile(debug, getBatchCompiledFilename(batchId), getBatchOptimizedFilename(batchId), basePath, this::getFunctionName);
 
             LLVMStackMapInfo stackMap = objectFileReader.parseStackMap(getBatchCompiledPath(batchId));
-            IntStream.range(getBatchStart(batchId), getBatchEnd(batchId)).forEach(id -> objectFileReader.readStackMap(stackMap, compilations.get(methodIndex[id]), methodIndex[id], id));
+            IntStream.range(getBatchStart(batchId), getBatchEnd(batchId)).forEach(id -> objectFileReader.readStackMap(stackMap, compilationResultFor(methodIndex[id]), methodIndex[id], id));
         });
     }
 
-    private void linkCompiledBatches(BatchExecutor executor, DebugContext debug, int numBatches) {
+    private void linkCompiledBatches(DebugContext debug, BatchExecutor executor, int numBatches) {
         List<String> compiledBatches = IntStream.range(0, numBatches).mapToObj(this::getBatchCompiledFilename).collect(Collectors.toList());
-        nativeLink(debug, getLinkedFilename(), compiledBatches);
+        nativeLink(debug, getLinkedFilename(), compiledBatches, basePath, this::getFunctionName);
 
         LLVMTextSectionInfo textSectionInfo = objectFileReader.parseCode(getLinkedPath());
 
-        executor.forEach(compilations.entrySet(), entry -> (debugContext) -> {
-            HostedMethod method = entry.getKey();
-            int offset = textSectionInfo.getOffset(SubstrateUtil.uniqueShortName(method));
-            int nextFunctionStartOffset = textSectionInfo.getNextOffset(offset);
+        List<Pair<HostedMethod, CompilationResult>> orderedCompilations = getOrderedCompilations();
+        executor.forEach(orderedCompilations, pair -> _ -> {
+            HostedMethod method = pair.getLeft();
+            method.setCodeAddressOffset(textSectionInfo.getOffset(method.getUniqueShortName()));
+        });
+        orderedCompilations.sort(Comparator.comparingInt(o -> o.getLeft().getCodeAddressOffset()));
+
+        executor.forEach(orderedCompilations.size(), i -> _ -> {
+            var pair = orderedCompilations.get(i);
+            HostedMethod method = pair.getLeft();
+            CompilationResult compilation = pair.getRight();
+            int offset = method.getCodeAddressOffset();
+            HostedMethod nextMethod = i + 1 == orderedCompilations.size() ? null : orderedCompilations.get(i + 1).getLeft();
+            int nextFunctionStartOffset = nextMethod == null ? NumUtil.safeToInt(textSectionInfo.getCodeSize()) : nextMethod.getCodeAddressOffset();
+            VMError.guarantee(offset < nextFunctionStartOffset, "Methods %s and %s have the same offset: %d", method, nextMethod == null ? "end of section" : nextMethod, offset);
             int functionSize = nextFunctionStartOffset - offset;
 
-            CompilationResult compilation = entry.getValue();
             compilation.setTargetCode(null, functionSize);
-            method.setCodeAddressOffset(offset);
         });
 
-        compilations.forEach((method, compilation) -> compilationsByStart.put(method.getCodeAddressOffset(), compilation));
         stackMapDumper.dumpOffsets(textSectionInfo);
         stackMapDumper.close();
 
-        HostedMethod firstMethod = (HostedMethod) getFirstCompilation().getMethods()[0];
-        buildRuntimeMetadata(MethodPointer.factory(firstMethod), WordFactory.signed(textSectionInfo.getCodeSize()));
-    }
-
-    private void llvmOptimize(DebugContext debug, String outputPath, String inputPath) {
-        List<String> args = new ArrayList<>();
-        if (LLVMOptions.BitcodeOptimizations.getValue()) {
-            /*
-             * This runs LLVM's bitcode optimizations in addition to the Graal optimizations.
-             * Inlining has to be disabled in this case as the functions are already stored in the
-             * image heap and inlining them would produce bogus runtime information for garbage
-             * collection and exception handling.
-             */
-            args.add("-disable-inlining");
-            args.add("-O2");
-        } else {
-            /*
-             * Mem2reg has to be run before rewriting statepoints as it promotes allocas, which are
-             * not supported for statepoints.
-             */
-            args.add("-mem2reg");
-        }
-        args.add("-rewrite-statepoints-for-gc");
-        args.add("-always-inline");
-
-        args.add("-o");
-        args.add(outputPath);
-        args.add(inputPath);
-
-        try {
-            LLVMToolchain.runLLVMCommand("opt", basePath, args);
-        } catch (RunFailureException e) {
-            debug.log("%s", e.getOutput());
-            throw new GraalError("LLVM optimization failed for " + getFunctionName(inputPath) + ": " + e.getStatus() + "\nCommand: opt " + String.join(" ", args));
-        }
-    }
-
-    private void llvmCompile(DebugContext debug, String outputPath, String inputPath) {
-        List<String> args = new ArrayList<>();
-        args.add("-relocation-model=pic");
-        /*
-         * Makes sure that unreachable instructions get emitted into the machine code. This prevents
-         * a situation where a call is the last instruction of a function, resulting in its return
-         * address being located in the next function, which causes trouble with runtime information
-         * emission.
-         */
-        args.add("--trap-unreachable");
-        args.add("-march=" + LLVMTargetSpecific.get().getLLVMArchName());
-        args.addAll(LLVMTargetSpecific.get().getLLCAdditionalOptions());
-        args.add("-O" + SubstrateOptions.Optimize.getValue());
-        args.add("-filetype=obj");
-        args.add("-o");
-        args.add(outputPath);
-        args.add(inputPath);
-
-        try {
-            LLVMToolchain.runLLVMCommand("llc", basePath, args);
-        } catch (RunFailureException e) {
-            debug.log("%s", e.getOutput());
-            throw new GraalError("LLVM compilation failed for " + getFunctionName(inputPath) + ": " + e.getStatus() + "\nCommand: llc " + String.join(" ", args));
-        }
-    }
-
-    private void llvmLink(DebugContext debug, String outputPath, List<String> inputPaths) {
-        List<String> args = new ArrayList<>();
-        args.add("-o");
-        args.add(outputPath);
-        args.addAll(inputPaths);
-
-        try {
-            LLVMToolchain.runLLVMCommand("llvm-link", basePath, args);
-        } catch (RunFailureException e) {
-            debug.log("%s", e.getOutput());
-            throw new GraalError("LLVM linking failed into " + getFunctionName(outputPath) + ": " + e.getStatus());
-        }
-    }
-
-    private void nativeLink(DebugContext debug, String outputPath, List<String> inputPaths) {
-        List<String> cmd = new ArrayList<>();
-        cmd.add((LLVMOptions.CustomLD.hasBeenSet()) ? LLVMOptions.CustomLD.getValue() : "ld");
-        cmd.add("-r");
-        cmd.add("-o");
-        cmd.add(outputPath);
-        cmd.addAll(inputPaths);
-
-        try {
-            LLVMToolchain.runCommand(basePath, cmd);
-        } catch (RunFailureException e) {
-            debug.log("%s", e.getOutput());
-            throw new GraalError("Native linking failed into " + getFunctionName(outputPath) + ": " + e.getStatus());
-        }
+        llvmCleanupStackMaps(debug, getLinkedFilename(), basePath);
+        long codeAreaSize = textSectionInfo.getCodeSize();
+        assert codeAreaSize <= Integer.MAX_VALUE;
+        llvmCleanupRISCVAttributes(debug, getLinkedFilename(), basePath);
+        llvmAddTextSectionSymbols(debug, getLinkedFilename(), NativeImage.getTextSectionStartSymbol(), NativeImage.getTextSectionEndSymbol(), codeAreaSize, basePath);
+        setCodeAreaSize((int) textSectionInfo.getCodeSize());
     }
 
     private Path getBitcodePath(int id) {
@@ -359,30 +297,29 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
                     function = "batch " + id + " (f" + getBatchStart(id) + "-f" + getBatchEnd(id) + "). Use -H:LLVMMaxFunctionsPerBatch=1 to compile each method individually.";
                     break;
                 default:
-                    throw shouldNotReachHere();
+                    throw shouldNotReachHereUnexpectedInput(type);
             }
         }
-        return function + " (" + basePath.resolve(fileName).toString() + ")";
+        return function + " (" + basePath.resolve(fileName) + ")";
     }
 
     @Override
-    public void patchMethods(DebugContext debug, RelocatableBuffer relocs, ObjectFile objectFile) {
+    public void patchMethods(DebugContext debug, RelocatableBuffer codeBuffer, ObjectFile objectFile) {
         Element rodataSection = objectFile.elementForName(SectionName.RODATA.getFormatDependentName(objectFile.getFormat()));
-        Element dataSection = objectFile.elementForName(SectionName.DATA.getFormatDependentName(objectFile.getFormat()));
-        for (CompilationResult result : getCompilations().values()) {
+        Element rwdataSection = objectFile.elementForName(SectionName.DATA.getFormatDependentName(objectFile.getFormat()));
+        for (Pair<HostedMethod, CompilationResult> pair : getOrderedCompilations()) {
+            CompilationResult result = pair.getRight();
             for (DataPatch dataPatch : result.getDataPatches()) {
-                if (dataPatch.reference instanceof CGlobalDataReference) {
-                    CGlobalDataReference reference = (CGlobalDataReference) dataPatch.reference;
-
-                    if (reference.getDataInfo().isSymbolReference()) {
-                        objectFile.createUndefinedSymbol(reference.getDataInfo().getData().symbolName, 0, true);
+                if (dataPatch.reference instanceof CGlobalDataDirectReference ref) {
+                    CGlobalDataInfo info = ref.getDataInfo();
+                    CGlobalDataImpl<?> data = info.getData();
+                    if (info.isSymbolReference() && !isImageHeapSymbol(data.symbolName) && objectFile.getOrCreateSymbolTable().getSymbol(data.symbolName) == null) {
+                        objectFile.createUndefinedSymbol(data.symbolName, true);
                     }
 
-                    int offset = reference.getDataInfo().getOffset();
-
                     String symbolName = (String) dataPatch.note;
-                    if (reference.getDataInfo().getData().symbolName == null && objectFile.getOrCreateSymbolTable().getSymbol(symbolName) == null) {
-                        objectFile.createDefinedSymbol(symbolName, dataSection, offset + RWDATA_CGLOBALS_PARTITION_OFFSET, 0, false, true);
+                    if (data.symbolName == null && objectFile.getOrCreateSymbolTable().getSymbol(symbolName) == null) {
+                        objectFile.createDefinedSymbol(symbolName, rwdataSection, info.getOffset() + RWDATA_CGLOBALS_PARTITION_OFFSET, 0, false, true, true);
                     }
                 } else if (dataPatch.reference instanceof DataSectionReference) {
                     DataSectionReference reference = (DataSectionReference) dataPatch.reference;
@@ -391,22 +328,53 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
                     String symbolName = (String) dataPatch.note;
                     if (objectFile.getOrCreateSymbolTable().getSymbol(symbolName) == null) {
-                        objectFile.createDefinedSymbol(symbolName, rodataSection, offset, 0, false, true);
+                        objectFile.createDefinedSymbol(symbolName, rodataSection, offset, 0, false, true, true);
                     }
                 }
             }
         }
     }
 
+    private static boolean isImageHeapSymbol(String symbolName) {
+        return symbolName.equals(Isolates.IMAGE_HEAP_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_RELOCATABLE_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_RELOCATABLE_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_A_RELOCATABLE_POINTER_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_END_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_PATCHED_BEGIN_SYMBOL_NAME) ||
+                        symbolName.equals(Isolates.IMAGE_HEAP_WRITABLE_PATCHED_END_SYMBOL_NAME);
+    }
+
     @Override
     public NativeTextSectionImpl getTextSectionImpl(RelocatableBuffer buffer, ObjectFile objectFile, NativeImageCodeCache codeCache) {
         return new NativeTextSectionImpl(buffer, objectFile, codeCache) {
             @Override
-            protected void defineMethodSymbol(String name, boolean global, Element section, HostedMethod method, CompilationResult result) {
-                ObjectFile.Symbol symbol = objectFile.createUndefinedSymbol(name, 0, true);
+            protected void defineMethodSymbol(String name, boolean global, boolean exported, Element section, HostedMethod method, CompilationResult result) {
+                ObjectFile.Symbol symbol = objectFile.createUndefinedSymbol(name, true);
                 if (global) {
                     globalSymbols.add(symbol);
                 }
+            }
+
+            /*
+             * The real text content is linked from llvm.o. Keep this section present while building
+             * the image object, but do not emit a second zero-filled text section into that object.
+             */
+            @Override
+            public int getOrDecideSize(Map<Element, LayoutDecisionMap> alreadyDecided, int sizeHint) {
+                return 0;
+            }
+
+            @Override
+            public byte[] getOrDecideContent(Map<Element, LayoutDecisionMap> alreadyDecided, byte[] contentHint) {
+                return new byte[0];
+            }
+
+            @Override
+            public int getMemSize(Map<Element, LayoutDecisionMap> alreadyDecided) {
+                return 0;
             }
         };
     }
@@ -418,52 +386,22 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
 
     @Override
     public Path[] getCCInputFiles(Path tempDirectory, String imageName) {
-        Path[] nativeImageFiles = super.getCCInputFiles(tempDirectory, imageName);
-        Path[] allInputFiles = Arrays.copyOf(nativeImageFiles, nativeImageFiles.length + 1);
-
+        Path[] allInputFiles;
+        if (LLVMOptions.UseLLVMDataSection.getValue()) {
+            allInputFiles = new Path[2];
+            allInputFiles[0] = basePath.resolve(LLVMObjectFile.getLinkedFilename());
+        } else {
+            Path[] nativeImageFiles = super.getCCInputFiles(tempDirectory, imageName);
+            allInputFiles = Arrays.copyOf(nativeImageFiles, nativeImageFiles.length + 1);
+        }
         Path bitcodeFileName = getLinkedPath();
-        allInputFiles[nativeImageFiles.length] = bitcodeFileName;
+        allInputFiles[allInputFiles.length - 1] = bitcodeFileName;
         return allInputFiles;
     }
 
     @Override
-    public List<ObjectFile.Symbol> getSymbols(ObjectFile objectFile, boolean onlyGlobal) {
+    public List<ObjectFile.Symbol> getSymbols(ObjectFile objectFile) {
         return globalSymbols;
-    }
-
-    private static final class BatchExecutor {
-        private CompletionExecutor executor;
-
-        private BatchExecutor(BigBang bb, ForkJoinPool threadPool) {
-            this.executor = new CompletionExecutor(bb, threadPool, bb.getHeartbeatCallback());
-            executor.init();
-        }
-
-        private void forEach(int num, IntFunction<DebugContextRunnable> callback) {
-            try {
-                executor.start();
-                for (int i = 0; i < num; ++i) {
-                    executor.execute(callback.apply(i));
-                }
-                executor.complete();
-                executor.init();
-            } catch (InterruptedException e) {
-                throw new GraalError(e);
-            }
-        }
-
-        private <T> void forEach(Set<T> set, Function<T, DebugContextRunnable> callback) {
-            try {
-                executor.start();
-                for (T elem : set) {
-                    executor.execute(callback.apply(elem));
-                }
-                executor.complete();
-                executor.init();
-            } catch (InterruptedException e) {
-                throw new GraalError(e);
-            }
-        }
     }
 
     private StackMapDumper getStackMapDumper(boolean enable) {
@@ -488,7 +426,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
         void close();
     }
 
-    private class EnabledStackMapDumper implements StackMapDumper {
+    private final class EnabledStackMapDumper implements StackMapDumper {
         private final FileWriter stackMapDump;
 
         {
@@ -499,18 +437,25 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
             }
         }
 
-        private ThreadLocal<StringBuilder> functionDump = new ThreadLocal<>();
+        private final ThreadLocal<StringBuilder> functionDump = new ThreadLocal<>();
 
         @Override
         public void dumpOffsets(LLVMTextSectionInfo textSectionInfo) {
             dump("\nOffsets\n=======\n");
-            textSectionInfo.forEachOffsetRange((startOffset, endOffset) -> {
-                CompilationResult compilationResult = compilationsByStart.get(startOffset);
-                assert startOffset + compilationResult.getTargetCodeSize() == endOffset : compilationResult.getName();
+            List<Pair<HostedMethod, CompilationResult>> orderedCompilations = getOrderedCompilations();
+            for (int i = 0; i < orderedCompilations.size(); ++i) {
+                var pair = orderedCompilations.get(i);
+                int startOffset = pair.getLeft().getCodeAddressOffset();
+                CompilationResult compilationResult = pair.getRight();
+                assert i == 0 || checkPreviousFunctionEnd(orderedCompilations.get(i - 1), startOffset) : orderedCompilations.get(i - 1).getRight().getName();
 
                 String methodName = textSectionInfo.getSymbol(startOffset);
                 dump("[" + startOffset + "] " + methodName + " (" + compilationResult.getTargetCodeSize() + ")\n");
-            });
+            }
+        }
+
+        private static boolean checkPreviousFunctionEnd(Pair<HostedMethod, CompilationResult> previousPair, int startOffset) {
+            return previousPair.getLeft().getCodeAddressOffset() + previousPair.getRight().getTargetCodeSize() == startOffset;
         }
 
         @Override
@@ -567,7 +512,7 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
         }
     }
 
-    private static class DisabledStackMapDumper implements StackMapDumper {
+    private static final class DisabledStackMapDumper implements StackMapDumper {
         @Override
         public void dumpOffsets(LLVMTextSectionInfo textSectionInfo) {
         }

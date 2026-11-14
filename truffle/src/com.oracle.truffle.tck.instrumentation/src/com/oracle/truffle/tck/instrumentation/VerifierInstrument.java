@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -50,8 +50,6 @@ import org.junit.Assert;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.frame.FrameSlot;
-import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.instrumentation.EventBinding;
@@ -90,9 +88,6 @@ public class VerifierInstrument extends TruffleInstrument implements InlineVerif
     protected void onCreate(Env instrumentEnv) {
         this.env = instrumentEnv;
         instrumentEnv.registerService(this);
-        instrumentEnv.getInstrumenter().attachExecutionEventListener(
-                        SourceSectionFilter.newBuilder().tagIs(RootTag.class).build(),
-                        new RootFrameChecker());
         instrumentEnv.getInstrumenter().attachExecutionEventListener(
                         SourceSectionFilter.newBuilder().tagIs(RootTag.class).build(),
                         new NodePropertyChecker());
@@ -161,7 +156,7 @@ public class VerifierInstrument extends TruffleInstrument implements InlineVerif
         }
 
         private boolean canRunAt(com.oracle.truffle.api.source.SourceSection ss) {
-            SourceSection section = TruffleTCKAccessor.instrumentAccess().createSourceSection(env, null, ss);
+            SourceSection section = (SourceSection) TruffleTCKAccessor.instrumentAccess().createPolyglotSourceSection(env, null, ss);
             return predicate.test(section);
         }
 
@@ -222,7 +217,7 @@ public class VerifierInstrument extends TruffleInstrument implements InlineVerif
 
             @TruffleBoundary
             private void verify(final Throwable exception) {
-                final PolyglotException pe = VerifierInstrument.TruffleTCKAccessor.engineAccess().wrapGuestException(snippet.getLanguage(), exception);
+                final PolyglotException pe = (PolyglotException) VerifierInstrument.TruffleTCKAccessor.engineAccess().wrapGuestException(snippet.getLanguage(), exception);
                 resultVerifier.verify(pe);
             }
 
@@ -233,7 +228,7 @@ public class VerifierInstrument extends TruffleInstrument implements InlineVerif
         }
     }
 
-    private static class NodePropertyChecker implements ExecutionEventListener {
+    private static final class NodePropertyChecker implements ExecutionEventListener {
 
         public void onEnter(EventContext context, VirtualFrame frame) {
             Node instrumentedNode = context.getInstrumentedNode();
@@ -255,46 +250,7 @@ public class VerifierInstrument extends TruffleInstrument implements InlineVerif
         }
     }
 
-    private static class RootFrameChecker implements ExecutionEventListener {
-
-        @Override
-        public void onEnter(EventContext context, VirtualFrame frame) {
-            checkFrameIsEmpty(context, frame.materialize());
-        }
-
-        @TruffleBoundary
-        private static void checkFrameIsEmpty(EventContext context, MaterializedFrame frame) {
-            Node node = context.getInstrumentedNode();
-            if (!hasParentRootTag(node) &&
-                            node.getRootNode().getFrameDescriptor() == frame.getFrameDescriptor()) {
-                Object defaultValue = frame.getFrameDescriptor().getDefaultValue();
-                for (FrameSlot slot : frame.getFrameDescriptor().getSlots()) {
-                    Assert.assertEquals("Top-most nodes tagged with RootTag should have clean frames.", defaultValue, frame.getValue(slot));
-                }
-            }
-        }
-
-        private static boolean hasParentRootTag(Node node) {
-            Node parent = node.getParent();
-            if (parent == null) {
-                return false;
-            }
-            if (parent instanceof InstrumentableNode && ((InstrumentableNode) parent).hasTag(RootTag.class)) {
-                return true;
-            }
-            return hasParentRootTag(parent);
-        }
-
-        @Override
-        public void onReturnValue(EventContext context, VirtualFrame frame, Object result) {
-        }
-
-        @Override
-        public void onReturnExceptional(EventContext context, VirtualFrame frame, Throwable exception) {
-        }
-    }
-
-    private static class LibraryChecker implements ExecutionEventNodeFactory {
+    private static final class LibraryChecker implements ExecutionEventNodeFactory {
 
         @Override
         public ExecutionEventNode create(EventContext context) {

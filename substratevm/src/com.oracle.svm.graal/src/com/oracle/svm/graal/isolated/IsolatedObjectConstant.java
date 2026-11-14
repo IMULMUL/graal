@@ -26,8 +26,12 @@ package com.oracle.svm.graal.isolated;
 
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointOptions;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+import com.oracle.svm.core.graal.isolated.ClientIsolateThread;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileClient;
+import com.oracle.svm.core.graal.isolated.IsolatedCompileContext;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -46,7 +50,7 @@ public final class IsolatedObjectConstant extends SubstrateObjectConstant {
         assert handle.notEqual(IsolatedHandles.nullHandle());
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public ClientHandle<?> getHandle() {
         return handle;
     }
@@ -56,15 +60,15 @@ public final class IsolatedObjectConstant extends SubstrateObjectConstant {
         return provider.lookupJavaType(getObjectClass());
     }
 
-    private Class<?> getObjectClass() {
+    public Class<?> getObjectClass() {
         if (cachedClass == null) {
             cachedClass = ImageHeapObjects.deref(getObjectClass0(IsolatedCompileContext.get().getClient(), handle));
         }
         return cachedClass;
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static ImageHeapRef<Class<?>> getObjectClass0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> h) {
         Object target = IsolatedCompileClient.get().unhand(h);
         return ImageHeapObjects.ref(target.getClass());
@@ -98,8 +102,8 @@ public final class IsolatedObjectConstant extends SubstrateObjectConstant {
         return h;
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.IntExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static int getIdentityHashCode0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> h) {
         Object target = IsolatedCompileClient.get().unhand(h);
         return computeIdentityHashCode(target);

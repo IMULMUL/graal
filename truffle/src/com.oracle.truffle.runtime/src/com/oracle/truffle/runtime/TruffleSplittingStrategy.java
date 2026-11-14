@@ -1,0 +1,390 @@
+/*
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.runtime;
+
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.logging.Level;
+
+import com.oracle.truffle.api.RootCallTarget;
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleLogger;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.NodeVisitor;
+import com.oracle.truffle.api.nodes.RootNode;
+
+final class TruffleSplittingStrategy {
+
+    private static final Set<OptimizedCallTarget> waste = Collections.synchronizedSet(new HashSet<>());
+    private static final int RECURSIVE_SPLIT_DEPTH = 3;
+
+    static boolean splitForCompilation(OptimizedCallTarget compilationRoot) {
+        class SplittingVisitor implements NodeVisitor {
+            boolean split;
+
+            @Override
+            public boolean visit(Node node) {
+                if (node instanceof OptimizedDirectCallNode callNode && splitCallNode(callNode.getCurrentCallTarget(), callNode) != null) {
+                    split = true;
+                }
+                return true;
+            }
+        }
+        SplittingVisitor visitor = new SplittingVisitor();
+        OptimizedRuntimeAccessor.NODES.visitCloneableNodes(compilationRoot.getRootNode(), visitor);
+        return visitor.split;
+    }
+
+    static OptimizedCallTarget splitCallNode(OptimizedCallTarget target, OptimizedDirectCallNode callNode) {
+        if (!target.isNeedsSplit()) {
+            return null;
+        }
+        EngineData engineData = target.engine;
+        if (engineData.traceSplittingSummary) {
+            traceSplittingPreShouldSplit(engineData, target);
+        }
+        if (shouldSplit(engineData, callNode, target)) {
+            // Compilation preparation can run without an entered language.
+            return doSplit(engineData, callNode, target, true, engineData.getLanguage(target));
+        }
+        return null;
+    }
+
+    private static void traceSplittingPreShouldSplit(final EngineData engineData, OptimizedCallTarget currentTarget) {
+        if (currentTarget.getCallCount() == 0) {
+            synchronized (engineData.splittingStatistics) {
+                engineData.splittingStatistics.totalExecutedNodeCount += currentTarget.getUninitializedNodeCount();
+            }
+        }
+    }
+
+    private static OptimizedCallTarget doSplit(EngineData engineData, OptimizedDirectCallNode callNode, OptimizedCallTarget target, boolean enforceBudget,
+                    TruffleLanguage<?> languageToEnter) {
+        int targetSize = target.getUninitializedNodeCount();
+        if (!reserveSplitBudget(engineData, targetSize, enforceBudget)) {
+            maybeTraceFail(engineData, callNode, "Not enough budget. " + (engineData.splitCount + targetSize) + " > " + engineData.splitLimit);
+            return null;
+        }
+        boolean installed = false;
+        try {
+            Object previous = languageToEnter == null ? null : engineData.enterLanguage(languageToEnter);
+            OptimizedCallTarget splitTarget;
+            try {
+                splitTarget = target.cloneUninitialized();
+            } finally {
+                if (languageToEnter != null) {
+                    engineData.leaveLanguage(languageToEnter, previous);
+                }
+            }
+            if (!callNode.installClonedCallTarget(target, splitTarget)) {
+                return null;
+            }
+            installed = true;
+            if (engineData.traceSplittingSummary) {
+                traceSplittingPreSplit(engineData, target);
+            }
+            OptimizedTruffleRuntime.getRuntime().getListener().onCompilationSplit(callNode);
+            if (engineData.traceSplittingSummary) {
+                traceSplittingPostSplit(engineData, target, splitTarget);
+            }
+            return splitTarget;
+        } finally {
+            if (!installed) {
+                releaseSplitBudget(engineData, targetSize);
+            }
+        }
+    }
+
+    private static boolean reserveSplitBudget(EngineData engineData, int targetSize, boolean enforceBudget) {
+        synchronized (engineData) {
+            if (enforceBudget && engineData.splitCount + targetSize >= engineData.splitLimit) {
+                return false;
+            }
+            engineData.splitCount += targetSize;
+            return true;
+        }
+    }
+
+    private static void releaseSplitBudget(EngineData engineData, int targetSize) {
+        synchronized (engineData) {
+            engineData.splitCount -= targetSize;
+        }
+    }
+
+    private static void traceSplittingPreSplit(EngineData engineData, OptimizedCallTarget target) {
+        synchronized (engineData.splittingStatistics) {
+            calculateSplitWasteImpl(target);
+        }
+    }
+
+    private static void traceSplittingPostSplit(EngineData engineData, OptimizedCallTarget sourceTarget, OptimizedCallTarget splitTarget) {
+        synchronized (engineData.splittingStatistics) {
+            engineData.splittingStatistics.splitNodeCount += splitTarget.getUninitializedNodeCount();
+            engineData.splittingStatistics.splitCount++;
+            engineData.splittingStatistics.splitTargets.put(sourceTarget, engineData.splittingStatistics.splitTargets.getOrDefault(sourceTarget, 0) + 1);
+        }
+    }
+
+    private static boolean shouldSplit(EngineData engine, OptimizedDirectCallNode callNode, OptimizedCallTarget target) {
+        if (!target.isNeedsSplit()) {
+            return false;
+        }
+        if (!canSplit(engine, callNode, target)) {
+            maybeTraceFail(engine, callNode, "Split not possible.");
+            return false;
+        }
+        if (isRecursiveSplit(callNode, target, RECURSIVE_SPLIT_DEPTH)) {
+            maybeTraceFail(engine, callNode, "Recursive split.");
+            return false;
+        }
+        if (target.getUninitializedNodeCount() > engine.splittingMaxCalleeSize) {
+            maybeTraceFail(engine, callNode, "Target too big: " + target.getUninitializedNodeCount() + " > " + engine.splittingMaxCalleeSize);
+            return false;
+        }
+        return true;
+    }
+
+    private static void maybeTraceFail(EngineData engine, OptimizedDirectCallNode callNode, String message) {
+        if (engine.traceSplits) {
+            OptimizedTruffleRuntime.getRuntime().getListener().onCompilationSplitFailed(callNode, message);
+        }
+    }
+
+    static void forceSplitting(OptimizedDirectCallNode call) {
+        final OptimizedCallTarget target = call.getCallTarget();
+        final EngineData engineData = target.engine;
+        if (engineData.splittingAllowForcedSplits) {
+            if (!canSplit(engineData, call, target) || isRecursiveSplit(call, target, RECURSIVE_SPLIT_DEPTH)) {
+                return;
+            }
+            // Forced splitting runs under the caller's current context and must not change it.
+            if (doSplit(engineData, call, target, false, null) != null && engineData.traceSplittingSummary) {
+                traceSplittingForcedSplit(engineData);
+            }
+        }
+    }
+
+    private static void traceSplittingForcedSplit(final EngineData engineData) {
+        synchronized (engineData.splittingStatistics) {
+            engineData.splittingStatistics.forcedSplitCount++;
+        }
+    }
+
+    private static boolean canSplit(EngineData engine, OptimizedDirectCallNode callNode, OptimizedCallTarget target) {
+        return engine.splitting && callNode.getCurrentCallTarget() == target && target.isSourceCallTarget() && target.getRootNode().isCloningAllowed();
+    }
+
+    private static boolean isRecursiveSplit(OptimizedDirectCallNode callNode, OptimizedCallTarget splitCandidateTarget, int allowedDepth) {
+        final RootNode rootNode = callNode.getRootNode();
+        if (rootNode == null) {
+            return false;
+        }
+        OptimizedCallTarget callRootTarget = (OptimizedCallTarget) rootNode.getCallTarget();
+        OptimizedCallTarget callSourceTarget = callRootTarget.getSourceCallTarget();
+        int depth = 0;
+        while (callSourceTarget != null) {
+            if (callSourceTarget == splitCandidateTarget) {
+                depth++;
+                if (depth == allowedDepth) {
+                    return true;
+                }
+            }
+            final OptimizedDirectCallNode splitCallSite = callRootTarget.getCallSiteForSplit();
+            if (splitCallSite == null) {
+                break;
+            }
+            final RootNode splitCallSiteRootNode = splitCallSite.getRootNode();
+            if (splitCallSiteRootNode == null) {
+                break;
+            }
+            callRootTarget = (OptimizedCallTarget) splitCallSiteRootNode.getCallTarget();
+            callSourceTarget = callRootTarget.getSourceCallTarget();
+        }
+        return false;
+    }
+
+    static void newTargetCreated(RootCallTarget target) {
+        final OptimizedCallTarget callTarget = (OptimizedCallTarget) target;
+
+        if (callTarget.isSplit()) { // ignore split call targets
+            return;
+        }
+
+        if (callTarget.isOSR()) {
+            /*
+             * There is no splitting needed for OSR call targets as there are no direct call nodes
+             * created with OSR targets. so there is also no need to increase the splitting budget
+             * from call targets that are created like this.
+             */
+            return;
+        }
+
+        final EngineData engineData = callTarget.engine;
+        if (engineData.splitting) {
+            synchronized (engineData) {
+                engineData.splitLimit = (int) (engineData.splitLimit + engineData.splittingGrowthLimit * callTarget.getUninitializedNodeCount());
+            }
+        }
+        if (engineData.traceSplittingSummary) {
+            traceSplittingNewCallTarget(callTarget, engineData);
+        }
+    }
+
+    private static void traceSplittingNewCallTarget(OptimizedCallTarget callTarget, EngineData engineData) {
+        synchronized (engineData.splittingStatistics) {
+            engineData.splittingStatistics.totalCreatedNodeCount += callTarget.getUninitializedNodeCount();
+        }
+    }
+
+    private static void calculateSplitWasteImpl(OptimizedCallTarget callTarget) {
+        OptimizedRuntimeAccessor.NODES.visitCloneableNodes(callTarget.getRootNode(), node -> {
+            if (node instanceof OptimizedDirectCallNode callNode) {
+                OptimizedCallTarget currentTarget = callNode.getCurrentCallTarget();
+                if (currentTarget.isSplit() && waste.add(currentTarget)) {
+                    final EngineData engineData = currentTarget.engine;
+                    engineData.splittingStatistics.wastedTargetCount++;
+                    engineData.splittingStatistics.wastedNodeCount += currentTarget.getUninitializedNodeCount();
+                    calculateSplitWasteImpl(currentTarget);
+                }
+            }
+            return true;
+        });
+    }
+
+    static void newPolymorphicSpecialize(Node node, EngineData engineData) {
+        if (engineData.traceSplittingSummary) {
+            traceSplittingNewPolymorphicSpecialize(node, engineData);
+        }
+    }
+
+    private static void traceSplittingNewPolymorphicSpecialize(Node node, EngineData engineData) {
+        synchronized (engineData.splittingStatistics) {
+            final Map<Class<? extends Node>, Integer> polymorphicNodes = engineData.splittingStatistics.polymorphicNodes;
+            final Class<? extends Node> aClass = node.getClass();
+            polymorphicNodes.put(aClass, polymorphicNodes.getOrDefault(aClass, 0) + 1);
+        }
+    }
+
+    static class SplitStatisticsData {
+        final Map<Class<? extends Node>, Integer> polymorphicNodes = new HashMap<>();
+        final Map<OptimizedCallTarget, Integer> splitTargets = new HashMap<>();
+        int splitCount;
+        int forcedSplitCount;
+        int splitNodeCount;
+        int totalExecutedNodeCount;
+        int totalCreatedNodeCount;
+        int wastedNodeCount;
+        int wastedTargetCount;
+
+        SplitStatisticsData() {
+        }
+    }
+
+    private static final class SplitStatisticsReporter implements OptimizedTruffleRuntimeListener {
+
+        private static final String D_FORMAT = "%n%-82s: %10d";
+        private static final String D_LONG_FORMAT = "%n%-120s: %10d";
+        private static final String P_FORMAT = "%n%-82s: %9.2f%%";
+        private static final String DELIMITER_FORMAT = "%n--- %s";
+
+        SplitStatisticsReporter() {
+        }
+
+        @Override
+        public void onEngineClosed(EngineData engineData) {
+            if (engineData.traceSplittingSummary) {
+                SplitStatisticsData stat = engineData.splittingStatistics;
+                StringWriter messageBuilder = new StringWriter();
+                try (PrintWriter out = new PrintWriter(messageBuilder)) {
+                    out.print("Splitting Statistics");
+                    out.printf(D_FORMAT, "Split count (sum of uninitializedNodeCount for all split targets)", engineData.splitCount);
+                    out.printf(D_FORMAT, "Split limit (limit for the number of nodes to create through splitting)", engineData.splitLimit);
+                    out.printf(D_FORMAT, "Splits (number of targets created through splitting)", stat.splitCount);
+                    out.printf(D_FORMAT, "Forced splits (number of targets created through DirectCallNode#cloneCallTarget)", stat.forcedSplitCount);
+                    out.printf(D_FORMAT, "Nodes created through splitting (sum of uninitializedNodeCount for split targets)", stat.splitNodeCount);
+                    out.printf(D_FORMAT, "Nodes created without splitting (sum of uninitializedNodeCount for source targets)", stat.totalCreatedNodeCount);
+                    out.printf(P_FORMAT, "Increase in nodes", (stat.splitNodeCount * 100.0) / (stat.totalCreatedNodeCount));
+                    out.printf(D_FORMAT, "Split nodes wasted (callee split nodes wasted due to splitting the caller later)", stat.wastedNodeCount);
+                    out.printf(P_FORMAT, "Percent of split nodes wasted", (stat.wastedNodeCount * 100.0) / (stat.splitNodeCount));
+                    out.printf(D_FORMAT, "Targets wasted due to splitting", stat.wastedTargetCount);
+                    out.printf(D_FORMAT, "Total nodes executed", stat.totalExecutedNodeCount);
+
+                    out.printf(DELIMITER_FORMAT, "SPLIT TARGETS");
+                    for (Map.Entry<OptimizedCallTarget, Integer> entry : sortByIntegerValue(stat.splitTargets).entrySet()) {
+                        out.printf(D_FORMAT, entry.getKey(), entry.getValue());
+                    }
+
+                    out.printf(DELIMITER_FORMAT, "NODES");
+                    for (Map.Entry<Class<? extends Node>, Integer> entry : sortByIntegerValue(stat.polymorphicNodes).entrySet()) {
+                        out.printf(D_LONG_FORMAT, entry.getKey(), entry.getValue());
+                    }
+                }
+                final TruffleLogger log = engineData.getEngineLogger();
+                log.log(Level.INFO, messageBuilder.toString());
+            }
+        }
+
+        private static <K, T> Map<K, Integer> sortByIntegerValue(Map<K, Integer> map) {
+            List<Entry<K, Integer>> list = new ArrayList<>(map.entrySet());
+            list.sort((x, y) -> y.getValue().compareTo(x.getValue()));
+
+            Map<K, Integer> result = new LinkedHashMap<>();
+            for (Entry<K, Integer> entry : list) {
+                result.put(entry.getKey(), entry.getValue());
+            }
+
+            return result;
+        }
+    }
+
+    static void installListener(OptimizedTruffleRuntime runtime) {
+        runtime.addListener(new SplitStatisticsReporter());
+    }
+}

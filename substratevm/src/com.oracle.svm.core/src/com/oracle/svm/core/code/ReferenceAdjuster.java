@@ -26,43 +26,45 @@ package com.oracle.svm.core.code;
 
 import java.nio.ByteOrder;
 
-import org.graalvm.compiler.api.replacements.Fold;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.c.NonmovableObjectArray;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
+import com.oracle.svm.shared.config.ObjectLayout;
 import com.oracle.svm.core.heap.ReferenceAccess;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.core.nmt.NmtCategory;
+import com.oracle.svm.shared.Uninterruptible;
 
+import jdk.graal.compiler.api.replacements.Fold;
 import jdk.vm.ci.meta.Constant;
+import jdk.vm.ci.meta.JavaConstant;
 
 /**
  * Tool for adjusting references to objects in non-movable data structures.
  */
 public interface ReferenceAdjuster {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    <T> void setConstantTargetInArray(NonmovableObjectArray<T> array, int index, SubstrateObjectConstant constant);
+    <T> void setConstantTargetInArray(NonmovableObjectArray<T> array, int index, JavaConstant constant);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     <T> void setObjectInArray(NonmovableObjectArray<T> array, int index, T object);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void setConstantTargetAt(PointerBase address, int length, SubstrateObjectConstant constant);
+    void setConstantTargetAt(PointerBase address, int length, JavaConstant constant);
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    default <T extends Constant> NonmovableObjectArray<Object> copyOfObjectConstantArray(T[] constants) {
-        NonmovableObjectArray<Object> objects = NonmovableArrays.createObjectArray(Object[].class, constants.length);
+    default <T extends Constant> NonmovableObjectArray<Object> copyOfObjectConstantArray(T[] constants, NmtCategory nmtCategory) {
+        NonmovableObjectArray<Object> objects = NonmovableArrays.createObjectArray(Object[].class, constants.length, nmtCategory);
         for (int i = 0; i < constants.length; i++) {
-            setConstantTargetInArray(objects, i, (SubstrateObjectConstant) constants[i]);
+            setConstantTargetInArray(objects, i, (JavaConstant) constants[i]);
         }
         return objects;
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source);
+    <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source, NmtCategory nmtCategory);
 
     /** Indicates whether all object references have been written. */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -70,7 +72,8 @@ public interface ReferenceAdjuster {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     static void writeReference(Pointer address, int length, Object obj) {
-        if (length == Long.BYTES && length > ConfigurationValues.getObjectLayout().getReferenceSize()) {
+        ObjectLayout ol = ObjectLayout.singleton();
+        if (length == Long.BYTES && length > ol.getReferenceSize()) {
             /*
              * For 8-byte immediates in instructions despite using narrow 4-byte references: we zero
              * all 8 bytes and patch a narrow reference at the offset, which results in the same
@@ -79,14 +82,13 @@ public interface ReferenceAdjuster {
             assert nativeByteOrder() == ByteOrder.LITTLE_ENDIAN;
             address.writeLong(0, 0L);
         } else {
-            assert length == ConfigurationValues.getObjectLayout().getReferenceSize() : "Unsupported reference constant size";
+            assert length == ol.getReferenceSize() : "Unsupported reference constant size";
         }
-        boolean compressed = ReferenceAccess.singleton().haveCompressedReferences();
-        ReferenceAccess.singleton().writeObjectAt(address, obj, compressed);
+        ReferenceAccess.singleton().writeObjectAt(address, obj, true);
     }
 
     @Fold
     static ByteOrder nativeByteOrder() {
-        return ConfigurationValues.getTarget().arch.getByteOrder();
+        return SubstrateTarget.getArchitecture().getByteOrder();
     }
 }

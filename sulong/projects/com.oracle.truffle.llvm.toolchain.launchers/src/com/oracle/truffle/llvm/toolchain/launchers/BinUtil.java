@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -34,29 +34,52 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Objects;
+import java.util.Optional;
 
 import org.graalvm.nativeimage.ProcessProperties;
 
+import com.oracle.truffle.llvm.toolchain.launchers.AbstractToolchainWrapper.ToolchainWrapperConfig;
 import com.oracle.truffle.llvm.toolchain.launchers.common.Driver;
 
-public final class BinUtil {
+public final class BinUtil extends Driver {
+
+    public BinUtil(String exe) {
+        super(exe);
+    }
+
     public static void main(String[] args) {
-        String processName = getProcessName();
+        ToolchainWrapperConfig config = AbstractToolchainWrapper.getConfig();
 
-        if (processName == null) {
-            System.err.println("Error: Could not figure out process name");
-            System.exit(1);
+        String toolName;
+        if (config != null) {
+            toolName = config.toolName();
+        } else {
+            // this is the boostrap toolchain...
+            toolName = System.getProperty("org.graalvm.launcher.executablename");
+
+            // ... or a legacy GraalVM
+            if (toolName == null) {
+                toolName = ProcessProperties.getArgumentVectorProgramName();
+            }
+
+            Path toolPath = Paths.get(toolName).getFileName();
+            if (toolPath != null) {
+                toolName = toolPath.toString();
+            }
         }
 
-        if (!processName.startsWith("llvm-")) {
-            processName = "llvm-" + processName;
+        if (!toolName.startsWith("llvm-")) {
+            toolName = "llvm-" + toolName;
         }
 
-        final Driver driver = new Driver();
-        final String targetName = driver.getLLVMBinDir().resolve(processName).toString();
+        final Path toolPath = Driver.getLLVMBinDir().resolve(toolName);
+        new BinUtil(Objects.toString(toolPath.getFileName(), "")).runTool(toolPath, args);
+    }
 
+    public void runTool(Path toolPath, String[] args) {
         ArrayList<String> utilArgs = new ArrayList<>(args.length + 1);
-        utilArgs.add(targetName);
+        utilArgs.add(toolPath.toString());
         if (args.length > 0) {
             utilArgs.addAll(Arrays.asList(args));
         }
@@ -67,39 +90,16 @@ public final class BinUtil {
             p.waitFor();
             System.exit(p.exitValue());
         } catch (IOException e) {
-            System.err.println("Error: " + e.getMessage());
-            driver.printMissingToolMessage();
+            log("Error: %s", e.getMessage());
+            printMissingToolMessage(Optional.ofNullable(toolPath.getParent()).map(Path::getParent).map(Path::toString).orElse("<invalid>"));
             System.exit(1);
         } catch (InterruptedException e) {
             if (p != null) {
                 p.destroyForcibly();
             }
-            System.err.println("Error: Subprocess interrupted: " + e.getMessage());
+            log("Error: Subprocess interrupted: %s", e.getMessage());
             System.exit(1);
         }
     }
 
-    private static String getProcessName() {
-        String binPathName = System.getProperty("org.graalvm.launcher.executablename");
-
-        if (binPathName == null) {
-            if (ProcessProperties.getArgumentVectorBlockSize() <= 0) {
-                return null;
-            }
-            binPathName = ProcessProperties.getArgumentVectorProgramName();
-
-            if (binPathName == null) {
-                return null;
-            }
-        }
-
-        Path p = Paths.get(binPathName);
-        Path f = p.getFileName();
-
-        if (f == null) {
-            return null;
-        }
-
-        return f.toString();
-    }
 }

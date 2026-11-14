@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -57,6 +57,7 @@ import org.graalvm.polyglot.Value;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.debug.Breakpoint;
@@ -73,8 +74,13 @@ import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.source.SourceSection;
 
-public class SLDebugDirectTest {
+public class SLDebugDirectTest extends AbstractSLTest {
     private static final Object UNASSIGNED = new Object();
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
 
     private Debugger debugger;
     private final LinkedList<Runnable> run = new LinkedList<>();
@@ -89,7 +95,7 @@ public class SLDebugDirectTest {
     @Before
     public void before() {
         suspendedEvent = null;
-        engine = Engine.newBuilder().out(out).err(err).build();
+        engine = newEngineBuilder().out(out).err(err).build();
         debugger = engine.getInstruments().get("debugger").lookup(Debugger.class);
         session = debugger.startSession((event) -> {
             suspendedEvent = event;
@@ -97,7 +103,7 @@ public class SLDebugDirectTest {
             suspendedEvent = null;
 
         });
-        context = Context.newBuilder().engine(engine).build();
+        context = newContextBuilder().engine(engine).build();
         run.clear();
     }
 
@@ -247,7 +253,11 @@ public class SLDebugDirectTest {
                         "1", "nMOFact",
                         "1", "res", "2");
         stepOver(1);
-        assertLocation("test", 2, false, "fac(2)", "res", UNASSIGNED);
+        if (mode == RunMode.AST) {
+            assertLocation("test", 2, false, "fac(2)", "res", UNASSIGNED);
+        } else {
+            assertLocation("test", 2, false, "res = fac(2)", "res", UNASSIGNED);
+        }
         stepOver(1);
         assertLocation("test", 3, true, "println(res)", "res", "2");
         stepOut();

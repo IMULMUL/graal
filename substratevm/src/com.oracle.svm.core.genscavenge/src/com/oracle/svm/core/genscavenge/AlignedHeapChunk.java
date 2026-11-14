@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,25 +24,26 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.compiler.word.Word;
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.shared.Uninterruptible.CORE_GC_CODE;
+
+import org.graalvm.nativeimage.c.struct.RawField;
+import org.graalvm.nativeimage.c.struct.RawFieldAddress;
 import org.graalvm.nativeimage.c.struct.RawStructure;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.MemoryWalker;
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AlwaysInline;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.genscavenge.compacting.CompactingAlignedChunkAccess;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.heap.ObjectVisitor;
+import com.oracle.svm.guest.staging.core.heap.ObjectVisitor;
+import com.oracle.svm.core.hub.LayoutEncoding;
 import com.oracle.svm.core.util.PointerUtils;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+
+import jdk.graal.compiler.api.replacements.Fold;
 
 /**
  * An AlignedHeapChunk can hold many Objects.
@@ -55,17 +56,14 @@ import com.oracle.svm.core.util.PointerUtils;
  * Most allocation within a AlignedHeapChunk is via fast-path allocation snippets, but a slow-path
  * allocation method is available.
  * <p>
- * Objects in a AlignedHeapChunk have to be promoted by copying from their current HeapChunk to a
- * destination HeapChunk.
- * <p>
- * An AlignedHeapChunk is laid out:
+ * An AlignedHeapChunk is laid out as follows:
  *
  * <pre>
- * +===============+-------+--------+----------------------+
- * | AlignedHeader | Card  | First  | Object ...           |
- * | Fields        | Table | Object |                      |
- * |               |       | Table  |                      |
- * +===============+-------+--------+----------------------+
+ * +===============+-------+--------+------------------+-----------------+
+ * | AlignedHeader | Card  | First  | CompactingOldGen | Object ...      |
+ * | Fields        | Table | Object | Extra Header     |                 |
+ * |               |       | Table  |                  |                 |
+ * +===============+-------+--------+------------------+-----------------+
  * </pre>
  *
  * The size of both the CardTable and the FirstObjectTable depends on the used {@link RememberedSet}
@@ -83,59 +81,156 @@ public final class AlignedHeapChunk {
      */
     @RawStructure
     public interface AlignedHeader extends HeapChunk.Header<AlignedHeader> {
+        /**
+         * The number of explicit pinnings of objects in this chunk. This is at least the number of
+         * pinned objects, but higher when an object is pinned more than once.
+         *
+         * This value is not maintained for {@linkplain #getAllPinned() all-pinned} chunks.
+         */
+        @RawField
+        int getObjectPinCount();
+
+        @RawField
+        void setObjectPinCount(int value);
+
+        @RawFieldAddress
+        Pointer addressOfObjectPinCount();
+
+        /**
+         * Whether all objects in this chunk are pinned. This does not automatically make them
+         * reachable, but a collection must never move them, and instead sweep this chunk.
+         *
+         * This value never changes for a chunk once it is used for allocation, until it is freed or
+         * recycled.
+         */
+        @RawField
+        boolean getAllPinned();
+
+        @RawField
+        void setAllPinned(boolean value);
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void initialize(AlignedHeader chunk, UnsignedWord chunkSize) {
+        assert chunk.isNonNull();
+        assert chunkSize.equal(HeapParameters.getAlignedHeapChunkSize()) : "expecting all aligned chunks to be the same size";
         HeapChunk.initialize(chunk, AlignedHeapChunk.getObjectsStart(chunk), chunkSize);
+        chunk.setObjectPinCount(0);
+        chunk.setAllPinned(false);
+
+        if (SerialGCOptions.useCompactingOldGen()) {
+            CompactingAlignedChunkAccess.initialize(chunk);
+        }
     }
 
     public static void reset(AlignedHeader chunk) {
-        HeapChunk.initialize(chunk, AlignedHeapChunk.getObjectsStart(chunk), HeapChunk.getEndOffset(chunk));
+        long alignedChunkSize = SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getValue();
+        assert HeapChunk.getSize(chunk).rawValue() == alignedChunkSize;
+        initialize(chunk, Word.unsigned(alignedChunkSize));
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static Pointer getObjectsStart(AlignedHeader that) {
         return HeapChunk.asPointer(that).add(getObjectsStartOffset());
     }
 
-    /** Allocate uninitialized memory within this AlignedHeapChunk. */
-    static Pointer allocateMemory(AlignedHeader that, UnsignedWord size) {
-        Pointer result = WordFactory.nullPointer();
-        UnsignedWord available = HeapChunk.availableObjectMemory(that);
-        if (size.belowOrEqual(available)) {
-            result = HeapChunk.getTopPointer(that);
-            Pointer newTop = result.add(size);
-            HeapChunk.setTopPointerCarefully(that, newTop);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean hasUncommittedPages(AlignedHeader chunk) {
+        return SerialGCOptions.useCompactingOldGen() && CompactingAlignedChunkAccess.hasUncommittedPages(chunk);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static UnsignedWord getCommittedSize(AlignedHeader chunk) {
+        UnsignedWord size = HeapChunk.getSize(chunk);
+        if (SerialGCOptions.useCompactingOldGen()) {
+            size = size.subtract(CompactingAlignedChunkAccess.getUncommittedBytes(chunk));
         }
+        return size;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static Pointer getObjectsEnd(AlignedHeader that) {
+        return HeapChunk.getEndPointer(that);
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isEmpty(AlignedHeader that) {
+        return HeapChunk.getTopOffset(that).equal(getObjectsStartOffset());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean hasPinnedObjects(AlignedHeader that) {
+        return that.getObjectPinCount() != 0 || that.getAllPinned();
+    }
+
+    /** Allocate uninitialized memory within this AlignedHeapChunk. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static Pointer tryAllocateMemory(AlignedHeader that, UnsignedWord size) {
+        UnsignedWord available = HeapChunk.availableObjectMemory(that);
+        if (size.aboveThan(available)) {
+            return Word.nullPointer();
+        }
+
+        Pointer result = HeapChunk.getTopPointer(that);
+        Pointer newTop = result.add(size);
+        HeapChunk.setTopPointerCarefully(that, newTop);
         return result;
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    static UnsignedWord getCommittedObjectMemory(AlignedHeader that) {
-        return HeapChunk.getEndOffset(that).subtract(getObjectsStartOffset());
-    }
-
     public static AlignedHeader getEnclosingChunk(Object obj) {
+        assert ObjectHeaderImpl.isAlignedObject(obj);
         Pointer ptr = Word.objectToUntrackedPointer(obj);
         return getEnclosingChunkFromObjectPointer(ptr);
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static AlignedHeader getEnclosingChunkFromObjectPointer(Pointer ptr) {
-        return (AlignedHeader) PointerUtils.roundDown(ptr, HeapPolicy.getAlignedHeapChunkAlignment());
+        return (AlignedHeader) PointerUtils.roundDown(ptr, HeapParameters.getAlignedHeapChunkAlignment());
     }
 
     /** Return the offset of an object within the objects part of a chunk. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static UnsignedWord getObjectOffset(AlignedHeader that, Pointer objectPointer) {
         Pointer objectsStart = getObjectsStart(that);
         return objectPointer.subtract(objectsStart);
     }
 
-    static boolean walkObjects(AlignedHeader that, ObjectVisitor visitor) {
-        return HeapChunk.walkObjectsFrom(that, getObjectsStart(that), visitor);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static void walkObjects(AlignedHeader that, ObjectVisitor visitor) {
+        HeapChunk.walkObjectsFrom(that, getObjectsStart(that), visitor);
     }
 
     @AlwaysInline("GC performance")
-    static boolean walkObjectsInline(AlignedHeader that, ObjectVisitor visitor) {
-        return HeapChunk.walkObjectsFromInline(that, getObjectsStart(that), visitor);
+    @Uninterruptible(reason = CORE_GC_CODE, mayBeInlined = true)
+    static void walkObjectsFromInline(AlignedHeader that, Pointer start, GreyToBlackObjectVisitor visitor) {
+        HeapChunk.walkObjectsFromInline(that, start, visitor);
+    }
+
+    /** Cleans the unallocated tail and filler-object payloads of an aligned heap chunk. */
+    @Uninterruptible(reason = "Uses raw pointers to access heap chunks.")
+    static void clean(AlignedHeader that, boolean cleanUnusedMemory, boolean cleanFillerObjectMemory) {
+        boolean hasUncommittedPages = hasUncommittedPages(that);
+        Pointer top = HeapChunk.getTopPointer(that);
+        if (cleanFillerObjectMemory) {
+            Pointer p = getObjectsStart(that);
+            while (p.belowThan(top)) {
+                Object obj = p.toObjectNonNull();
+                UnsignedWord size = LayoutEncoding.getSizeFromObjectInlineInGC(obj);
+                if (FillerObjectUtil.isFillerObject(obj)) {
+                    FillerObjectUtil.cleanFillerObjectMemory(obj, hasUncommittedPages);
+                }
+                p = p.add(size);
+            }
+        }
+        if (cleanUnusedMemory) {
+            Pointer limit = HeapChunk.getEndPointer(that);
+            if (hasUncommittedPages) {
+                CompactingAlignedChunkAccess.fillCommittedMemory(that, top, limit, 0);
+            } else {
+                UnmanagedMemoryUtil.fill(top, limit.subtract(top), (byte) 0);
+            }
+        }
     }
 
     @Fold
@@ -144,38 +239,16 @@ public final class AlignedHeapChunk {
     }
 
     @Fold
-    static MemoryWalker.HeapChunkAccess<AlignedHeapChunk.AlignedHeader> getMemoryWalkerAccess() {
-        return ImageSingletons.lookup(AlignedHeapChunk.MemoryWalkerAccessImpl.class);
+    public static UnsignedWord getUsableSizeForObjects() {
+        return HeapParameters.getAlignedHeapChunkSize().subtract(getObjectsStartOffset());
     }
 
-    /** Methods for a {@link MemoryWalker} to access an aligned heap chunk. */
-    static final class MemoryWalkerAccessImpl extends HeapChunk.MemoryWalkerAccessImpl<AlignedHeapChunk.AlignedHeader> {
-
-        @Platforms(Platform.HOSTED_ONLY.class)
-        MemoryWalkerAccessImpl() {
-        }
-
-        @Override
-        public boolean isAligned(AlignedHeapChunk.AlignedHeader heapChunk) {
-            return true;
-        }
-
-        @Override
-        public UnsignedWord getAllocationStart(AlignedHeapChunk.AlignedHeader heapChunk) {
-            return getObjectsStart(heapChunk);
-        }
-    }
-}
-
-@AutomaticFeature
-class AlignedHeapChunkMemoryWalkerAccessFeature implements Feature {
-    @Override
-    public boolean isInConfiguration(IsInConfigurationAccess access) {
-        return SubstrateOptions.UseSerialGC.getValue();
-    }
-
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(AlignedHeapChunk.MemoryWalkerAccessImpl.class, new AlignedHeapChunk.MemoryWalkerAccessImpl());
+    public interface Visitor {
+        /**
+         * Visit an {@link AlignedHeapChunk}. The currently visited chunk may be
+         * {@linkplain HeapChunk#setNext unlinked from its list} by the visitor.
+         */
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        void visitChunk(AlignedHeader chunk);
     }
 }

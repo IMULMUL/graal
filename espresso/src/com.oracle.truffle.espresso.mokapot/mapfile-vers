@@ -32,6 +32,8 @@ SUNWprivate_1.1 {
                 getJavaVM;
                 mokapotAttachThread;
                 mokapotGetRTLD_DEFAULT;
+                mokapotGetProcessHandle;
+                mokapotCaptureState;
                 getPackageAt;
 
                 # Espresso management native API
@@ -41,7 +43,9 @@ SUNWprivate_1.1 {
                 # Espresso jvmti native API
                 initializeJvmtiContext;
                 disposeJvmtiContext;
-                initializeJvmtiHandlerContext;
+                
+                # Structs initialization
+                initializeStructs;
                 lookupMemberOffset;
 
                 # JNI
@@ -212,6 +216,7 @@ SUNWprivate_1.1 {
                 JVM_LatestUserDefinedLoader;
                 JVM_Listen;
                 JVM_LoadClass0;
+                JVM_LoadZipLibrary;
                 JVM_LoadLibrary;
                 JVM_Lseek;
                 JVM_MaxObjectInspectionAge;
@@ -268,7 +273,7 @@ SUNWprivate_1.1 {
                 JVM_Write;
                 JVM_Yield;
                 JVM_handle_linux_signal;
-                
+
                 # JDK 11
                 JVM_AddModuleExports;
                 JVM_AddModuleExportsToAll;
@@ -296,22 +301,83 @@ SUNWprivate_1.1 {
                 JVM_MoreStackWalk;
                 JVM_SetBootLoaderUnnamedModule;
                 JVM_WaitForReferencePendingList;
+                
+                # JDK 16
+                JVM_DefineArchivedModules;
+                JVM_GetExtendedNPEMessage;
+                JVM_GetPermittedSubclasses;
+                JVM_GetProperties;
+                JVM_GetRandomSeedForDumping;
+                JVM_GetRecordComponents;
+                JVM_IsCDSDumpingEnabled;
+                JVM_IsDumpingClassList;
+                JVM_IsHiddenClass;
+                JVM_IsRecord;
+                JVM_IsSharingEnabled;
+                JVM_IsUseContainerSupport;
+                JVM_LogLambdaFormInvoker;
+                JVM_LookupDefineClass;
+                JVM_LookupLambdaProxyClassFromArchive;
+                JVM_PhantomReferenceRefersTo;
+                JVM_ReferenceClear;
+                JVM_ReferenceRefersTo;
+                JVM_RegisterLambdaProxyClassForArchiving;
+
+                # JDK 17
+                JVM_DumpClassListToFile;
+                JVM_DumpDynamicArchive;
+
+                # JDK 19
+                JVM_CurrentCarrierThread;
+                JVM_SetCurrentThread;
+                JVM_GetStackTrace;
+                JVM_ExtentLocalCache;
+                JVM_SetExtentLocalCache;
+                JVM_GetNextThreadIdOffset;
+                JVM_RegisterContinuationMethods;
+                JVM_IsPreviewEnabled;
+                JVM_IsContinuationsSupported;
+                JVM_SetStackWalkContinuation;
+                JVM_ReportFinalizationComplete;
+                JVM_IsFinalizationEnabled;
+
+                # JDK 20
+                JVM_VirtualThreadHideFrames;
+                JVM_GetClassFileVersion;
+                JVM_ScopedValueCache;
+                JVM_SetScopedValueCache;
+                JVM_FindScopedValueBindings;
+                JVM_EnsureMaterializedForStackWalk_func;
+
+                # JDK 21
+                JVM_IsForeignLinkerSupported;
+                JVM_VirtualThreadStart;
+                JVM_VirtualThreadEnd;
+                JVM_VirtualThreadMount;
+                JVM_VirtualThreadUnmount;
+                JVM_PrintWarningAtDynamicAgentLoad;
+
+                # JDK 25
+                JVM_SleepNanos;
+                JVM_ExpandStackFrameInfo;
+                JVM_IsContainerized;
+                JVM_GetCDSConfigStatus;
+                JVM_NeedsClassInitBarrierForCDS;
+                JVM_VirtualThreadDisableSuspend;
+                JVM_VirtualThreadPinnedEvent;
+                JVM_TakeVirtualThreadListToUnblock;
+                JVM_IsStaticallyLinked;
+                JVM_CreateThreadSnapshot;
+                JVM_AOTEndRecording;
+
+                # JDK 26
+                JVM_ReferenceGet;
 
                 # miscellaneous functions
                 jio_fprintf;
-                jio_printf;
                 jio_snprintf;
                 jio_vfprintf;
                 jio_vsnprintf;
-                fork1;
-                numa_warn;
-                numa_error;
-
-                # Needed because there is no JVM interface for this.
-                sysThreadAvailableStackWithSlack;
-
-                # This is for Forte Analyzer profiling support.
-                AsyncGetCallTrace;
 
 		# INSERT VTABLE SYMBOLS HERE
 

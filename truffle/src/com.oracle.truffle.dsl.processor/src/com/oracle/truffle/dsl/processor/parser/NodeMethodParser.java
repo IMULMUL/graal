@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -77,7 +77,7 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
     }
 
     protected ParameterSpec createReturnParameterSpec() {
-        ParameterSpec returnValue = new ParameterSpec("returnValue", getPossibleReturnTypes());
+        ParameterSpec returnValue = new ParameterSpec("returnValue#", getPossibleReturnTypes());
         returnValue.setExecution(getNode().getThisExecution());
         return returnValue;
     }
@@ -102,7 +102,6 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
         addDefaultFrame(methodSpec);
         addDefaultFieldMethodSpec(methodSpec);
         addDefaultChildren(shortCircuitName, methodSpec);
-
         return methodSpec;
     }
 
@@ -116,13 +115,17 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
             if (breakName != null && execution.getIndexedName().equals(breakName)) {
                 break;
             }
-
-            spec.addRequired(createValueParameterSpec(execution));
+            ParameterSpec valueSpecification = createValueParameterSpec(execution);
+            if (execution.getIndex() == 0 && getNode().isGenerateInline()) {
+                spec.addOptional(valueSpecification);
+            } else {
+                spec.addRequired(valueSpecification);
+            }
         }
     }
 
     protected void addDefaultFrame(MethodSpec methodSpec) {
-        if (getNode().supportsFrame()) {
+        if (getNode().isBindFrame() && getNode().supportsFrame()) {
             methodSpec.addOptional(new ParameterSpec("frame", getNode().getFrameType()));
         }
     }
@@ -135,6 +138,7 @@ public abstract class NodeMethodParser<E extends TemplateMethod> extends Templat
                 methodSpec.addOptional(spec);
             }
         }
+
     }
 
 }

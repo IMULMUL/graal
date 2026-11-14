@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,11 +24,15 @@ package com.oracle.truffle.espresso.jdwp.api;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.TruffleThreadBuilder;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.espresso.jdwp.impl.DebuggerController;
 
 /**
  * Interface that defines required methods for a guest language when implementing JDWP.
@@ -64,7 +68,7 @@ public interface JDWPContext {
      *
      * @return array containing every class loaded
      */
-    KlassRef[] getAllLoadedClasses();
+    Set<? extends KlassRef> getAllLoadedClasses();
 
     /**
      * Finds the method for which an root node was created from.
@@ -72,7 +76,7 @@ public interface JDWPContext {
      * @param root the Truffle root node object
      * @return the declaring method of the root node
      */
-    MethodRef getMethodFromRootNode(RootNode root);
+    MethodVersionRef getMethodFromRootNode(RootNode root);
 
     /**
      * @return guest language array of all active threads
@@ -155,13 +159,14 @@ public interface JDWPContext {
     int getArrayLength(Object array);
 
     /**
-     * Returns the TypeTag constant for the input object. The TypeTag will be determined based on
-     * the declaring class of the object.
+     * Returns the tag constant for the component type of the input array. Note that all sub
+     * variants of the OBJECT tag constant is not used, e.g. if the component class of the array is
+     * j.l.String the generic OBJECT tag is returned and not the STRING tag.
      *
      * @param array must be a guest language array object
-     * @return TypeTag for the object
+     * @return the TypeTag for the component type of the array
      */
-    byte getTypeTag(Object array);
+    byte getArrayComponentTag(Object array);
 
     /**
      * Returns an unboxed host primitive type array of the array.
@@ -175,9 +180,9 @@ public interface JDWPContext {
      * Returns all classes for which the class loader initiated loading.
      *
      * @param classLoader guest language class loader
-     * @return array of classes initiated by the class loader
+     * @return set of classes initiated by the class loader
      */
-    List<? extends KlassRef> getInitiatedClasses(Object classLoader);
+    Set<? extends KlassRef> getInitiatedClasses(Object classLoader);
 
     /**
      * Retrieves the field value of a static field.
@@ -219,6 +224,21 @@ public interface JDWPContext {
     Ids<Object> getIds();
 
     /**
+     * Creates a new system thread.
+     *
+     * @return {@link Env#createSystemThread(java.lang.Runnable)}.
+     */
+    public Thread createSystemThread(Runnable runnable);
+
+    /**
+     * Creates a new polyglot thread bound to the Espresso language context.
+     *
+     * @return {@link Env#newTruffleThreadBuilder(java.lang.Runnable)}.{@link TruffleThreadBuilder#build()
+     *         build()}.
+     */
+    public Thread createPolyglotThread(Runnable runnable);
+
+    /**
      * @param string guest language string object
      * @return true if object is a guest language String, false otherwise
      */
@@ -251,7 +271,7 @@ public interface JDWPContext {
 
     /**
      * Verifies that the array has the expected length.
-     * 
+     *
      * @param array guest language array object
      * @param length expected length of the array
      * @return true if array is equal to or bigger in size than the expected length
@@ -265,14 +285,6 @@ public interface JDWPContext {
      * @return true if the object is a valid class loader, false otherwise
      */
     boolean isValidClassLoader(Object object);
-
-    /**
-     * Converts an arbitrary host object to the corresponding guest object.
-     *
-     * @param object the host object to convert
-     * @return the guest object
-     */
-    Object toGuest(Object object);
 
     // temporarily needed until we get better exception-type based filtering in the Debug API
     Object getGuestException(Throwable exception);
@@ -335,14 +347,6 @@ public interface JDWPContext {
     void interruptThread(Object thread);
 
     /**
-     * Returns all active child threads within the thread group.
-     *
-     * @param threadGroup the thread group that threads must belong to
-     * @return all active threads in the group
-     */
-    Object[] getChildrenThreads(Object threadGroup);
-
-    /**
      * Returns the classes and interfaces directly nested within this type.Types further nested
      * within those types are not included.
      *
@@ -395,11 +399,12 @@ public interface JDWPContext {
     /**
      * Returns the bci of the next bytecode instruction within the current frame
      *
-     * @param callerRoot the root node of the caller frame
+     * @param method the current method
+     * @param rawNode the current node
      * @param frame the frame to read the current bci from
      * @return the bci of the next instruction
      */
-    int getNextBCI(RootNode callerRoot, Frame frame);
+    int getNextBCI(MethodRef method, Node rawNode, Frame frame);
 
     /**
      * Returns the current BCI or -1 if the BCI cannot be read.
@@ -408,7 +413,7 @@ public interface JDWPContext {
      * @param frame the frame to read the bci from
      * @return the BCI or -1
      */
-    long readBCIFromFrame(RootNode root, Frame frame);
+    int readBCIFromFrame(RootNode root, Frame frame);
 
     /**
      * Returns a {@link CallFrame} representation of the location of
@@ -429,10 +434,11 @@ public interface JDWPContext {
     /**
      * Returns the entry count for the monitor on the current thread.
      *
+     * @param monitorOwnerThread the owner thread of the monitor
      * @param monitor the monitor
      * @return entry count of monitor
      */
-    int getMonitorEntryCount(Object monitor);
+    int getMonitorEntryCount(Object monitorOwnerThread, Object monitor);
 
     /**
      * Returns all owned guest-language monitor object of the input call frames.
@@ -441,15 +447,6 @@ public interface JDWPContext {
      * @return the owned monitor objects
      */
     MonitorStackInfo[] getOwnedMonitors(CallFrame[] callFrames);
-
-    /**
-     * Returns the current contended monitor for the guest thread, or <code>null</code> if there are
-     * no current contended monitor for this thread.
-     *
-     * @param guestThread the guest thread
-     * @return the current contended monitor
-     */
-    Object getCurrentContendedMonitor(Object guestThread);
 
     /**
      * Returns the language class associated with the implementing class of this interface.
@@ -466,30 +463,14 @@ public interface JDWPContext {
      * @param redefineInfos the information about the original class and the new class bytes
      * @return 0 on success or the appropriate {@link ErrorCodes} if an error occur
      */
-    int redefineClasses(RedefineInfo[] redefineInfos);
+    int redefineClasses(List<RedefineInfo> redefineInfos);
 
     /**
      * Exit all monitors that was entered by the frame.
-     * 
+     *
      * @param frame
      */
     void clearFrameMonitors(CallFrame frame);
-
-    /**
-     * Aborts the context.
-     *
-     * @param exitCode the system exit code
-     */
-    void abort(int exitCode);
-
-    /**
-     * Returns the nearest {@link com.oracle.truffle.api.instrumentation.InstrumentableNode node} or
-     * <code>null</code>. The nodes are traversed by walking the parent node hierarchy.
-     *
-     * @param node the node
-     * @return the nearest instrumentable node
-     */
-    Node getInstrumentableNode(Node node);
 
     /**
      * Returns the current BCI of the node.
@@ -498,5 +479,53 @@ public interface JDWPContext {
      * @param frame the current frame
      * @return the current bci
      */
-    long getBCI(Node rawNode, Frame frame);
+    int getBCI(Node rawNode, Frame frame);
+
+    /**
+     * Returns the instrumentable delegate node for the language root node or <code>rootNode</code>
+     * if no instrumentable node can be found.
+     *
+     * @param rootNode the root node
+     * @return the instrumentable delegate node
+     */
+    Node getInstrumentableNode(RootNode rootNode);
+
+    /**
+     * Tests if the guest object is a member of the klass.
+     *
+     * @param guestObject the guest object
+     * @param klass the class
+     * @return true is guest object is a member of the klass
+     */
+    boolean isMemberOf(Object guestObject, KlassRef klass);
+
+    /**
+     * Returns all defined modules.
+     *
+     * @return all modules
+     */
+    ModuleRef[] getAllModulesRefs();
+
+    /**
+     * Tests if the thread is a virtual thread.
+     */
+    boolean isVirtualThread(Object thread);
+
+    /**
+     * Tests if the current thread is blocked for debugging (suspends should not occur i.e. not
+     * being reported via stepping).
+     */
+    boolean isSingleSteppingDisabled();
+
+    Object allocateInstance(KlassRef klass);
+
+    void steppingInProgress(Thread t, boolean value);
+
+    boolean isSteppingInProgress(Thread t);
+
+    void replaceController(DebuggerController newController);
+
+    int getJavaFeatureVersion();
+
+    String getSystemProperty(String name);
 }

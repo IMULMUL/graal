@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,30 +24,43 @@
  */
 package com.oracle.truffle.tools.dap.test;
 
-import java.io.PrintWriter;
-
-import com.oracle.truffle.api.instrumentation.TruffleInstrument;
-import com.oracle.truffle.tools.dap.server.DebugProtocolServerImpl;
-
-import com.oracle.truffle.tools.dap.server.ExecutionContext;
-import com.oracle.truffle.tools.dap.types.DebugProtocolServer;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.io.PrintWriter;
+import java.net.URI;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.Executors;
+
+import com.oracle.truffle.api.instrumentation.TruffleInstrument;
+import com.oracle.truffle.tools.dap.server.DebugProtocolServerImpl;
+import com.oracle.truffle.tools.dap.server.DebugProtocolServerListener;
+
+import com.oracle.truffle.tools.dap.server.ExecutionContext;
+import com.oracle.truffle.tools.dap.types.DebugProtocolServer;
 
 @TruffleInstrument.Registration(id = DAPTestInstrument.ID, services = DAPSessionHandlerProvider.class)
 public class DAPTestInstrument extends TruffleInstrument {
 
     public static final String ID = "DAPTestInstrument";
+    private DebugProtocolServerListener listener;
 
     @Override
     protected void onCreate(final Env env) {
         env.registerService(new DAPSessionHandlerProvider() {
             @Override
-            public DAPSessionHandler getSessionHandler(final boolean suspend, final boolean inspectInternal, final boolean inspectInitialization) throws IOException {
+            public DebugProtocolServerListener getServer(boolean suspend, boolean waitAttached) {
+                ExecutionContext context = new ExecutionContext(env, new PrintWriter(env.out(), true), new PrintWriter(env.err(), true), false, false);
+                listener = new DebugProtocolServerListener(context, suspend, waitAttached, false, Collections.emptyList());
+                return listener;
+            }
+
+            @Override
+            public DAPSessionHandler getSessionHandler(final boolean suspend, final boolean inspectInternal, final boolean inspectInitialization, Runnable prolog, List<URI> sourcePath)
+                            throws IOException {
                 return new DAPSessionHandler() {
 
                     private PipedOutputStream out;
@@ -59,7 +72,11 @@ public class DAPTestInstrument extends TruffleInstrument {
                         this.out = new PipedOutputStream();
                         PipedOutputStream pos = new PipedOutputStream();
                         in = new PipedInputStream(pos, 2048);
-                        DebugProtocolServer.Session.connect(DebugProtocolServerImpl.create(context, suspend, inspectInternal, inspectInitialization), new PipedInputStream(this.out, 2048), pos,
+                        DebugProtocolServerImpl dapServer = DebugProtocolServerImpl.create(context, suspend, inspectInternal, inspectInitialization, sourcePath);
+                        if (prolog != null) {
+                            prolog.run();
+                        }
+                        DebugProtocolServer.Session.connect(dapServer, new PipedInputStream(this.out, 2048), pos,
                                         Executors.newSingleThreadExecutor());
                         return this;
                     }
@@ -78,10 +95,18 @@ public class DAPTestInstrument extends TruffleInstrument {
         });
     }
 
+    @Override
+    protected void onFinalize(Env env) {
+        if (listener != null) {
+            listener.dispose();
+        }
+    }
 }
 
 interface DAPSessionHandlerProvider {
-    DAPSessionHandler getSessionHandler(boolean suspend, boolean inspectInternal, boolean inspectInitialization) throws IOException;
+    DebugProtocolServerListener getServer(boolean suspend, boolean waitAttached);
+
+    DAPSessionHandler getSessionHandler(boolean suspend, boolean inspectInternal, boolean inspectInitialization, Runnable prolog, List<URI> sourcePath) throws IOException;
 }
 
 interface DAPSessionHandler {

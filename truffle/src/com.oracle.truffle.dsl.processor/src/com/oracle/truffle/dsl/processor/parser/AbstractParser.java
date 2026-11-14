@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -49,13 +49,16 @@ import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeMirror;
 import javax.tools.Diagnostic.Kind;
 
 import com.oracle.truffle.dsl.processor.CompileErrorException;
 import com.oracle.truffle.dsl.processor.Log;
 import com.oracle.truffle.dsl.processor.ProcessorContext;
+import com.oracle.truffle.dsl.processor.Timer;
 import com.oracle.truffle.dsl.processor.TruffleProcessorOptions;
 import com.oracle.truffle.dsl.processor.TruffleTypes;
+import com.oracle.truffle.dsl.processor.bytecode.model.BytecodeDSLModels;
 import com.oracle.truffle.dsl.processor.java.ElementUtils;
 import com.oracle.truffle.dsl.processor.library.LibraryData;
 import com.oracle.truffle.dsl.processor.model.MessageContainer;
@@ -104,9 +107,10 @@ public abstract class AbstractParser<M extends MessageContainer> {
         return true;
     }
 
+    @SuppressWarnings({"unchecked", "try"})
     public final M parse(Element element, boolean emitErrors) {
         M model = null;
-        try {
+        try (Timer timer = Timer.create(getClass().getSimpleName(), element)) {
             List<AnnotationMirror> mirrors = null;
             if (getAnnotationType() != null) {
                 mirrors = ElementUtils.getRepeatedAnnotation(element.getAnnotationMirrors(), getAnnotationType());
@@ -118,15 +122,15 @@ public abstract class AbstractParser<M extends MessageContainer> {
             }
 
             if (emitErrors) {
-                model.emitMessages(context, log);
+                model.emitMessages(log);
             }
-            if (model instanceof NodeData || model instanceof LibraryData) {
+            if (model instanceof NodeData || model instanceof LibraryData || model instanceof BytecodeDSLModels) {
                 return model;
             } else {
                 return emitErrors ? filterErrorElements(model) : model;
             }
         } catch (CompileErrorException e) {
-            log.message(Kind.WARNING, element, null, null, "The truffle processor could not parse class due to error: %s", e.getMessage());
+            log.message(Kind.WARNING, element, null, null, "The truffle processor could not parse class due to error: %s%nError: ", e.getMessage(), ElementUtils.printException(e));
             return null;
         }
     }
@@ -162,6 +166,14 @@ public abstract class AbstractParser<M extends MessageContainer> {
 
     public List<DeclaredType> getTypeDelegatedAnnotationTypes() {
         return Collections.emptyList();
+    }
+
+    protected final TypeMirror type(Class<?> c) {
+        return context.getType(c);
+    }
+
+    protected final DeclaredType declaredType(Class<?> t) {
+        return context.getDeclaredType(t);
     }
 
 }

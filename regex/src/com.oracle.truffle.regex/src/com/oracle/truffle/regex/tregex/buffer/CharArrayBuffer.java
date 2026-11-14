@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,6 +43,8 @@ package com.oracle.truffle.regex.tregex.buffer;
 
 import java.util.Arrays;
 
+import com.oracle.truffle.regex.util.EmptyArrays;
+
 /**
  * This class is designed as a "scratchpad" for generating many char arrays of unknown size. It will
  * never shrink its internal buffer, so it should be disposed as soon as it is no longer needed.
@@ -52,7 +54,7 @@ import java.util.Arrays;
  *
  * <pre>
  * CharArrayBuffer buf = new CharArrayBuffer();
- * List<char[]> results = new ArrayList<>();
+ * List&lt;char[]> results = new ArrayList&lt;>();
  * for (Object obj : listOfThingsToProcess) {
  *     for (Object x : obj.thingsThatShouldBecomeChars()) {
  *         buf.add(someCalculation(x));
@@ -64,7 +66,6 @@ import java.util.Arrays;
  */
 public class CharArrayBuffer extends AbstractArrayBuffer {
 
-    private static final char[] EMPTY = {};
     protected char[] buf;
 
     public CharArrayBuffer() {
@@ -73,6 +74,11 @@ public class CharArrayBuffer extends AbstractArrayBuffer {
 
     public CharArrayBuffer(int initialSize) {
         buf = new char[initialSize];
+    }
+
+    public CharArrayBuffer(CharArrayBuffer copy) {
+        buf = Arrays.copyOf(copy.buf, copy.buf.length);
+        setLength(copy.length());
     }
 
     @Override
@@ -105,6 +111,6 @@ public class CharArrayBuffer extends AbstractArrayBuffer {
     }
 
     public char[] toArray() {
-        return isEmpty() ? EMPTY : Arrays.copyOf(buf, length);
+        return isEmpty() ? EmptyArrays.CHAR : Arrays.copyOf(buf, length);
     }
 }

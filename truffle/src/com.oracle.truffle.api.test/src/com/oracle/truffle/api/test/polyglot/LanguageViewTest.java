@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -54,15 +54,12 @@ import org.graalvm.polyglot.Context;
 import org.junit.Test;
 import org.junit.runners.Parameterized.Parameters;
 
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.LanguageInfo;
-import com.oracle.truffle.api.source.Source;
-import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.api.test.AbstractParametrizedLibraryTest;
 
 public class LanguageViewTest extends AbstractParametrizedLibraryTest {
@@ -76,13 +73,13 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
     static class ProxyLanguageObject implements TruffleObject {
 
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return ProxyLanguage.class;
+        String getLanguageId() {
+            return ProxyLanguage.ID;
         }
 
         @SuppressWarnings("static-method")
@@ -97,13 +94,13 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
     static class OtherLanguageObject implements TruffleObject {
 
         @ExportMessage
-        boolean hasLanguage() {
+        boolean hasLanguageId() {
             return true;
         }
 
         @ExportMessage
-        Class<? extends TruffleLanguage<?>> getLanguage() {
-            return OtherTestLanguage.class;
+        String getLanguageId() {
+            return OtherTestLanguage.ID;
         }
 
         @SuppressWarnings("static-method")
@@ -114,21 +111,20 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
 
     }
 
+    public LanguageViewTest() {
+        needsInstrumentEnv = true;
+    }
+
     @Test
     public void testDefaultLanguageView() throws UnsupportedMessageException {
         setupEnv(Context.create(), new ProxyLanguage() {
-            @Override
-            protected Object findMetaObject(LanguageContext c, Object value) {
-                return null;
-            }
-
         });
         LanguageInfo l = instrumentEnv.getLanguages().get(ProxyLanguage.ID);
 
         // test primitive
         Object view = instrumentEnv.getLanguageView(l, "42");
         InteropLibrary viewLib = createLibrary(InteropLibrary.class, view);
-        assertTrue(viewLib.hasLanguage(view));
+        assertTrue(viewLib.hasLanguageId(view));
         assertFalse(viewLib.hasMetaObject(view));
         assertFalse(viewLib.hasSourceLocation(view));
         assertEquals("42", viewLib.toDisplayString(view));
@@ -138,8 +134,8 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
         view = instrumentEnv.getLanguageView(l, o);
         assertSame(view, o);
         viewLib = createLibrary(InteropLibrary.class, view);
-        assertTrue(viewLib.hasLanguage(view));
-        assertSame(ProxyLanguage.class, viewLib.getLanguage(view));
+        assertTrue(viewLib.hasLanguageId(view));
+        assertEquals(ProxyLanguage.ID, viewLib.getLanguageId(view));
         assertFalse(viewLib.hasMetaObject(view));
         assertFalse(viewLib.hasSourceLocation(view));
         assertEquals("42", viewLib.toDisplayString(view));
@@ -149,11 +145,11 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
         view = instrumentEnv.getLanguageView(l, o);
         assertNotSame(view, o);
         viewLib = createLibrary(InteropLibrary.class, view);
-        assertTrue(viewLib.hasLanguage(view));
-        assertSame(ProxyLanguage.class, viewLib.getLanguage(view));
+        assertTrue(viewLib.hasLanguageId(view));
+        assertEquals(ProxyLanguage.ID, viewLib.getLanguageId(view));
         assertFalse(viewLib.hasMetaObject(view));
         assertFalse(viewLib.hasSourceLocation(view));
-        assertEquals(o.toString(), viewLib.toDisplayString(view));
+        assertEquals("other", viewLib.toDisplayString(view));
     }
 
     Function<Object, Object> getLanguageView;
@@ -179,79 +175,6 @@ public class LanguageViewTest extends AbstractParametrizedLibraryTest {
         assertFails(() -> instrumentEnv.getLanguageView(l, null), NullPointerException.class);
         assertFails(() -> instrumentEnv.getLanguageView(l, new Object()), ClassCastException.class);
         assertFails(() -> instrumentEnv.getLanguageView(null, ""), NullPointerException.class);
-    }
-
-    public static class LegacyLanguageView implements TruffleObject {
-
-        final SourceSection section;
-        final Object metaObject;
-
-        LegacyLanguageView(SourceSection section, Object metaObject) {
-            this.section = section;
-            this.metaObject = metaObject;
-        }
-
-    }
-
-    @Test
-    public void testLegacy() throws UnsupportedMessageException {
-        setupEnv(Context.create(), new ProxyLanguage() {
-            @Override
-            protected boolean isObjectOfLanguage(Object object) {
-                return object instanceof LegacyLanguageView;
-            }
-
-            @Override
-            protected SourceSection findSourceLocation(LanguageContext c, Object value) {
-                if (value instanceof LegacyLanguageView) {
-                    return ((LegacyLanguageView) value).section;
-                }
-                return null;
-            }
-
-            @Override
-            protected Object findMetaObject(LanguageContext c, Object value) {
-                if (value instanceof LegacyLanguageView) {
-                    return ((LegacyLanguageView) value).metaObject;
-                }
-                return null;
-            }
-
-            @Override
-            protected String toString(LanguageContext c, Object value) {
-                return "s";
-            }
-        });
-        LanguageInfo l = instrumentEnv.getLanguages().get(ProxyLanguage.ID);
-        Object view = instrumentEnv.getLanguageView(l, new LegacyLanguageView(null, null));
-
-        InteropLibrary viewLib = createLibrary(InteropLibrary.class, view);
-        assertTrue(viewLib.hasLanguage(view));
-        assertSame(ProxyLanguage.class, viewLib.getLanguage(view));
-        assertFalse(viewLib.hasSourceLocation(view));
-        assertFalse(viewLib.hasMetaObject(view));
-        assertEquals("s", viewLib.toDisplayString(view));
-
-        Source source = Source.newBuilder("js", "foo", " ").build();
-        SourceSection section = source.createSection(1);
-        String metaObject = "metaObject";
-
-        view = instrumentEnv.getLanguageView(l, new LegacyLanguageView(section, metaObject));
-        viewLib = createLibrary(InteropLibrary.class, view);
-        assertTrue(viewLib.hasLanguage(view));
-        assertSame(ProxyLanguage.class, viewLib.getLanguage(view));
-        assertTrue(viewLib.hasSourceLocation(view));
-        assertSame(section, viewLib.getSourceLocation(view));
-        assertTrue(viewLib.hasMetaObject(view));
-        assertEquals("s", viewLib.toDisplayString(view));
-
-        Object meta = viewLib.getMetaObject(view);
-        InteropLibrary metaLib = createLibrary(InteropLibrary.class, meta);
-        assertTrue(metaLib.isMetaObject(meta));
-        assertEquals("metaObject", metaLib.getMetaQualifiedName(meta));
-        assertEquals("metaObject", metaLib.getMetaSimpleName(meta));
-        assertEquals("metaObject", metaLib.toDisplayString(meta));
-        assertTrue(metaLib.isMetaInstance(meta, view));
     }
 
 }

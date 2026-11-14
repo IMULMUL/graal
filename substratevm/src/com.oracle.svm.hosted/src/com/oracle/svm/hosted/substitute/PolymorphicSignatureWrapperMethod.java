@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,30 +24,32 @@
  */
 package com.oracle.svm.hosted.substitute;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereUnexpectedInput;
 
-import java.lang.annotation.Annotation;
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.Type;
+import java.util.ArrayList;
 import java.util.List;
 
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.nodes.CallTargetNode;
-import org.graalvm.compiler.nodes.InvokeWithExceptionNode;
-import org.graalvm.compiler.nodes.StateSplit;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.java.NewArrayNode;
-
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
-import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
-import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
 import com.oracle.svm.core.invoke.MethodHandleUtils;
 import com.oracle.svm.core.invoke.Target_java_lang_invoke_MemberName;
-import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.phases.HostedGraphKit;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.AnnotatedWrapper;
+import com.oracle.svm.util.OriginalMethodProvider;
 
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.nodes.CallTargetNode;
+import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
+import jdk.graal.compiler.nodes.StateSplit;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.java.NewArrayNode;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.ExceptionHandler;
@@ -59,13 +61,15 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 import jdk.vm.ci.meta.SpeculationLog;
+import jdk.vm.ci.meta.annotation.Annotated;
+import jdk.vm.ci.meta.annotation.AnnotationsInfo;
 
 /**
  * Creates a wrapper around a {@link java.lang.invoke.MethodHandle}.PolymorphicSignature method that
  * assembles the arguments into an array, performing necessary boxing operations. The wrapper then
  * transfers execution to the underlying varargs method.
  */
-public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, GraphProvider {
+public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, GraphProvider, AnnotatedWrapper, OriginalMethodProvider {
 
     private final SubstitutionMethod substitutionBaseMethod;
     private final ResolvedJavaMethod originalMethod;
@@ -77,37 +81,36 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
     PolymorphicSignatureWrapperMethod(SubstitutionMethod substitutionBaseMethod, ResolvedJavaMethod originalMethod) {
         this.substitutionBaseMethod = substitutionBaseMethod;
         this.originalMethod = originalMethod;
-        this.constantPool = substitutionBaseMethod.getDeclaringClass().getDeclaredConstructors()[0].getConstantPool();
+        this.constantPool = substitutionBaseMethod.getDeclaringClass().getDeclaredConstructors(false)[0].getConstantPool();
     }
 
     @Override
-    public StructuredGraph buildGraph(DebugContext debug, ResolvedJavaMethod method, HostedProviders providers, Purpose purpose) {
-        UniverseMetaAccess metaAccess = (UniverseMetaAccess) providers.getMetaAccess();
+    public ResolvedJavaMethod unwrapTowardsOriginalMethod() {
+        return originalMethod;
+    }
+
+    @Override
+    public StructuredGraph buildGraph(DebugContext debug, AnalysisMethod method, HostedProviders providers, Purpose purpose) {
         HostedGraphKit kit = new HostedGraphKit(debug, providers, method);
 
-        List<ValueNode> args = kit.loadArguments(method.toParameterTypes());
+        List<ValueNode> args = new ArrayList<>(kit.getInitialArguments());
         ValueNode receiver = null;
         if (!substitutionBaseMethod.isStatic()) {
-            receiver = args.remove(0);
+            receiver = args.removeFirst();
         }
 
-        ValueNode parameterArray = kit.append(new NewArrayNode(metaAccess.lookupJavaType(Object.class), kit.createInt(args.size()), false));
+        ValueNode parameterArray = kit.append(new NewArrayNode(kit.getMetaAccess().lookupJavaType(Object.class), kit.createInt(args.size()), true));
+
         for (int i = 0; i < args.size(); ++i) {
             ValueNode arg = args.get(i);
             if (arg.getStackKind().isPrimitive()) {
-                arg = kit.createBoxing(arg, arg.getStackKind(), metaAccess.lookupJavaType(arg.getStackKind().toBoxedJavaClass()));
+                arg = kit.createBoxing(arg, arg.getStackKind(), kit.getMetaAccess().lookupJavaType(arg.getStackKind().toBoxedJavaClass()));
             }
             StateSplit storeIndexedNode = (StateSplit) kit.createStoreIndexed(parameterArray, i, JavaKind.Object, arg);
             storeIndexedNode.setStateAfter(kit.getFrameState().create(kit.bci(), storeIndexedNode));
         }
 
-        ResolvedJavaMethod invokeTarget;
-        if (metaAccess instanceof AnalysisMetaAccess) {
-            invokeTarget = metaAccess.getUniverse().lookup(substitutionBaseMethod.getOriginal());
-        } else {
-            invokeTarget = metaAccess.getUniverse().lookup(((AnalysisMetaAccess) metaAccess.getWrapped()).getUniverse().lookup(substitutionBaseMethod.getOriginal()));
-        }
-
+        AnalysisMethod invokeTarget = kit.getMetaAccess().getUniverse().lookup(substitutionBaseMethod.getOriginal());
         InvokeWithExceptionNode invoke;
         if (substitutionBaseMethod.isStatic()) {
             invoke = kit.createInvokeWithExceptionAndUnwind(invokeTarget, CallTargetNode.InvokeKind.Static, kit.getFrameState(), kit.bci(), parameterArray);
@@ -124,9 +127,9 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
                  * handle and the bytecode type of the invocation itself (for compatible primitive
                  * types only). For example, int value = mh.invokeBasic(...) where
                  * mh.type().returnType() == short.class.
-                 * 
-                 * This doesn't cause trouble in HotSpot since these values can be silently casted
-                 * to the expected type. However, since Native Image handles the return value as a
+                 *
+                 * This doesn't cause trouble in HotSpot since these values can be silently cast to
+                 * the expected type. However, since Native Image handles the return value as a
                  * boxed object, it needs to explicitly cast it to the required type to avoid tricky
                  * bugs to occur.
                  *
@@ -145,35 +148,58 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
                 case Int:
                 case Long:
                     ValueNode methodHandleOrMemberName;
-                    ResolvedJavaMethod unboxMethod;
+                    AnalysisMethod unboxMethod;
                     try {
-                        String unboxMethodName = returnKind.toString() + "Unbox";
                         switch (substitutionBaseMethod.getName()) {
                             case "invokeBasic":
                             case "invokeExact":
                             case "invoke":
+                                /*
+                                 * Crema returns a type based on the form's vmentry. See
+                                 * CremaSupportImpl.invokeBasic*
+                                 */
+                                boolean crema = RuntimeClassLoading.isSupported();
                                 methodHandleOrMemberName = receiver;
-                                unboxMethod = metaAccess.lookupJavaMethod(
-                                                MethodHandleUtils.class.getMethod(unboxMethodName, Object.class, MethodHandle.class));
+                                unboxMethod = kit.getMetaAccess().lookupJavaMethod(
+                                                MethodHandleUtils.getUnboxMethod(returnKind, crema, Object.class, MethodHandle.class));
                                 break;
                             case "linkToVirtual":
                             case "linkToStatic":
                             case "linkToInterface":
                             case "linkToSpecial":
-                                methodHandleOrMemberName = args.get(args.size() - 1);
-                                unboxMethod = metaAccess.lookupJavaMethod(
-                                                MethodHandleUtils.class.getMethod(unboxMethodName, Object.class, Target_java_lang_invoke_MemberName.class));
+                                if (RuntimeClassLoading.isSupported()) {
+                                    /*
+                                     * Crema already applies the conversion. See
+                                     * CremaSupportImpl.linkTo*
+                                     */
+                                    unboxMethod = null;
+                                    methodHandleOrMemberName = null;
+                                } else {
+                                    methodHandleOrMemberName = args.getLast();
+                                    unboxMethod = kit.getMetaAccess().lookupJavaMethod(
+                                                    MethodHandleUtils.getUnboxMethod(returnKind, false, Object.class, Target_java_lang_invoke_MemberName.class));
+                                }
                                 break;
+                            case "linkToNative": {
+                                methodHandleOrMemberName = args.getLast();
+                                unboxMethod = kit.getMetaAccess().lookupJavaMethod(MethodHandleUtils.getUnboxForeignMethod(returnKind));
+                                break;
+                            }
                             default:
-                                throw shouldNotReachHere();
+                                throw shouldNotReachHereUnexpectedInput(substitutionBaseMethod.getName()); // ExcludeFromJacocoGeneratedReport
                         }
                     } catch (NoSuchMethodException e) {
-                        throw shouldNotReachHere();
+                        throw shouldNotReachHere(e);
                     }
-                    retVal = kit.createInvokeWithExceptionAndUnwind(unboxMethod, CallTargetNode.InvokeKind.Static, kit.getFrameState(), kit.bci(), retVal, methodHandleOrMemberName);
+                    if (unboxMethod != null) {
+                        assert methodHandleOrMemberName != null;
+                        retVal = kit.createInvokeWithExceptionAndUnwind(unboxMethod, CallTargetNode.InvokeKind.Static, kit.getFrameState(), kit.bci(), retVal, methodHandleOrMemberName);
+                    } else {
+                        retVal = kit.createUnboxing(invoke, returnKind);
+                    }
                     break;
                 default:
-                    retVal = kit.createUnboxing(invoke, returnKind, metaAccess);
+                    retVal = kit.createUnboxing(invoke, returnKind);
             }
         }
         kit.createReturn(retVal, returnKind);
@@ -242,6 +268,11 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
     }
 
     @Override
+    public boolean isDeclared() {
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
     public boolean isClassInitializer() {
         return false;
     }
@@ -271,12 +302,12 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
 
     @Override
     public ProfilingInfo getProfilingInfo(boolean includeNormal, boolean includeOSR) {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public void reprofile() {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
@@ -285,13 +316,8 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
     }
 
     @Override
-    public Annotation[][] getParameterAnnotations() {
-        throw VMError.unimplemented();
-    }
-
-    @Override
     public Type[] getGenericParameterTypes() {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
@@ -321,36 +347,36 @@ public class PolymorphicSignatureWrapperMethod implements ResolvedJavaMethod, Gr
 
     @Override
     public Constant getEncoding() {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public boolean isInVirtualMethodTable(ResolvedJavaType resolved) {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public SpeculationLog getSpeculationLog() {
-        throw VMError.unimplemented();
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return substitutionBaseMethod.getAnnotation(annotationClass);
-    }
-
-    @Override
-    public Annotation[] getAnnotations() {
-        return substitutionBaseMethod.getAnnotations();
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return substitutionBaseMethod.getDeclaredAnnotations();
+    public Annotated getWrappedAnnotated() {
+        return substitutionBaseMethod;
     }
 
     @Override
     public int getModifiers() {
         return substitutionBaseMethod.getModifiers();
+    }
+
+    @Override
+    public AnnotationsInfo getParameterAnnotationInfo() {
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public AnnotationsInfo getAnnotationDefaultInfo() {
+        throw VMError.intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 }

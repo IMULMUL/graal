@@ -1,0 +1,213 @@
+/*
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * The Universal Permissive License (UPL), Version 1.0
+ *
+ * Subject to the condition set forth below, permission is hereby granted to any
+ * person obtaining a copy of this software, associated documentation and/or
+ * data (collectively the "Software"), free of charge and under any and all
+ * copyright rights in the Software, and any and all patent rights owned or
+ * freely licensable by each licensor hereunder covering either (i) the
+ * unmodified Software as contributed to or provided by such licensor, or (ii)
+ * the Larger Works (as defined below), to deal in both
+ *
+ * (a) the Software, and
+ *
+ * (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+ * one is included with the Software each a "Larger Work" to which the Software
+ * is contributed by such licensors),
+ *
+ * without restriction, including without limitation the rights to copy, create
+ * derivative works of, display, perform, and distribute the Software and make,
+ * use, sell, offer for sale, import, export, have made, and have sold the
+ * Software and the Larger Work(s), and to sublicense the foregoing rights on
+ * either these or other terms.
+ *
+ * This license is subject to the following condition:
+ *
+ * The above copyright notice and either this complete permission notice or at a
+ * minimum a reference to the UPL must be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.oracle.truffle.runtime;
+
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.nodes.DirectCallNode;
+import com.oracle.truffle.api.nodes.NodeInfo;
+import com.oracle.truffle.api.nodes.RootNode;
+
+/**
+ * A call node with a constant {@link CallTarget} that can be optimized by Graal.
+ *
+ * Note: {@code PartialEvaluator} looks up this class and a number of its methods by name.
+ */
+@NodeInfo
+public final class OptimizedDirectCallNode extends DirectCallNode {
+
+    /*
+     * Reflectively read by the Truffle compiler. See KnownTruffleTypes.
+     */
+    private boolean inliningForced;
+    @CompilationFinal private Class<? extends Throwable> exceptionProfile;
+
+    /*
+     * Reflectively read by the Truffle compiler. See KnownTruffleTypes.
+     */
+    @CompilationFinal private OptimizedCallTarget currentCallTarget;
+
+    /*
+     * Should be instantiated with the runtime.
+     */
+    OptimizedDirectCallNode(OptimizedCallTarget target) {
+        super(target);
+        assert target.isSourceCallTarget();
+        this.currentCallTarget = target;
+    }
+
+    @Override
+    public OptimizedDirectCallNode copy() {
+        OptimizedDirectCallNode copy = (OptimizedDirectCallNode) super.copy();
+        copy.getCurrentCallTarget().addDirectCallNode(copy);
+        return copy;
+    }
+
+    @Override
+    public Object call(Object... arguments) {
+        OptimizedCallTarget target = getCurrentCallTarget();
+        try {
+            return target.callDirect(this, -1, arguments);
+        } catch (Throwable t) {
+            throw handleException(t, -1);
+        }
+    }
+
+    @Override
+    public Object call(int bytecodeIndex, Object[] arguments) {
+        OptimizedCallTarget target = getCurrentCallTarget();
+        try {
+            return target.callDirect(this, bytecodeIndex, arguments);
+        } catch (Throwable t) {
+            throw handleException(t, bytecodeIndex);
+        }
+    }
+
+    @Override
+    public Object call(Class<? extends RootNode> rootType, int bytecodeIndex, Object[] arguments) {
+        OptimizedCallTarget target = getCurrentCallTarget();
+        RootNode root = rootType.cast(target.getRootNode());
+        return target.callRoot(this, bytecodeIndex, root, arguments);
+    }
+
+    private RuntimeException handleException(Throwable t, int bytecodeIndex) {
+        Throwable profiled = profileExceptionType(t);
+        OptimizedRuntimeAccessor.LANGUAGE.addStackFrameInfo(this, null, profiled, null, bytecodeIndex);
+        throw OptimizedCallTarget.rethrow(profiled);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends Throwable> T profileExceptionType(T value) {
+        Class<? extends Throwable> clazz = exceptionProfile;
+        if (clazz != Throwable.class) {
+            if (clazz != null && value.getClass() == clazz) {
+                if (CompilerDirectives.inInterpreter()) {
+                    return value;
+                } else {
+                    return (T) CompilerDirectives.castExact(value, clazz);
+                }
+            } else {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                if (clazz == null) {
+                    exceptionProfile = value.getClass();
+                } else {
+                    exceptionProfile = Throwable.class;
+                }
+            }
+        }
+        return value;
+    }
+
+    @Override
+    public boolean isInlinable() {
+        CompilerAsserts.neverPartOfCompilation();
+        return true;
+    }
+
+    @Override
+    public void forceInlining() {
+        CompilerAsserts.neverPartOfCompilation();
+        inliningForced = true;
+    }
+
+    @Override
+    public boolean isInliningForced() {
+        CompilerAsserts.neverPartOfCompilation();
+        return inliningForced;
+    }
+
+    @Override
+    public boolean isCallTargetCloningAllowed() {
+        return getCallTarget().getRootNode().isCloningAllowed();
+    }
+
+    @Override
+    public OptimizedCallTarget getCurrentCallTarget() {
+        return currentCallTarget;
+    }
+
+    public int getKnownCallSiteCount() {
+        return getCurrentCallTarget().getKnownCallSiteCount();
+    }
+
+    @Override
+    public OptimizedCallTarget getClonedCallTarget() {
+        if (currentCallTarget != callTarget) {
+            return currentCallTarget;
+        }
+        return null;
+    }
+
+    @Override
+    public OptimizedCallTarget getCallTarget() {
+        return (OptimizedCallTarget) super.getCallTarget();
+    }
+
+    /** Transfers caller registrations before publishing the cloned target. */
+    boolean installClonedCallTarget(OptimizedCallTarget expectedTarget, OptimizedCallTarget clonedTarget) {
+        CompilerAsserts.neverPartOfCompilation();
+
+        // Synchronize with atomic() as replace() also takes the same lock
+        // and we only want to take one lock to avoid deadlocks.
+        return atomic(() -> {
+            if (currentCallTarget != expectedTarget) {
+                return false;
+            }
+
+            if (getParent() != null) {
+                // dummy replace to report the split, irrelevant if this node is not adopted
+                replace(this, "Split call node");
+            }
+            expectedTarget.removeDirectCallNode(this);
+            clonedTarget.addDirectCallNode(this);
+            currentCallTarget = clonedTarget;
+            return true;
+        });
+    }
+
+    @Override
+    public boolean cloneCallTarget() {
+        TruffleSplittingStrategy.forceSplitting(this);
+        return true;
+    }
+}

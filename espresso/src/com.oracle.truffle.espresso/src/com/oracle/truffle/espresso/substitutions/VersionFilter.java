@@ -22,10 +22,15 @@
  */
 package com.oracle.truffle.espresso.substitutions;
 
-import com.oracle.truffle.espresso.runtime.JavaVersion;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.JavaVersion;
 
 @FunctionalInterface
-public interface VersionFilter {
+public interface VersionFilter extends LanguageFilter {
+
+    default boolean isValidFor(EspressoLanguage language) {
+        return isValidFor(language.getJavaVersion());
+    }
 
     boolean isValidFor(JavaVersion version);
 
@@ -50,6 +55,198 @@ public interface VersionFilter {
         @Override
         public boolean isValidFor(JavaVersion version) {
             return version.java8OrEarlier();
+        }
+    }
+
+    final class Java9OrLater implements VersionFilter {
+        public static final Java9OrLater INSTANCE = new Java9OrLater();
+
+        private Java9OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java9OrLater();
+        }
+    }
+
+    final class Java11OrEarlier implements VersionFilter {
+        public static final Java11OrEarlier INSTANCE = new Java11OrEarlier();
+
+        private Java11OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java11OrEarlier();
+        }
+    }
+
+    final class Java11OrLater implements VersionFilter {
+        public static final Java11OrLater INSTANCE = new Java11OrLater();
+
+        private Java11OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java11OrLater();
+        }
+    }
+
+    final class Java11To21 implements VersionFilter {
+        public static final Java11To21 INSTANCE = new Java11To21();
+
+        private Java11To21() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.inRange(11, 21);
+        }
+    }
+
+    final class Java13OrEarlier implements VersionFilter {
+        public static final Java13OrEarlier INSTANCE = new Java13OrEarlier();
+
+        private Java13OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java13OrEarlier();
+        }
+    }
+
+    final class Java17OrEarlier implements VersionFilter {
+        public static final Java17OrEarlier INSTANCE = new Java17OrEarlier();
+
+        private Java17OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java17OrEarlier();
+        }
+    }
+
+    final class Java18OrEarlier implements VersionFilter {
+        public static final Java18OrEarlier INSTANCE = new Java18OrEarlier();
+
+        private Java18OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java18OrEarlier();
+        }
+    }
+
+    final class Java19OrLater implements VersionFilter {
+        public static final Java19OrLater INSTANCE = new Java19OrLater();
+
+        private Java19OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java19OrLater();
+        }
+    }
+
+    final class Java20OrLater implements VersionFilter {
+        public static final Java20OrLater INSTANCE = new Java20OrLater();
+
+        private Java20OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java20OrLater();
+        }
+    }
+
+    final class Java21OrLater implements VersionFilter {
+        public static final Java21OrLater INSTANCE = new Java21OrLater();
+
+        private Java21OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java21OrLater();
+        }
+    }
+
+    final class Java21 implements VersionFilter {
+        public static final Java21 INSTANCE = new Java21();
+
+        private Java21() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.inRange(21, 21);
+        }
+    }
+
+    final class Java22OrLater implements VersionFilter {
+        public static final Java22OrLater INSTANCE = new Java22OrLater();
+
+        private Java22OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java22OrLater();
+        }
+    }
+
+    final class Java23OrEarlier implements VersionFilter {
+        public static final Java23OrEarlier INSTANCE = new Java23OrEarlier();
+
+        private Java23OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java23OrEarlier();
+        }
+    }
+
+    final class Java24OrEarlier implements VersionFilter {
+        public static final Java24OrEarlier INSTANCE = new Java24OrEarlier();
+
+        private Java24OrEarlier() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java24OrEarlier();
+        }
+    }
+
+    final class Java25OrLater implements VersionFilter {
+        public static final Java25OrLater INSTANCE = new Java25OrLater();
+
+        private Java25OrLater() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java25OrLater();
+        }
+    }
+
+    final class Java9To21 implements VersionFilter {
+        public static final Java9To21 INSTANCE = new Java9To21();
+
+        private Java9To21() {
+        }
+
+        @Override
+        public boolean isValidFor(JavaVersion version) {
+            return version.java21OrEarlier() && version.java9OrLater();
         }
     }
 }

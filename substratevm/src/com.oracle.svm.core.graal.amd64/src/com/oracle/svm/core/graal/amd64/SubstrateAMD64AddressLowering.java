@@ -24,15 +24,20 @@
  */
 package com.oracle.svm.core.graal.amd64;
 
-import org.graalvm.compiler.asm.amd64.AMD64Address.Scale;
-import org.graalvm.compiler.core.amd64.AMD64AddressNode;
-import org.graalvm.compiler.core.amd64.AMD64CompressAddressLowering;
-import org.graalvm.compiler.core.common.CompressEncoding;
-import org.graalvm.compiler.nodes.CompressionNode;
-import org.graalvm.compiler.nodes.ValueNode;
+import jdk.graal.compiler.asm.amd64.AMD64Address;
+import jdk.graal.compiler.core.common.Stride;
+import jdk.graal.compiler.core.amd64.AMD64AddressNode;
+import jdk.graal.compiler.core.amd64.AMD64CompressAddressLowering;
+import jdk.graal.compiler.core.common.CompressEncoding;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.CompressionNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.VirtualState;
+import jdk.graal.compiler.nodes.memory.address.AddressNode;
 
 import com.oracle.svm.core.ReservedRegisters;
-import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.interpreter.InterpreterSupport;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
 import jdk.vm.ci.code.Register;
 
@@ -47,16 +52,18 @@ public class SubstrateAMD64AddressLowering extends AMD64CompressAddressLowering 
 
     @Override
     protected final boolean improveUncompression(AMD64AddressNode addr, CompressionNode compression, ValueNode other) {
-        assert SubstrateOptions.SpawnIsolates.getValue();
+        if (isUncompressedValueAvailableInHandler(compression)) {
+            return false;
+        }
 
         CompressEncoding encoding = compression.getEncoding();
-        if (!Scale.isScaleShiftSupported(encoding.getShift())) {
+        if (!AMD64Address.isScaleShiftSupported(encoding.getShift())) {
             return false;
         }
 
         long encodingBase = encoding.getBase();
         ValueNode base = other;
-        if (heapBaseRegister != null && encodingBase == heapBase) {
+        if (encodingBase == heapBase) {
             if (other != null) {
                 return false;
             }
@@ -67,10 +74,24 @@ public class SubstrateAMD64AddressLowering extends AMD64CompressAddressLowering 
             }
         }
 
-        Scale scale = Scale.fromShift(encoding.getShift());
+        Stride stride = Stride.fromLog2(encoding.getShift());
         addr.setBase(base);
-        addr.setScale(scale);
+        addr.setScale(stride);
         addr.setIndex(compression.getValue());
         return true;
+    }
+
+    private static boolean isUncompressedValueAvailableInHandler(CompressionNode compression) {
+        if (!SubstrateUtil.HOSTED || !InterpreterSupport.isEnabled() || compression.graph().method() == null ||
+                        !InterpreterSupport.singleton().isInterpreterBytecodeHandlerStub(compression.graph().method())) {
+            return false;
+        }
+        for (Node usage : compression.usages()) {
+            if (!(usage instanceof AddressNode) && !(usage instanceof VirtualState)) {
+                /* The scheduled uncompress dominates all its uses, so reuse it for addresses too. */
+                return true;
+            }
+        }
+        return false;
     }
 }

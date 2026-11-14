@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,8 +43,7 @@ package com.oracle.truffle.api;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 
-import com.oracle.truffle.api.nodes.NodeCost;
-import com.oracle.truffle.api.nodes.NodeInfo;
+import org.graalvm.nativeimage.ImageInfo;
 
 /**
  * Class containing general Truffle options.
@@ -75,6 +74,26 @@ public final class TruffleOptions {
     public static final boolean DetailedRewriteReasons;
 
     /**
+     * Enables expensive assertions in Truffle and guest language implementations. An assertion is
+     * expensive if its cost is significant compared to the operation it checks, for example when it
+     * recomputes a cached result.
+     * <p>
+     * Disabled by default. Can be set with {@code -Dtruffle.DetailedAssertions=true} before this class
+     * is initialized. Java assertions must also be enabled for the classes containing the checks.
+     * For native images, set the property when building the image. This is not a polyglot option and
+     * is not forwarded to polyglot isolates.
+     * <p>
+     * Use this option to guard expensive checks while keeping inexpensive assertions enabled:
+     *
+     * <pre>
+     * assert !TruffleOptions.DetailedAssertions || expensiveCheck();
+     * </pre>
+     *
+     * @since 25.6
+     */
+    public static final boolean DetailedAssertions;
+
+    /**
      * Filters rewrites that do not contain the given string in the qualified name of the source or
      * target class hierarchy.
      * <p>
@@ -85,26 +104,16 @@ public final class TruffleOptions {
     public static final String TraceRewritesFilterClass;
 
     /**
-     * Filters rewrites which does not contain the {@link NodeCost} in its source {@link NodeInfo}.
-     * If no {@link NodeInfo} is defined the element is filtered if the filter value is set.
-     * <p>
-     * Can be set with
-     * {@code -Dtruffle.TraceRewritesFilterFromCost=NONE|MONOMORPHIC|POLYMORPHIC|MEGAMORPHIC}.
-     *
      * @since 0.8 or earlier
+     * @deprecated in 24.1 without replacement
      */
-    public static final NodeCost TraceRewritesFilterFromCost;
+    @SuppressWarnings("deprecation") @Deprecated public static final com.oracle.truffle.api.nodes.NodeCost TraceRewritesFilterFromCost;
 
     /**
-     * Filters rewrites which does not contain the {@link NodeCost} in its target {@link NodeInfo}.
-     * If no {@link NodeInfo} is defined the element is filtered if the filter value is set.
-     * <p>
-     * Can be set with
-     * {@code -Dtruffle.TraceRewritesFilterToKind=UNINITIALIZED|SPECIALIZED|POLYMORPHIC|GENERIC}.
-     *
      * @since 0.8 or earlier
+     * @deprecated in 24.1 without replacement
      */
-    public static final NodeCost TraceRewritesFilterToCost;
+    @SuppressWarnings("deprecation") @Deprecated public static final com.oracle.truffle.api.nodes.NodeCost TraceRewritesFilterToCost;
 
     /**
      * Forces ahead-of-time initialization.
@@ -113,35 +122,31 @@ public final class TruffleOptions {
      */
     public static final boolean AOT;
 
-    private static NodeCost parseNodeInfoKind(String kind) {
+    @SuppressWarnings("deprecation")
+    private static com.oracle.truffle.api.nodes.NodeCost parseNodeInfoKind(String kind) {
         if (kind == null) {
             return null;
         }
 
-        return NodeCost.valueOf(kind);
+        return com.oracle.truffle.api.nodes.NodeCost.valueOf(kind);
     }
 
     static {
-        /*
-         * Ensure TruffleRuntime gets initialized before TruffleOptions are set. This allows a
-         * specific TruffleRuntime to effect the system properties that are used to determine the
-         * values for the TruffleOptions below.
-         */
-        Truffle.getRuntime();
-
         class GetOptions implements PrivilegedAction<Void> {
             boolean aot;
             boolean traceRewrites;
             boolean detailedRewriteReasons;
+            boolean detailedAssertions;
             String traceRewritesFilterClass;
-            NodeCost traceRewritesFilterFromCost;
-            NodeCost traceRewritesFilterToCost;
+            @SuppressWarnings("deprecation") com.oracle.truffle.api.nodes.NodeCost traceRewritesFilterFromCost;
+            @SuppressWarnings("deprecation") com.oracle.truffle.api.nodes.NodeCost traceRewritesFilterToCost;
 
             @Override
             public Void run() {
-                aot = Boolean.getBoolean("com.oracle.graalvm.isaot");
+                aot = ImageInfo.inImageCode();
                 traceRewrites = Boolean.getBoolean("truffle.TraceRewrites");
                 detailedRewriteReasons = Boolean.getBoolean("truffle.DetailedRewriteReasons");
+                detailedAssertions = Boolean.getBoolean("truffle.DetailedAssertions");
                 traceRewritesFilterClass = System.getProperty("truffle.TraceRewritesFilterClass");
                 traceRewritesFilterFromCost = parseNodeInfoKind(System.getProperty("truffle.TraceRewritesFilterFromCost"));
                 traceRewritesFilterToCost = parseNodeInfoKind(System.getProperty("truffle.TraceRewritesFilterToCost"));
@@ -153,6 +158,7 @@ public final class TruffleOptions {
         AccessController.doPrivileged(options);
         TraceRewrites = options.traceRewrites;
         DetailedRewriteReasons = options.detailedRewriteReasons;
+        DetailedAssertions = options.detailedAssertions;
         AOT = options.aot;
         TraceRewritesFilterClass = options.traceRewritesFilterClass;
         TraceRewritesFilterFromCost = options.traceRewritesFilterFromCost;

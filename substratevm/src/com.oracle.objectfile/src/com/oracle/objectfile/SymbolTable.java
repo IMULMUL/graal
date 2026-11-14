@@ -30,7 +30,21 @@ import com.oracle.objectfile.ObjectFile.Symbol;
 public interface SymbolTable extends Iterable<Symbol> {
     Symbol getSymbol(String name);
 
-    Symbol newDefinedEntry(String name, ObjectFile.Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode);
+    Symbol newDefinedEntry(String name, ObjectFile.Section referencedSection, long referencedOffset, long size, boolean isGlobal, boolean isCode, boolean isExported);
 
     Symbol newUndefinedEntry(String name, boolean isCode);
+
+    /**
+     * Simple sanity check: don't let a symbol replace a symbol, to be used with
+     * {@link java.util.Map#compute}.
+     *
+     * Previously we allowed the replacement of undefined symbols; however, this is unnecessary and
+     * then requires the linking resolution to be performed at run time.
+     */
+    static <T extends Symbol> T tryReplace(T oldEntry, T newEntry) {
+        if (oldEntry != null) {
+            throw new RuntimeException(String.format("Illegal replacement of symbol table entry. Name: '%s'", newEntry.getName()));
+        }
+        return newEntry;
+    }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,266 +24,397 @@
  */
 package com.oracle.svm.hosted;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
-
+import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
+import java.io.PrintStream;
 import java.lang.annotation.Annotation;
+import java.lang.annotation.AnnotationFormatError;
 import java.lang.reflect.AnnotatedElement;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
+import com.oracle.svm.shared.option.HostedOptionValues;
 import org.graalvm.collections.EconomicSet;
-import org.graalvm.compiler.word.Word;
+import org.graalvm.nativeimage.AnnotationAccess;
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.ClassLoaderQuery;
-import com.oracle.svm.core.TypeResult;
+import com.oracle.graal.pointsto.ExtensionPolicy;
+import com.oracle.graal.pointsto.flow.MethodFlowsGraph;
+import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.shared.BuildPhaseProvider;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.hosted.imagelayer.LayeredDispatchTableFeature;
+import com.oracle.svm.shared.util.LogUtils;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAccess;
+import com.oracle.svm.util.HostedModuleSupport;
+import com.oracle.svm.util.TypeResult;
 
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModule;
+import jdk.graal.compiler.vmaccess.ResolvedJavaModuleLayer;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.annotation.Annotated;
+
+/**
+ * This class maintains a dictionary of the classes {@linkplain #loadAllClasses() loaded} from the
+ * Native Image builder class-path and module-path. Until Terminus is done, it unfortunately also
+ * includes classes loaded from the application class-path and module-path. Terminus is working to
+ * ensure the latter are _only_ managed by {@link GuestTypes}.
+ */
 public final class ImageClassLoader {
-
-    /*
-     * This cannot be a HostedOption because the option parsing already relies on the list of loaded
-     * classes.
+    /**
+     * The types, methods and fields available in the guest context.
      */
-    private static final int CLASS_LOADING_MAX_SCALING = 8;
-    private static final int CLASS_LOADING_TIMEOUT_IN_MINUTES = 10;
+    public final GuestTypes guestTypes;
 
-    static {
-        /*
-         * ImageClassLoader is one of the first classes used during image generation, so early
-         * enough to ensure that we can use the Word type.
-         */
-        Word.ensureInitialized();
-    }
-
+    /**
+     * The platform of the target image being built.
+     */
     public final Platform platform;
-    final NativeImageClassLoaderSupport classLoaderSupport;
 
-    private final EconomicSet<Class<?>> applicationClasses = EconomicSet.create();
+    public final NativeImageClassLoaderSupport classLoaderSupport;
+    public final DeadlockWatchdog watchdog;
+
+    /**
+     * The set of builder-context classes compatible with the {@linkplain #platform target platform}
+     * that should _not_ end up in the image. Once project Terminus is resolved, this should be
+     * deleted and only {@link #hostedOnlyClasses} remains.
+     */
+    private final EconomicSet<Class<?>> builderClasses = EconomicSet.create();
+
+    /**
+     * The set of hosted-only classes loaded from the Native Image class-path and module-path.
+     */
     private final EconomicSet<Class<?>> hostedOnlyClasses = EconomicSet.create();
-    private final EconomicSet<Method> systemMethods = EconomicSet.create();
-    private final EconomicSet<Field> systemFields = EconomicSet.create();
+
+    /**
+     * Builder modules that comprise the Native Image builder. This does not describe which modules are
+     * visible in a guest VM access context.
+     */
+    private Set<Module> builderModules;
+
+    /**
+     * Modules containing SVM runtime code rather than application code. Membership in this set is used
+     * by {@link SVMHost#isCoreType(ResolvedJavaType)} to classify SVM runtime types. In an open type
+     * world, {@link ExtensionPolicy#isTypeClosed(AnalysisType)} treats their type hierarchies as closed,
+     * {@link ExtensionPolicy#isFieldClosed(ResolvedJavaField)} treats their fields as closed by default, and
+     * {@link MethodFlowsGraph} excludes their methods from open-world saturation.
+     * <p>
+     * In layered builds, {@link ExtensionLayerImageFeature} requires these types and their subtypes to
+     * be complete in the initial layer, while {@link LayeredDispatchTableFeature} omits calls involving
+     * these modules from virtual-call roots persisted for later layers. At image run time,
+     * {@link #getDynamicHubClassLoader(Class)} assigns these classes the null class loader.
+     * <p>
+     * During the Terminus migration, non-isolated builds also include builder modules that still contain
+     * SVM runtime code.
+     */
+    private Set<ResolvedJavaModule> coreGuestModules;
 
     ImageClassLoader(Platform platform, NativeImageClassLoaderSupport classLoaderSupport) {
         this.platform = platform;
         this.classLoaderSupport = classLoaderSupport;
-    }
 
-    public void initAllClasses() {
-        final ForkJoinPool executor = new ForkJoinPool(Math.min(Runtime.getRuntime().availableProcessors(), CLASS_LOADING_MAX_SCALING));
-        classLoaderSupport.initAllClasses(executor, this);
-        boolean completed = executor.awaitQuiescence(CLASS_LOADING_TIMEOUT_IN_MINUTES, TimeUnit.MINUTES);
-        if (!completed) {
-            throw shouldNotReachHere("timed out while initializing classes");
-        }
-        executor.shutdownNow();
-    }
-
-    private void findSystemElements(Class<?> systemClass) {
-        Method[] declaredMethods = null;
-        try {
-            declaredMethods = systemClass.getDeclaredMethods();
-        } catch (Throwable t) {
-            handleClassLoadingError(t);
-        }
-        if (declaredMethods != null) {
-            for (Method systemMethod : declaredMethods) {
-                if (annotationsAvailable(systemMethod) && NativeImageGenerator.includedIn(platform, systemMethod.getAnnotation(Platforms.class))) {
-                    synchronized (systemMethods) {
-                        systemMethods.add(systemMethod);
-                    }
-                }
-            }
-        }
-
-        Field[] declaredFields = null;
-        try {
-            declaredFields = systemClass.getDeclaredFields();
-        } catch (Throwable t) {
-            handleClassLoadingError(t);
-        }
-        if (declaredFields != null) {
-            for (Field systemField : declaredFields) {
-                if (annotationsAvailable(systemField) && NativeImageGenerator.includedIn(platform, systemField.getAnnotation(Platforms.class))) {
-                    synchronized (systemFields) {
-                        systemFields.add(systemField);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * @param element The element to check
-     * @return Returns true if the annotations on the {@code element} can be loaded without any
-     *         errors.
-     */
-    private static boolean canLoadAnnotations(AnnotatedElement element) {
-        try {
-            element.getAnnotations();
-            return true;
-        } catch (Throwable t) {
-            handleClassLoadingError(t);
-            return false;
-        }
-    }
-
-    /**
-     * @param element The element to check
-     * @return Returns true if and only if the the {@code element} has any annotations present and
-     *         the {@link AnnotatedElement#getAnnotations()} did not throw any error.
-     */
-    private static boolean annotationsAvailable(AnnotatedElement element) {
-        try {
-            final Annotation[] annotations = element.getAnnotations();
-            return annotations.length != 0;
-        } catch (Throwable t) {
-            handleClassLoadingError(t);
-            return false;
-        }
+        OptionValues parsedHostedOptions = classLoaderSupport.getParsedHostedOptions();
+        int watchdogInterval = SubstrateOptions.DeadlockWatchdogInterval.getValue(parsedHostedOptions);
+        boolean watchdogExitOnTimeout = SubstrateOptions.DeadlockWatchdogExitOnTimeout.getValue(parsedHostedOptions);
+        this.watchdog = new DeadlockWatchdog(watchdogInterval, watchdogExitOnTimeout);
+        this.guestTypes = new GuestTypes(GuestAccess.get(), platform);
+        classLoaderSupport.getBuildClassPath().stream().map(Path::toUri).forEach(this.guestTypes.builderURILocations::add);
     }
 
     @SuppressWarnings("unused")
-    static void handleClassLoadingError(Throwable t) {
+    public void loadAllClasses() throws InterruptedException {
+        ForkJoinPool executor = ForkJoinPool.commonPool();
+        try {
+            classLoaderSupport.loadAllClasses(executor, this);
+        } finally {
+            boolean isQuiescence = false;
+            while (!isQuiescence) {
+                isQuiescence = executor.awaitQuiescence(10, TimeUnit.MINUTES);
+                if (!isQuiescence) {
+                    LogUtils.warning("Class loading is slow. Waiting for tasks to complete...");
+                    /* DeadlockWatchdog should fail the build eventually. */
+                }
+            }
+        }
+        classLoaderSupport.allClassesLoaded();
+        guestTypes.reportBuilderClassesInApplication(classLoaderSupport.getParsedHostedOptions());
+
+    }
+
+    /**
+     * Controls printing of otherwise silently swallowed LinkageErrors. This can be very useful when
+     * diagnosing obscure Native Image problems.
+     */
+    private static final boolean PRINT_LINKAGE_ERRORS = Boolean.getBoolean(ImageClassLoader.class.getName() + ".traceSwallowedLinkageErrors");
+
+    @SuppressWarnings("unused")
+    static void handleClassLoadingError(LinkageError t, String format, Object... args) {
         /* we ignore class loading errors due to incomplete paths that people often have */
-    }
-
-    void handleClass(Class<?> clazz) {
-        boolean inPlatform = true;
-        boolean isHostedOnly = false;
-
-        AnnotatedElement cur = clazz.getPackage();
-        if (cur == null) {
-            cur = clazz;
-        }
-        do {
-            if (!canLoadAnnotations(cur)) {
-                return;
-            }
-            Platforms platformsAnnotation = cur.getAnnotation(Platforms.class);
-            if (containsHostedOnly(platformsAnnotation)) {
-                isHostedOnly = true;
-            } else if (!NativeImageGenerator.includedIn(platform, platformsAnnotation)) {
-                inPlatform = false;
-            }
-
-            if (cur instanceof Package) {
-                cur = clazz;
-            } else {
-                try {
-                    cur = ((Class<?>) cur).getEnclosingClass();
-                } catch (Throwable t) {
-                    handleClassLoadingError(t);
-                    cur = null;
-                }
-            }
-        } while (cur != null);
-
-        if (inPlatform) {
-            if (isHostedOnly) {
-                synchronized (hostedOnlyClasses) {
-                    hostedOnlyClasses.add(clazz);
-                }
-
-            } else {
-                synchronized (applicationClasses) {
-                    applicationClasses.add(clazz);
-                }
-                findSystemElements(clazz);
-            }
+        if (PRINT_LINKAGE_ERRORS) {
+            PrintStream out = System.out;
+            out.println("Error " + format.formatted(args));
+            t.printStackTrace(out);
         }
     }
 
-    private static boolean containsHostedOnly(Platforms platformsAnnotation) {
-        if (platformsAnnotation != null) {
-            for (Class<? extends Platform> platformClass : platformsAnnotation.value()) {
-                if (platformClass == Platform.HOSTED_ONLY.class) {
-                    return true;
-                }
+    private static Class<?> getEnclosingClassOrNull(Class<?> clazz) {
+        try {
+            return clazz.getEnclosingClass();
+        } catch (LinkageError e) {
+            return null;
+        }
+    }
+
+    public ClassLoader getDynamicHubClassLoader(Class<?> clazz) {
+        if (isCoreType(clazz)) {
+            /*
+             * Use null-loader for VM implementation classes. Our own VM implementation code (e.g.
+             * com.oracle.svm.core classes) are unrelated to the application code of the image and
+             * should not share the same classloader at image run-time. Using null as the
+             * classloader for such classes is in line with other use of the null-loader in Java.
+             */
+            return null;
+        } else {
+            /*
+             * If the class is an application class then it was loaded by NativeImageClassLoader.
+             * The ClassLoaderFeature object replacer will unwrap the original AppClassLoader from
+             * the NativeImageClassLoader.
+             */
+            return clazz.getClassLoader();
+        }
+    }
+
+    public boolean isCoreType(Class<?> clazz) {
+        GuestAccess guestAccess = GuestAccess.get();
+        return getCoreGuestModules().contains(guestAccess.getModule(guestAccess.lookupType(clazz)));
+    }
+
+    /**
+     * Type of result returned by {@link ImageClassLoader#isPlatformSupported}.
+     */
+    public enum PlatformSupportResult {
+        /**
+         * The element is not supported.
+         */
+        NO,
+
+        /**
+         * The element is supported but only during native image generation.
+         */
+        HOSTED,
+
+        /**
+         * The element is supported.
+         */
+        YES;
+
+        /**
+         * Returns the most restrictive value between this result and {@code other}.
+         */
+        public PlatformSupportResult and(PlatformSupportResult other) {
+            if (ordinal() < other.ordinal()) {
+                return this;
+            }
+            return other;
+        }
+
+        static {
+            assert NO.and(YES) == NO;
+            assert YES.and(NO) == NO;
+            assert NO.and(HOSTED) == NO;
+            assert HOSTED.and(NO) == NO;
+            assert YES.and(HOSTED) == HOSTED;
+            assert HOSTED.and(YES) == HOSTED;
+        }
+    }
+
+    /**
+     * Determines if {@code element} is supported on {@code thePlatform} by consulting the
+     * {@link Platforms} annotation on {@code element}.
+     * <p>
+     * If {@code element} is a {@link ResolvedJavaType}, the {@link Platforms} annotation on its
+     * enclosing classes and package are consulted as well.
+     */
+    public PlatformSupportResult isPlatformSupported(Annotated element, Platform thePlatform) {
+        return guestTypes.isPlatformSupported(element, thePlatform);
+    }
+
+    /* GR-79036: Unify this core-reflection path with guest type platform filtering. */
+    private static PlatformSupportResult isBuilderPlatformSupported(Class<?> clazz, Platform thePlatform) {
+        PlatformSupportResult res = isBuilderPlatformSupported0(clazz, thePlatform);
+        if (res == PlatformSupportResult.NO) {
+            return res;
+        }
+        Package p = clazz.getPackage();
+        if (p != null) {
+            res = res.and(isBuilderPlatformSupported0(p, thePlatform));
+            if (res == PlatformSupportResult.NO) {
+                return res;
             }
         }
-        return false;
+        Class<?> enclosingClass = getEnclosingClassOrNull(clazz);
+        while (enclosingClass != null && res != PlatformSupportResult.NO) {
+            res = res.and(isBuilderPlatformSupported0(enclosingClass, thePlatform));
+            enclosingClass = getEnclosingClassOrNull(enclosingClass);
+        }
+        return res;
+    }
+
+    private static PlatformSupportResult isBuilderPlatformSupported0(AnnotatedElement element, Platform thePlatform) {
+        if (thePlatform == null) {
+            return PlatformSupportResult.YES;
+        }
+        Platforms platforms = getPlatformsAnnotation(element);
+        if (platforms != null) {
+            for (Class<? extends Platform> platformGroup : platforms.value()) {
+                if (platformGroup == Platform.HOSTED_ONLY.class) {
+                    return PlatformSupportResult.HOSTED;
+                }
+            }
+            if (!NativeImageGenerator.includedIn(thePlatform, platforms)) {
+                return PlatformSupportResult.NO;
+            }
+        }
+        return PlatformSupportResult.YES;
+    }
+
+    private static Platforms getPlatformsAnnotation(AnnotatedElement element) {
+        try {
+            Platforms platforms;
+            // Checkstyle: allow direct annotation access
+            platforms = element.getAnnotation(Platforms.class);
+            // Checkstyle: disallow direct annotation access
+            return platforms;
+        } catch (LinkageError | AnnotationFormatError e) {
+            return null;
+        }
+    }
+
+    /**
+     * Registers a class loaded from the image class-path or module-path.
+     */
+    void registerClass(Class<?> clazz) {
+        PlatformSupportResult res;
+        try {
+            ResolvedJavaType type = GuestAccess.get().lookupType(clazz);
+            res = isPlatformSupported(type, platform);
+        } catch (LinkageError error) {
+            handleClassLoadingError(error, "host: getting @Platforms annotation value for %s", clazz);
+            res = PlatformSupportResult.NO;
+        }
+
+        registerClass(clazz, res);
+    }
+
+    /**
+     * Registers a class loaded from a builder module that is not visible to the guest context.
+     */
+    void registerBuilderClass(Class<?> clazz) {
+        registerClass(clazz, isBuilderPlatformSupported(clazz, platform));
+    }
+
+    private void registerClass(Class<?> clazz, PlatformSupportResult res) {
+        if (res == PlatformSupportResult.HOSTED) {
+            synchronized (hostedOnlyClasses) {
+                hostedOnlyClasses.add(clazz);
+            }
+        } else if (res == PlatformSupportResult.YES) {
+            synchronized (builderClasses) {
+                builderClasses.add(clazz);
+            }
+        }
     }
 
     public Enumeration<URL> findResourcesByName(String resource) throws IOException {
-        return classLoaderSupport.getClassLoader().getResources(resource);
-    }
-
-    public InputStream findResourceAsStreamByName(String resource) {
-        return classLoaderSupport.getClassLoader().getResourceAsStream(resource);
+        return getClassLoader().getResources(resource);
     }
 
     /**
-     * @deprecated use {@link #findClassOrFail(String)} instead.
+     * Find class or fail if exception occurs.
      */
-    @Deprecated
-    public Class<?> findClassByName(String name) {
-        return findClassByName(name, true);
-    }
-
-    /**
-     * @deprecated use {@link #findClass(String)} or {@link #findClassOrFail(String)} instead.
-     */
-    @Deprecated
-    public Class<?> findClassByName(String name, boolean failIfClassMissing) {
-        TypeResult<Class<?>> result = findClass(name);
-        if (failIfClassMissing) {
-            return result.getOrFail();
-        } else {
-            return result.get();
-        }
-    }
-
-    /** Find class or fail if exception occurs. */
     public Class<?> findClassOrFail(String name) {
         return findClass(name).getOrFail();
     }
 
-    /** Find class, return result encoding class or failure reason. */
+    /**
+     * Find class, return result encoding class or failure reason.
+     */
     public TypeResult<Class<?>> findClass(String name) {
+        return findClass(name, true);
+    }
+
+    /**
+     * Find class, return result encoding class or failure reason.
+     */
+    public TypeResult<Class<?>> findClass(String name, boolean allowPrimitives) {
+        return findClass(name, allowPrimitives, getClassLoader());
+    }
+
+    /**
+     * Find class, return result encoding class or failure reason.
+     */
+    public static TypeResult<Class<?>> findClass(String name, boolean allowPrimitives, ClassLoader loader) {
         try {
-            if (name.indexOf('.') == -1) {
-                switch (name) {
-                    case "boolean":
-                        return TypeResult.forClass(boolean.class);
-                    case "char":
-                        return TypeResult.forClass(char.class);
-                    case "float":
-                        return TypeResult.forClass(float.class);
-                    case "double":
-                        return TypeResult.forClass(double.class);
-                    case "byte":
-                        return TypeResult.forClass(byte.class);
-                    case "short":
-                        return TypeResult.forClass(short.class);
-                    case "int":
-                        return TypeResult.forClass(int.class);
-                    case "long":
-                        return TypeResult.forClass(long.class);
-                    case "void":
-                        return TypeResult.forClass(void.class);
+            if (allowPrimitives && name.indexOf('.') == -1) {
+                Class<?> primitive = forPrimitive(name);
+                if (primitive != null) {
+                    return TypeResult.forClass(primitive);
                 }
             }
-            return TypeResult.forClass(forName(name));
+            return TypeResult.forClass(forName(name, false, loader));
         } catch (ClassNotFoundException | LinkageError ex) {
             return TypeResult.forException(name, ex);
         }
     }
 
-    Class<?> forName(String name) throws ClassNotFoundException {
-        return Class.forName(name, false, classLoaderSupport.getClassLoader());
+    public static Class<?> forPrimitive(String name) {
+        return switch (name) {
+            case "boolean" -> boolean.class;
+            case "char" -> char.class;
+            case "float" -> float.class;
+            case "double" -> double.class;
+            case "byte" -> byte.class;
+            case "short" -> short.class;
+            case "int" -> int.class;
+            case "long" -> long.class;
+            case "void" -> void.class;
+            default -> null;
+        };
+    }
+
+    public Class<?> forName(String className) throws ClassNotFoundException {
+        return forName(className, false);
+    }
+
+    public Class<?> forName(String className, boolean initialize) throws ClassNotFoundException {
+        return forName(className, initialize, getClassLoader());
+    }
+
+    public static Class<?> forName(String className, boolean initialize, ClassLoader loader) throws ClassNotFoundException {
+        return Class.forName(className, initialize, loader);
+    }
+
+    public Class<?> forName(String className, Module module) throws ClassNotFoundException {
+        if (module == null) {
+            return forName(className);
+        }
+        return classLoaderSupport.loadClassFromModule(module, className);
     }
 
     /**
@@ -313,25 +444,26 @@ public final class ImageClassLoader {
     }
 
     public <T> List<Class<? extends T>> findSubclasses(Class<T> baseClass, boolean includeHostedOnly) {
-        ArrayList<Class<? extends T>> result = new ArrayList<>();
-        addSubclasses(applicationClasses, baseClass, result);
+        ArrayList<Class<? extends T>> subclasses = new ArrayList<>();
+        addSubclasses(builderClasses, baseClass, subclasses);
         if (includeHostedOnly) {
-            addSubclasses(hostedOnlyClasses, baseClass, result);
+            addSubclasses(hostedOnlyClasses, baseClass, subclasses);
         }
-        return result;
+
+        return subclasses;
     }
 
     private static <T> void addSubclasses(EconomicSet<Class<?>> classes, Class<T> baseClass, ArrayList<Class<? extends T>> result) {
-        for (Class<?> systemClass : classes) {
-            if (baseClass.isAssignableFrom(systemClass)) {
-                result.add(systemClass.asSubclass(baseClass));
+        for (Class<?> c : classes) {
+            if (baseClass.isAssignableFrom(c)) {
+                result.add(c.asSubclass(baseClass));
             }
         }
     }
 
     public List<Class<?>> findAnnotatedClasses(Class<? extends Annotation> annotationClass, boolean includeHostedOnly) {
         ArrayList<Class<?>> result = new ArrayList<>();
-        addAnnotatedClasses(applicationClasses, annotationClass, result);
+        addAnnotatedClasses(builderClasses, annotationClass, result);
         if (includeHostedOnly) {
             addAnnotatedClasses(hostedOnlyClasses, annotationClass, result);
         }
@@ -339,106 +471,99 @@ public final class ImageClassLoader {
     }
 
     private static void addAnnotatedClasses(EconomicSet<Class<?>> classes, Class<? extends Annotation> annotationClass, ArrayList<Class<?>> result) {
-        for (Class<?> systemClass : classes) {
-            if (systemClass.getAnnotation(annotationClass) != null) {
-                result.add(systemClass);
+        for (Class<?> c : classes) {
+            if (AnnotationAccess.isAnnotationPresent(c, annotationClass)) {
+                result.add(c);
             }
         }
-    }
-
-    public List<Method> findAnnotatedMethods(Class<? extends Annotation> annotationClass) {
-        ArrayList<Method> result = new ArrayList<>();
-        for (Method method : systemMethods) {
-            if (method.getAnnotation(annotationClass) != null) {
-                result.add(method);
-            }
-        }
-        return result;
-    }
-
-    public List<Method> findAnnotatedMethods(Class<? extends Annotation>[] annotationClasses) {
-        ArrayList<Method> result = new ArrayList<>();
-        for (Method method : systemMethods) {
-            boolean match = true;
-            for (Class<? extends Annotation> annotationClass : annotationClasses) {
-                if (method.getAnnotation(annotationClass) == null) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                result.add(method);
-            }
-        }
-        return result;
-    }
-
-    public List<Field> findAnnotatedFields(Class<? extends Annotation> annotationClass) {
-        ArrayList<Field> result = new ArrayList<>();
-        for (Field field : systemFields) {
-            if (field.getAnnotation(annotationClass) != null) {
-                result.add(field);
-            }
-        }
-        return result;
-    }
-
-    @SuppressWarnings("unchecked")
-    public List<Class<? extends Annotation>> allAnnotations() {
-        return StreamSupport.stream(applicationClasses.spliterator(), false)
-                        .filter(Class::isAnnotation)
-                        .map(clazz -> (Class<? extends Annotation>) clazz)
-                        .collect(Collectors.toList());
-    }
-
-    /**
-     * Returns all annotations on classes, methods, and fields (enabled or disabled based on the
-     * parameters) of the given annotation class.
-     */
-    public <T extends Annotation> List<T> findAnnotations(Class<T> annotationClass) {
-        List<T> result = new ArrayList<>();
-        for (Class<?> clazz : findAnnotatedClasses(annotationClass, false)) {
-            result.add(clazz.getAnnotation(annotationClass));
-        }
-        for (Method method : findAnnotatedMethods(annotationClass)) {
-            result.add(method.getAnnotation(annotationClass));
-        }
-        for (Field field : findAnnotatedFields(annotationClass)) {
-            result.add(field.getAnnotation(annotationClass));
-        }
-        return result;
     }
 
     public ClassLoader getClassLoader() {
         return classLoaderSupport.getClassLoader();
     }
 
-    public Class<?> loadClassFromModule(Object module, String className) throws ClassNotFoundException {
-        return classLoaderSupport.loadClassFromModule(module, className);
-    }
-
-    public Optional<Object> findModule(String moduleName) {
+    public Optional<Module> findModule(String moduleName) {
         return classLoaderSupport.findModule(moduleName);
     }
-}
 
-class ClassLoaderQueryImpl implements ClassLoaderQuery {
-
-    private final ClassLoader imageClassLoader;
-
-    ClassLoaderQueryImpl(ClassLoader imageClassLoader) {
-        this.imageClassLoader = imageClassLoader;
+    public String getMainClassNotFoundErrorMessage(String className) {
+        List<Path> classPath = applicationClassPath();
+        String classPathString = classPath.isEmpty() ? "empty classpath" : "classpath: '%s'".formatted(pathsToString(classPath));
+        List<Path> modulePath = applicationModulePath();
+        String modulePathString = modulePath.isEmpty() ? "empty modulepath" : "modulepath: '%s'".formatted(pathsToString(modulePath));
+        return String.format("Main entry point class '%s' neither found on %n%s nor%n%s.", className, classPathString, modulePathString);
     }
 
-    @Override
-    public boolean isNativeImageClassLoader(ClassLoader classLoader) {
-        ClassLoader loader = classLoader;
-        while (loader != null) {
-            if (loader == imageClassLoader || loader instanceof NativeImageSystemClassLoader) {
-                return true;
-            }
-            loader = loader.getParent();
+    private static String pathsToString(List<Path> paths) {
+        return paths.stream().map(String::valueOf).collect(Collectors.joining(File.pathSeparator));
+    }
+
+    public Set<Module> getBuilderModules() {
+        assert builderModules != null : "Builder modules not yet initialized.";
+        return builderModules;
+    }
+
+    public void initBuilderModules() {
+        builderModules = Collections.unmodifiableSet(NativeImageGeneratorRunner.getNativeImageBuilderModules());
+    }
+
+    public Set<ResolvedJavaModule> getCoreGuestModules() {
+        assert coreGuestModules != null : "Core modules not yet initialized.";
+        return coreGuestModules;
+    }
+
+    public void initCoreModules() {
+        VMError.guarantee(BuildPhaseProvider.isFeatureRegistrationFinished(), "Querying core modules is only possible after feature registration is finished.");
+        GuestAccess guestAccess = GuestAccess.get();
+        Set<ResolvedJavaModule> modules = new LinkedHashSet<>();
+        /*
+         * Runtime code still spans host SVM modules until GR-76917 moves the remaining core runtime
+         * ownership to guest modules. Non-isolated HostVMAccess can resolve those host modules from
+         * host class literals, so include them here. Fully isolated Terminus excludes host-side
+         * modules because they are invisible to the guest.
+         */
+        if (!guestAccess.isFullyIsolated()) {
+            VMError.guarantee(ImageSingletons.contains(VMFeature.class), "Querying host-side core modules is only possible after VMFeature is available.");
+            modules.add(guestAccess.getModule(guestAccess.lookupType(ImageSingletons.lookup(VMFeature.class).getClass())));
+            modules.add(guestAccess.getModule(guestAccess.lookupType(SVMHost.class)));
         }
-        return false;
+        ResolvedJavaModuleLayer guestModuleLayer = guestModuleLayer(guestAccess);
+        HostedModuleSupport.STANDARD_GUEST_MODULES.forEach(moduleName -> addCoreModule(modules, guestModuleLayer, moduleName));
+        if (SubstrateOptions.EnableJVMCIGuest.getValue(HostedOptionValues.singleton().get())) {
+            HostedModuleSupport.JVMCI_GUEST_MODULES.forEach(moduleName -> addCoreModule(modules, guestModuleLayer, moduleName));
+        }
+        if (SubstrateOptions.useLLVMBackend()) {
+            String llvmBackendModule = "org.graalvm.nativeimage.llvm";
+            modules.add(guestAccess.bootModuleLayer().findModule(llvmBackendModule)
+                            .orElseThrow(() -> UserError.abort("The LLVM backend module '%s' is not available. Use --tool:llvm-backend or select a different compiler backend.",
+                                            llvmBackendModule)));
+        }
+        coreGuestModules = Collections.unmodifiableSet(modules);
+    }
+
+    private static void addCoreModule(Set<ResolvedJavaModule> modules, ResolvedJavaModuleLayer moduleLayer, String moduleName) {
+        ResolvedJavaModule module = moduleLayer.findModule(moduleName)
+                        .orElseThrow(() -> VMError.shouldNotReachHere("Could not resolve SVM core module in active VMAccess context: " + moduleName));
+        VMError.guarantee(moduleName.equals(module.getName()), "Expected to resolve SVM core module %s, got %s.", moduleName, module.getName());
+        modules.add(module);
+    }
+
+    private static ResolvedJavaModuleLayer guestModuleLayer(GuestAccess guestAccess) {
+        /*
+         * The guest module layer is not necessarily the boot module layer in HostVMAccess. Locate it
+         * through a dedicated marker in the pure guest module so all guest modules can be resolved
+         * uniformly. The builder module does not read the guest module, so the marker must be looked
+         * up by name rather than referenced with a class literal.
+         */
+        String markerClassName = "com.oracle.svm.guest.GuestModuleLayerMarker";
+        ResolvedJavaType markerType = guestAccess.lookupType(markerClassName);
+        VMError.guarantee(markerType != null, "Could not resolve guest module layer marker class %s.", markerClassName);
+        ResolvedJavaModule markerModule = guestAccess.getModule(markerType);
+        String markerModuleName = "org.graalvm.nativeimage.guest";
+        VMError.guarantee(markerModuleName.equals(markerModule.getName()), "Expected guest module layer marker class %s to resolve module %s, got %s.",
+                        markerClassName, markerModuleName, markerModule.getName());
+        ResolvedJavaModuleLayer moduleLayer = markerModule.getLayer();
+        VMError.guarantee(moduleLayer != null, "Guest module layer marker class %s is not in a module layer.", markerClassName);
+        return moduleLayer;
     }
 }

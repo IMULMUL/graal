@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,8 +47,9 @@ import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.regex.result.PreCalculatedResultFactory;
 import com.oracle.truffle.regex.tregex.automaton.StateIndex;
+import com.oracle.truffle.regex.tregex.automaton.TransitionConstraint;
+import com.oracle.truffle.regex.tregex.automaton.TransitionOp;
 import com.oracle.truffle.regex.tregex.parser.Counter;
-import com.oracle.truffle.regex.tregex.parser.ast.GroupBoundaries;
 import com.oracle.truffle.regex.tregex.parser.ast.RegexAST;
 import com.oracle.truffle.regex.tregex.util.json.Json;
 import com.oracle.truffle.regex.tregex.util.json.JsonArray;
@@ -78,6 +79,7 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
                     Collection<NFAState> states,
                     Counter.ThresholdCounter stateIDCounter,
                     Counter.ThresholdCounter transitionIDCounter,
+                    NFAStateTransition initialLoopBack,
                     PreCalculatedResultFactory[] preCalculatedResults) {
         this.ast = ast;
         this.dummyInitialState = dummyInitialState;
@@ -85,21 +87,12 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
         this.unAnchoredEntry = unAnchoredEntry;
         this.reverseAnchoredEntry = reverseAnchoredEntry;
         this.reverseUnAnchoredEntry = reverseUnAnchoredEntry;
+        this.initialLoopBack = initialLoopBack;
         this.preCalculatedResults = preCalculatedResults;
         this.states = new NFAState[stateIDCounter.getCount()];
         // reserve last slot for loopBack matcher
         this.transitions = new NFAStateTransition[transitionIDCounter.getCount() + 1];
-        if (isTraceFinderNFA()) {
-            this.initialLoopBack = null;
-        } else {
-            this.initialLoopBack = new NFAStateTransition(
-                            (short) transitionIDCounter.inc(),
-                            getUnAnchoredInitialState(),
-                            getUnAnchoredInitialState(),
-                            ast.getEncoding().getFullSet(),
-                            GroupBoundaries.getEmptyInstance(ast.getLanguage()));
-            this.transitions[initialLoopBack.getId()] = initialLoopBack;
-        }
+
         for (NFAState s : states) {
             assert this.states[s.getId()] == null;
             this.states[s.getId()] = s;
@@ -109,6 +102,7 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
             for (NFAStateTransition t : s.getSuccessors()) {
                 assert this.transitions[t.getId()] == null || (s == dummyInitialState && this.transitions[t.getId()] == t);
                 this.transitions[t.getId()] = t;
+                assert checkBQGuardSourceAndTargets(t);
             }
             if (s == dummyInitialState) {
                 for (NFAStateTransition t : s.getPredecessors()) {
@@ -117,14 +111,47 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
                 }
             }
         }
+        if (initialLoopBack != null) {
+            assert this.transitions[initialLoopBack.getId()] == null;
+            this.transitions[initialLoopBack.getId()] = initialLoopBack;
+        }
+    }
+
+    private static boolean checkBQGuardSourceAndTargets(NFAStateTransition t) {
+        for (long constraint : t.getConstraints()) {
+            assert TransitionConstraint.getStateID(constraint) == t.getSource().getId();
+        }
+        for (long operation : t.getOperations()) {
+            assert TransitionOp.getSource(operation) == TransitionOp.NO_SOURCE || TransitionOp.getSource(operation) == t.getSource().getId();
+            assert TransitionOp.getTarget(operation) == t.getTarget().getId();
+        }
+        return true;
     }
 
     public NFAState getUnAnchoredInitialState() {
-        return unAnchoredEntry[0].getTarget();
+        return unAnchoredEntry[0] == null ? null : unAnchoredEntry[0].getTarget();
+    }
+
+    public NFAState getMaxOffsetUnAnchoredInitialState() {
+        return getMaxOffsetInitialState(unAnchoredEntry);
     }
 
     public NFAState getAnchoredInitialState() {
-        return anchoredEntry[0].getTarget();
+        return anchoredEntry[0] == null ? null : anchoredEntry[0].getTarget();
+    }
+
+    public NFAState getMaxOffsetAnchoredInitialState() {
+        return getMaxOffsetInitialState(anchoredEntry);
+    }
+
+    private static NFAState getMaxOffsetInitialState(NFAStateTransition[] entries) {
+        NFAState ret = null;
+        for (NFAStateTransition t : entries) {
+            if (t != null) {
+                ret = t.getTarget();
+            }
+        }
+        return ret;
     }
 
     public boolean hasReverseUnAnchoredEntry() {
@@ -163,7 +190,7 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
 
     private static int transitionListIndexOfTarget(NFAStateTransition[] transitions, NFAState target) {
         for (int i = 0; i < transitions.length; i++) {
-            if (transitions[i].getTarget() == target) {
+            if (transitions[i] != null && transitions[i].getTarget() == target) {
                 return i;
             }
         }
@@ -172,7 +199,7 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
 
     private static boolean transitionListContainsTarget(NFAStateTransition[] transitions, NFAState target) {
         for (NFAStateTransition t : transitions) {
-            if (t.getTarget() == target) {
+            if (t != null && t.getTarget() == target) {
                 return true;
             }
         }
@@ -235,23 +262,48 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
     }
 
     public boolean isDead() {
-        return anchoredEntry != null ? getAnchoredInitialState().isDead(true) : (reverseAnchoredEntry.getSource().isDead(false) && reverseUnAnchoredEntry.getSource().isDead(false));
+        return anchoredEntry != null ? allDead(anchoredEntry) : (reverseAnchoredEntry.getSource().isDead(false) && reverseUnAnchoredEntry.getSource().isDead(false));
+    }
+
+    private static boolean allDead(NFAStateTransition[] entries) {
+        if (entries == null) {
+            return true;
+        }
+        for (NFAStateTransition t : entries) {
+            if (t != null) {
+                assert !t.getTarget().isDead(true);
+                return false;
+            }
+        }
+        return true;
     }
 
     public void setInitialLoopBack(boolean enable) {
-        if (getUnAnchoredInitialState().getSuccessors().length == 0) {
+        if (getUnAnchoredInitialState() == null || initialLoopBack == null) {
             return;
         }
-        NFAStateTransition lastInitTransition = getUnAnchoredInitialState().getSuccessors()[getUnAnchoredInitialState().getSuccessors().length - 1];
+        NFAState loopbackState = initialLoopBack.getSource();
+        NFAStateTransition lastInitTransition = loopbackState.getSuccessors()[loopbackState.getSuccessors().length - 1];
         if (enable) {
             if (lastInitTransition != initialLoopBack) {
-                getUnAnchoredInitialState().addLoopBackNext(initialLoopBack);
+                loopbackState.addLoopBackNext(initialLoopBack);
             }
         } else {
             if (lastInitTransition == initialLoopBack) {
-                getUnAnchoredInitialState().removeLoopBackNext();
+                loopbackState.removeLoopBackNext();
             }
         }
+    }
+
+    public boolean isFixedCodePointWidth() {
+        boolean fixedCodePointWidth = true;
+        for (NFAStateTransition transition : transitions) {
+            if (transition != null && !transition.getTarget().isFinalState() && !ast.getEncoding().isFixedCodePointWidth(transition.getCodePointSet())) {
+                fixedCodePointWidth = false;
+                break;
+            }
+        }
+        return fixedCodePointWidth;
     }
 
     @TruffleBoundary
@@ -292,7 +344,7 @@ public final class NFA implements StateIndex<NFAState>, JsonConvertible {
 
     @TruffleBoundary
     private static JsonArray fwdEntryToJson(NFAStateTransition[] entryArray) {
-        return Json.array(Arrays.stream(entryArray).map(x -> Json.val(x.getTarget().getId())));
+        return Json.array(Arrays.stream(entryArray).map(x -> x == null ? Json.nullValue() : Json.val(x.getTarget().getId())));
     }
 
     @TruffleBoundary

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,29 +40,15 @@
  */
 package com.oracle.truffle.tck.tests;
 
-import org.graalvm.polyglot.Context;
-import org.graalvm.polyglot.Source;
-import org.graalvm.polyglot.Value;
-import org.graalvm.polyglot.proxy.ProxyArray;
-import org.graalvm.polyglot.proxy.ProxyDate;
-import org.graalvm.polyglot.proxy.ProxyDuration;
-import org.graalvm.polyglot.proxy.ProxyExecutable;
-import org.graalvm.polyglot.proxy.ProxyHashMap;
-import org.graalvm.polyglot.proxy.ProxyIterable;
-import org.graalvm.polyglot.proxy.ProxyIterator;
-import org.graalvm.polyglot.proxy.ProxyObject;
-import org.graalvm.polyglot.proxy.ProxyTime;
-import org.graalvm.polyglot.proxy.ProxyTimeZone;
-import org.graalvm.polyglot.tck.LanguageProvider;
-import org.graalvm.polyglot.tck.Snippet;
-import org.graalvm.polyglot.tck.TypeDescriptor;
-
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.AbstractMap;
@@ -79,6 +65,23 @@ import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.proxy.ProxyArray;
+import org.graalvm.polyglot.proxy.ProxyDate;
+import org.graalvm.polyglot.proxy.ProxyDuration;
+import org.graalvm.polyglot.proxy.ProxyExecutable;
+import org.graalvm.polyglot.proxy.ProxyHashMap;
+import org.graalvm.polyglot.proxy.ProxyIterable;
+import org.graalvm.polyglot.proxy.ProxyIterator;
+import org.graalvm.polyglot.proxy.ProxyObject;
+import org.graalvm.polyglot.proxy.ProxyTime;
+import org.graalvm.polyglot.proxy.ProxyTimeZone;
+import org.graalvm.polyglot.tck.LanguageProvider;
+import org.graalvm.polyglot.tck.Snippet;
+import org.graalvm.polyglot.tck.TypeDescriptor;
 
 public final class JavaHostLanguageProvider implements LanguageProvider {
     private static final String ID = "java-host";
@@ -103,6 +106,7 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
         primitives.put(Long.class, Primitive.create("long", Long.MIN_VALUE, TypeDescriptor.NUMBER));
         primitives.put(Float.class, Primitive.create("float", Float.MAX_VALUE, TypeDescriptor.NUMBER));
         primitives.put(Double.class, Primitive.create("double", Double.MAX_VALUE, TypeDescriptor.NUMBER));
+        primitives.put(BigInteger.class, Primitive.create("java.math.BigInteger", new BigInteger(String.valueOf(Long.MAX_VALUE)).add(BigInteger.TWO), TypeDescriptor.NUMBER));
         primitives.put(String.class, Primitive.create("java.lang.String", "TEST", TypeDescriptor.STRING));
 
         primitives.put(Instant.class, Primitive.create("java.time.Instant", Instant.now(),
@@ -113,6 +117,10 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
                         TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.TIME, TypeDescriptor.DATE)));
         primitives.put(ZonedDateTime.class, Primitive.create("java.time.ZonedDateTime", ZonedDateTime.now(),
                         TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.TIME, TypeDescriptor.DATE, TypeDescriptor.TIME_ZONE)));
+        primitives.put(OffsetDateTime.class, Primitive.create("java.time.OffsetDateTime", OffsetDateTime.now(),
+                        TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.TIME, TypeDescriptor.DATE, TypeDescriptor.TIME_ZONE)));
+        primitives.put(OffsetTime.class, Primitive.create("java.time.OffsetTime", OffsetTime.now(),
+                        TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.TIME, TypeDescriptor.TIME_ZONE)));
         primitives.put(ZoneId.class,
                         Primitive.create("java.time.ZoneId", ZoneId.systemDefault(),
                                         TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.TIME_ZONE)));
@@ -234,7 +242,7 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
                         "java.util.List<Integer>",
                         export(context, new ValueSupplier<>(new ArrayList<>(Arrays.asList(1, 2)))),
                         TypeDescriptor.intersection(TypeDescriptor.HOST_OBJECT, TypeDescriptor.OBJECT, TypeDescriptor.array(TypeDescriptor.NUMBER))).build());
-        Function<Object, Object> func = new Function<Object, Object>() {
+        Function<Object, Object> func = new Function<>() {
             @Override
             public Object apply(Object t) {
                 return t;
@@ -346,7 +354,7 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
     }
 
     private static final class ProxyExecutableImpl implements ProxyExecutable {
-        private static final Consumer<? super Value> EMPTY = new Consumer<Value>() {
+        private static final Consumer<? super Value> EMPTY = new Consumer<>() {
             @Override
             public void accept(Value t) {
             }
@@ -384,7 +392,7 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
         @Override
         public Object execute(Value... arguments) {
             if (this.arity > arguments.length) {
-                throw new AssertionError(String.format("Not enought arguments, required: %d, given: %d", this.arity, arguments.length));
+                throw new AssertionError(String.format("Not enough arguments, required: %d, given: %d", this.arity, arguments.length));
             }
             for (int i = 0; i < arity; i++) {
                 verifier.accept(arguments[i]);
@@ -394,7 +402,7 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
 
         private static Consumer<? super Value> createVerifier(final Primitive primitive) {
             if (TypeDescriptor.NUMBER == primitive.type) {
-                return new Consumer<Value>() {
+                return new Consumer<>() {
                     @Override
                     public void accept(Value value) {
                         if (!value.isNumber()) {
@@ -418,14 +426,14 @@ public final class JavaHostLanguageProvider implements LanguageProvider {
                     }
                 };
             } else if (TypeDescriptor.BOOLEAN == primitive.type) {
-                return new Consumer<Value>() {
+                return new Consumer<>() {
                     @Override
                     public void accept(Value value) {
                         value.asBoolean();
                     }
                 };
             } else if (TypeDescriptor.STRING == primitive.type) {
-                return new Consumer<Value>() {
+                return new Consumer<>() {
                     @Override
                     public void accept(Value value) {
                         value.asString();

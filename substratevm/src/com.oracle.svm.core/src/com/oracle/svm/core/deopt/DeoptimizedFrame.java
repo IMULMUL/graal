@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,118 +24,85 @@
  */
 package com.oracle.svm.core.deopt;
 
-import java.lang.annotation.ElementType;
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
-import java.lang.ref.WeakReference;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
-import org.graalvm.compiler.core.common.NumUtil;
 import org.graalvm.nativeimage.PinnedObject;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.FrameAccess;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.code.CodeInfo;
-import com.oracle.svm.core.code.CodeInfoAccess;
-import com.oracle.svm.core.code.CodeInfoQueryResult;
-import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.FrameInfoQueryResult;
-import com.oracle.svm.core.code.SimpleCodeInfoQueryResult;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.deopt.Deoptimizer.TargetContent;
-import com.oracle.svm.core.log.StringBuilderLog;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.core.monitor.MonitorSupport;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
 
-import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.JavaConstant;
 
 /**
  * The handle to a deoptimized frame. It contains all stack entries which are written to the frame
  * of the deopt target method(s). For details see {@link Deoptimizer}.
  * <p>
- * In addition to the instance fields, the {@link DeoptimizedFrame} also has same reserved space for
- * the return value registers. This is used by {@link Deoptimizer#deoptStub} for restoring the
- * original return values.
  */
-@DeoptimizedFrame.ReserveDeoptScratchSpace
-public final class DeoptimizedFrame {
+public abstract class DeoptimizedFrame {
+    /**
+     * The frame size of the deoptimized method. This is the size of the physical stack frame that
+     * is still present on the stack until the actual stack frame rewriting happens.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public abstract long getSourceEncodedFrameSize();
+
+    public abstract long getSourceTotalFrameSize();
 
     /**
-     * Used to let the universe builder reserve some space in the instance layout for storing return
-     * value registers.
+     * The code address inside the source method (= the method to deoptimize).
      */
-    @Retention(RetentionPolicy.RUNTIME)
-    @Target(ElementType.TYPE)
-    public @interface ReserveDeoptScratchSpace {
-    }
+    public abstract CodePointer getSourcePC();
 
     /**
-     * Returns the offset of the {@linkplain ReserveDeoptScratchSpace scratch space} in the object.
+     * Rewrites the first return address entry to the exception handler. This lets the
+     * deoptimization stub return to the exception handler instead of the regular return address of
+     * the deoptimization target.
      */
-    public static int getScratchSpaceOffset() {
-        return NumUtil.roundUp(ConfigurationValues.getObjectLayout().getFirstFieldOffset(), FrameAccess.wordSize());
-    }
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public abstract void takeException();
 
     /**
-     * Heap-based representation of a future baseline-compiled stack frame, i.e., the intermediate
-     * representation between deoptimization of an optimized frame and the stack-frame rewriting.
+     * Returns the {@link PinnedObject} that ensures that this {@link DeoptimizedFrame} is not moved
+     * by the GC. The {@link DeoptimizedFrame} is accessed during GC when walking the stack.
      */
-    public static class VirtualFrame {
-        protected final FrameInfoQueryResult frameInfo;
-        protected VirtualFrame caller;
-        /** The program counter where execution continuous. */
-        protected ReturnAddress returnAddress;
+    public abstract PinnedObject getPin();
 
+    /**
+     * The top frame, i.e., the innermost callee of the inlining hierarchy.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public abstract VirtualFrame getTopFrame();
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public abstract DeoptTargetTier getTargetTier();
+
+    public enum DeoptTargetTier {
         /**
-         * The saved base pointer for the target frame, or null if the architecture does not use
-         * base pointers.
+         * Baseline-compiled AOT deoptimization target entry method.
          */
-        protected SavedBasePointer savedBasePointer;
-
+        BaselineCompiledCode,
         /**
-         * The local variables and expression stack value of this frame. Local variables that are
-         * unused at the deoptimization point are {@code null}.
+         * Crema interpreter.
          */
-        protected final ConstantEntry[] values;
-
-        protected VirtualFrame(FrameInfoQueryResult frameInfo) {
-            this.frameInfo = frameInfo;
-            this.values = new ConstantEntry[frameInfo.getValueInfos().length];
-        }
-
-        /**
-         * The caller frame of this frame, or null if this is the outermost frame.
-         */
-        public VirtualFrame getCaller() {
-            return caller;
-        }
-
-        /**
-         * The deoptimization metadata for this frame, i.e., the metadata of the baseline-compiled
-         * deoptimization target method.
-         */
-        public FrameInfoQueryResult getFrameInfo() {
-            return frameInfo;
-        }
-
-        /**
-         * Returns the value of the local variable or expression stack value with the given index.
-         * Expression stack values are after all local variables.
-         */
-        public JavaConstant getConstant(int index) {
-            if (index >= values.length || values[index] == null) {
-                return JavaConstant.forIllegal();
-            } else {
-                return values[index].constant;
-            }
-        }
+        Interpreter;
     }
+
+    public abstract SubstrateInstalledCode getSourceInstalledCode();
+
+    public abstract void logTraceDeoptMessage(Log log, FrameInfoQueryResult sourceTopFrame, boolean printOnlyTopFrames);
+
+    /**
+     * Returns the diagnostic event emitted when the deopt stub finishes handing off this frame.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected abstract char[] getCompletedMessage();
 
     /**
      * Base class for all kind of stack entries.
@@ -146,9 +113,6 @@ public final class DeoptimizedFrame {
         protected Entry(int offset) {
             this.offset = offset;
         }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.")
-        protected abstract void write(Deoptimizer.TargetContent targetContent);
     }
 
     /**
@@ -158,7 +122,11 @@ public final class DeoptimizedFrame {
 
         protected final JavaConstant constant;
 
-        protected static ConstantEntry factory(int offset, JavaConstant constant) {
+        /** Writes this entry into the target frame buffer. */
+        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+        protected abstract void write(Deoptimizer.TargetContent targetContent);
+
+        protected static ConstantEntry factory(int offset, JavaConstant constant, FrameInfoQueryResult frameInfo) {
             switch (constant.getJavaKind()) {
                 case Boolean:
                 case Byte:
@@ -175,7 +143,7 @@ public final class DeoptimizedFrame {
                 case Object:
                     return new ObjectConstantEntry(offset, constant, SubstrateObjectConstant.asObject(constant), SubstrateObjectConstant.isCompressed(constant));
                 default:
-                    throw VMError.shouldNotReachHere(constant.getJavaKind().toString());
+                    throw Deoptimizer.fatalDeoptimizationError("Unexpected constant type: " + constant, frameInfo);
             }
         }
 
@@ -242,18 +210,35 @@ public final class DeoptimizedFrame {
     /**
      * The return address, located between deopt target frames.
      */
-    static class ReturnAddress extends Entry {
+    public static class ReturnAddress extends Entry {
         protected long returnAddress;
 
-        protected ReturnAddress(int offset, long returnAddress) {
+        public ReturnAddress(int offset, long returnAddress) {
             super(offset);
             this.returnAddress = returnAddress;
         }
 
-        @Override
-        @Uninterruptible(reason = "Called from uninterruptible code.")
-        protected void write(Deoptimizer.TargetContent targetContent) {
-            targetContent.writeLong(offset, returnAddress);
+        /**
+         * Writes this return address into the target frame buffer, encoding it for its eventual
+         * stack location.
+         *
+         * @param targetContent buffer receiving the return address
+         * @param targetContentDestination address where the buffer will be installed
+         */
+        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+        protected void write(Deoptimizer.TargetContent targetContent, Pointer targetContentDestination) {
+            /*
+             * Encode the return address for its final stack location before writing it to the
+             * temporary buffer. On AArch64 with pointer authentication, the encoding uses the
+             * stack pointer immediately above the return-address slot.
+            */
+            Pointer returnAddressSp = targetContentDestination.add(Word.unsigned(offset + FrameAccess.returnAddressSize()));
+            CodePointer encodedReturnAddress = FrameAccess.singleton().encodeReturnAddress(returnAddressSp, Word.pointer(returnAddress));
+            targetContent.writeWord(offset, encodedReturnAddress);
+        }
+
+        public long getReturnAddress() {
+            return returnAddress;
         }
     }
 
@@ -269,14 +254,14 @@ public final class DeoptimizedFrame {
             this.valueRelativeToNewSp = valueRelativeToNewSp;
         }
 
-        @Uninterruptible(reason = "Called from uninterruptible code.")
+        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
         protected void write(Deoptimizer.TargetContent targetContent, Pointer newSp) {
-            targetContent.writeWord(offset, newSp.add(WordFactory.unsigned(valueRelativeToNewSp)));
+            targetContent.writeWord(offset, newSp.add(Word.unsigned(valueRelativeToNewSp)));
         }
     }
 
     /** Data for re-locking of an object during deoptimization. */
-    static class RelockObjectData {
+    public static class RelockObjectData {
         /** The object that needs to be re-locked. */
         final Object object;
         /**
@@ -289,141 +274,15 @@ public final class DeoptimizedFrame {
             this.object = object;
             this.lockData = lockData;
         }
-    }
 
-    protected static DeoptimizedFrame factory(int targetContentSize, long sourceEncodedFrameSize, SubstrateInstalledCode sourceInstalledCode, VirtualFrame topFrame,
-                    RelockObjectData[] relockedObjects, CodePointer sourcePC) {
-        final TargetContent targetContentBuffer = new TargetContent(targetContentSize, ConfigurationValues.getTarget().arch.getByteOrder());
-        return new DeoptimizedFrame(sourceEncodedFrameSize, sourceInstalledCode, topFrame, targetContentBuffer, relockedObjects, sourcePC);
-    }
-
-    private final long sourceEncodedFrameSize;
-    private final WeakReference<SubstrateInstalledCode> sourceInstalledCode;
-    private final VirtualFrame topFrame;
-    private final Deoptimizer.TargetContent targetContent;
-    private final RelockObjectData[] relockedObjects;
-    private final PinnedObject pin;
-    private final CodePointer sourcePC;
-    private final char[] completedMessage;
-
-    private DeoptimizedFrame(long sourceEncodedFrameSize, SubstrateInstalledCode sourceInstalledCode, VirtualFrame topFrame, Deoptimizer.TargetContent targetContent,
-                    RelockObjectData[] relockedObjects, CodePointer sourcePC) {
-        this.sourceEncodedFrameSize = sourceEncodedFrameSize;
-        this.topFrame = topFrame;
-        this.targetContent = targetContent;
-        this.relockedObjects = relockedObjects;
-        this.sourceInstalledCode = sourceInstalledCode == null ? null : new WeakReference<>(sourceInstalledCode);
-        this.sourcePC = sourcePC;
-        this.pin = PinnedObject.create(this);
-        StringBuilderLog sbl = new StringBuilderLog();
-        sbl.string("deoptStub: completed for DeoptimizedFrame at ").hex(pin.addressOfObject()).newline();
-        this.completedMessage = sbl.getResult().toCharArray();
-    }
-
-    /**
-     * The frame size of the deoptimized method. This is the size of the physical stack frame that
-     * is still present on the stack until the actual stack frame rewriting happens.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.")
-    public long getSourceEncodedFrameSize() {
-        return sourceEncodedFrameSize;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.")
-    public long getSourceTotalFrameSize() {
-        return CodeInfoQueryResult.getTotalFrameSize(sourceEncodedFrameSize);
-    }
-
-    /**
-     * Returns the {@link InstalledCode} of the deoptimized method, or {@code null}. If a runtime
-     * compiled method has been invalidated, the {@link InstalledCode} is no longer available. No
-     * {@link InstalledCode} is available for native image methods (which are only deoptimized
-     * during deoptimization testing).
-     */
-    public SubstrateInstalledCode getSourceInstalledCode() {
-        return sourceInstalledCode == null ? null : sourceInstalledCode.get();
-    }
-
-    /**
-     * The top frame, i.e., the innermost callee of the inlining hierarchy.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public VirtualFrame getTopFrame() {
-        return topFrame;
-    }
-
-    /**
-     * The new stack content for the target methods. In the second step of deoptimization this
-     * content is built from the entries of {@link VirtualFrame}s.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.")
-    protected Deoptimizer.TargetContent getTargetContent() {
-        return targetContent;
-    }
-
-    /**
-     * Returns the {@link PinnedObject} that ensures that this {@link DeoptimizedFrame} is not moved
-     * by the GC. The {@link DeoptimizedFrame} is accessed during GC when walking the stack.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.")
-    public PinnedObject getPin() {
-        return pin;
-    }
-
-    /**
-     * The code address inside the source method (= the method to deoptimize).
-     */
-    public CodePointer getSourcePC() {
-        return sourcePC;
-    }
-
-    @Uninterruptible(reason = "Called from Deoptimizer.deoptStub.")
-    char[] getCompletedMessage() {
-        return completedMessage;
-    }
-
-    /**
-     * Fills the target content from the {@link VirtualFrame virtual frame} information. This method
-     * must be uninterruptible.
-     *
-     * @param newSp the new stack pointer where execution will eventually continue
-     */
-    @Uninterruptible(reason = "Reads pointer values from the stack frame to unmanaged storage.")
-    protected void buildContent(Pointer newSp) {
-
-        VirtualFrame cur = topFrame;
-        do {
-            cur.returnAddress.write(targetContent);
-            if (cur.savedBasePointer != null) {
-                cur.savedBasePointer.write(targetContent, newSp);
-            }
-            for (int i = 0; i < cur.values.length; i++) {
-                if (cur.values[i] != null) {
-                    cur.values[i].write(targetContent);
-                }
-            }
-            cur = cur.caller;
-        } while (cur != null);
-
-        if (relockedObjects != null) {
-            for (RelockObjectData relockedObject : relockedObjects) {
-                MonitorSupport.singleton().doRelockObject(relockedObject.object, relockedObject.lockData);
-            }
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public Object getLockData() {
+            return lockData;
         }
-    }
 
-    /**
-     * Rewrites the first return address entry to the exception handler. This lets the
-     * deoptimization stub return to the exception handler instead of the regular return address of
-     * the deoptimization target.
-     */
-    public void takeException() {
-        ReturnAddress firstAddressEntry = topFrame.returnAddress;
-        CodeInfo info = CodeInfoTable.getImageCodeInfo();
-        SimpleCodeInfoQueryResult codeInfoQueryResult = StackValue.get(SimpleCodeInfoQueryResult.class);
-        CodeInfoAccess.lookupCodeInfo(info, CodeInfoAccess.relativeIP(info, WordFactory.pointer(firstAddressEntry.returnAddress)), codeInfoQueryResult);
-        long handler = codeInfoQueryResult.getExceptionOffset();
-        VMError.guarantee(handler != 0, "no exception handler registered for deopt target");
-        firstAddressEntry.returnAddress += handler;
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+        public Object getObject() {
+            return object;
+        }
     }
 }

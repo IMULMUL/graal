@@ -24,45 +24,63 @@
  */
 package com.oracle.svm.core.thread;
 
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.IsolateThread;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.core.heap.VMOperationInfo;
+import com.oracle.svm.core.jfr.JfrTicks;
+import com.oracle.svm.core.jfr.events.ExecuteVMOperationEvent;
+import com.oracle.svm.guest.staging.log.Log;
 import com.oracle.svm.core.thread.VMOperationControl.OpInProgress;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Only one thread at a time can execute {@linkplain VMOperation}s (see
  * {@linkplain VMOperationControl}). While executing a VM operation, it is guaranteed that the
  * yellow zone is enabled and that recurring callbacks are paused. This is necessary to avoid
  * unexpected exceptions while executing critical code.
+ *
+ * No Java synchronization is allowed within a VMOperation. See
+ * {@link VMOperationControl#guaranteeOkayToBlock} for examples of how using synchronization within
+ * a VMOperation can cause a deadlock.
  */
 public abstract class VMOperation {
-    private final String name;
-    private final SystemEffect systemEffect;
+    private final VMOperationInfo info;
 
-    protected VMOperation(String name, SystemEffect systemEffect) {
-        this.name = name;
-        this.systemEffect = systemEffect;
+    protected VMOperation(VMOperationInfo info) {
+        assert info.getVMOperationClass() == this.getClass();
+        this.info = info;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public final int getId() {
+        return info.getId();
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final String getName() {
-        return name;
+        return info.getName();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected boolean isGC() {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean isGC() {
         return false;
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public final boolean getCausesSafepoint() {
-        return SystemEffect.getCausesSafepoint(systemEffect);
+        return info.getCausesSafepoint();
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public final boolean isBlocking() {
+        return info.isBlocking();
     }
 
     protected final void execute(NativeVMOperationData data) {
@@ -75,7 +93,7 @@ public abstract class VMOperation {
              * The caller already does some filtering but it can still happen that we reach this
              * code even though no work needs to be done.
              */
-            trace.string("[Skipping operation ").string(name).string("]");
+            trace.string("[Skipping operation ").string(getName()).string("]");
             return;
         }
 
@@ -83,70 +101,82 @@ public abstract class VMOperation {
         VMOperation prevOperation = control.getInProgress().getOperation();
         IsolateThread prevQueuingThread = control.getInProgress().getQueuingThread();
         IsolateThread prevExecutingThread = control.getInProgress().getExecutingThread();
+        IsolateThread requestingThread = getQueuingThread(data);
 
-        control.setInProgress(this, getQueuingThread(data), CurrentIsolate.getCurrentThread(), true);
+        control.setInProgress(this, requestingThread, CurrentIsolate.getCurrentThread(), true);
+        long startTicks = JfrTicks.elapsedTicks();
         try {
-            trace.string("[Executing operation ").string(name);
+            trace.string("[Executing operation ").string(getName());
             operate(data);
             trace.string("]");
         } catch (Throwable t) {
             trace.string("[VMOperation.execute caught: ").string(t.getClass().getName()).string("]").newline();
             throw VMError.shouldNotReachHere(t);
         } finally {
+            ExecuteVMOperationEvent.emit(this, requestingThread, startTicks);
             control.setInProgress(prevOperation, prevQueuingThread, prevExecutingThread, false);
         }
     }
 
     /**
-     * Returns true if the current thread is currently executing a VM operation.
+     * Returns true if the current thread is in the middle of executing a VM operation. Note that
+     * this includes VM operations that do not need a safepoint.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isInProgress() {
         OpInProgress inProgress = VMOperationControl.get().getInProgress();
         return isInProgress(inProgress);
     }
 
     /**
-     * Returns true if the current thread is currently executing a VM operation that causes a
+     * Returns true if the current thread is in the middle of executing a VM operation that needs a
      * safepoint.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isInProgressAtSafepoint() {
         OpInProgress inProgress = VMOperationControl.get().getInProgress();
         return isInProgress(inProgress) && inProgress.operation.getCausesSafepoint();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static boolean isInProgress(OpInProgress inProgress) {
+    /**
+     * Returns true if the current thread is in the middle of executing a VM operation. Note that
+     * this includes VM operations that do not need a safepoint.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    static boolean isInProgress(OpInProgress inProgress) {
         return inProgress.getExecutingThread() == CurrentIsolate.getCurrentThread();
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    /** Returns true if the current thread is in the middle of performing a garbage collection. */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static boolean isGCInProgress() {
         VMOperation op = VMOperationControl.get().getInProgress().getOperation();
         return op != null && op.isGC();
     }
 
-    /** Check that there is a VMOperation in progress. */
-    public static void guaranteeInProgress(String message) {
-        if (!isInProgress()) {
-            throw VMError.shouldNotReachHere(message);
-        }
-    }
-
-    /** Check that there is not a VMOperation in progress. */
+    /**
+     * Throws a fatal error if the current thread is in the middle of executing a VM operation. Note
+     * that this includes VM operations that do not need a safepoint.
+     */
     public static void guaranteeNotInProgress(String message) {
         if (isInProgress()) {
             throw VMError.shouldNotReachHere(message);
         }
     }
 
+    /**
+     * Verifies that the current thread is in the middle of executing a VM operation that needs a
+     * safepoint.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void guaranteeInProgressAtSafepoint(String message) {
         if (!isInProgressAtSafepoint()) {
             throw VMError.shouldNotReachHere(message);
         }
     }
 
+    /** Verifies that the current thread is in the middle of performing a garbage collection. */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
     public static void guaranteeGCInProgress(String message) {
         if (!isGCInProgress()) {
             throw VMError.shouldNotReachHere(message);
@@ -162,24 +192,23 @@ public abstract class VMOperation {
         return true;
     }
 
-    protected abstract IsolateThread getQueuingThread(NativeVMOperationData data);
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected abstract void markAsQueued(NativeVMOperationData data);
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected abstract void setQueuingThread(NativeVMOperationData data, IsolateThread value);
+    protected abstract void markAsFinished(NativeVMOperationData data);
+
+    protected abstract IsolateThread getQueuingThread(NativeVMOperationData data);
 
     protected abstract boolean isFinished(NativeVMOperationData data);
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected abstract void setFinished(NativeVMOperationData data, boolean value);
-
-    @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, overridesCallers = true, reason = "Whitelisted because some operations may allocate.")
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, reason = "Whitelisted because some operations may allocate.")
     protected abstract void operate(NativeVMOperationData data);
 
     public enum SystemEffect {
         NONE,
         SAFEPOINT;
 
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+        @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
         public static boolean getCausesSafepoint(SystemEffect value) {
             return value == SAFEPOINT;
         }

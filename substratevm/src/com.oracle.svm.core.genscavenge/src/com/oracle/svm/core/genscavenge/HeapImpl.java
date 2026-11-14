@@ -24,75 +24,97 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import java.io.Serial;
 import java.lang.ref.Reference;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
-import org.graalvm.compiler.api.replacements.Fold;
-import org.graalvm.compiler.core.common.SuppressFBWarnings;
-import org.graalvm.compiler.nodes.gc.BarrierSet;
-import org.graalvm.compiler.word.Word;
-import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature.FeatureAccess;
+import org.graalvm.nativeimage.impl.RuntimeStateTrimConfig.Mode;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.MemoryWalker;
 import com.oracle.svm.core.SubstrateDiagnostics;
 import com.oracle.svm.core.SubstrateDiagnostics.DiagnosticThunk;
+import com.oracle.svm.core.SubstrateDiagnostics.ErrorContext;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AlwaysInline;
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
+import com.oracle.svm.core.genscavenge.AlignedHeapChunk.AlignedHeader;
+import com.oracle.svm.core.genscavenge.UnalignedHeapChunk.UnalignedHeader;
+import com.oracle.svm.core.genscavenge.metaspace.MetaspaceImpl;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
-import com.oracle.svm.core.heap.GC;
-import com.oracle.svm.core.heap.Heap;
+import com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets;
+import com.oracle.svm.guest.staging.core.heap.GC;
+import com.oracle.svm.guest.staging.core.heap.GCCause;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.heap.NoAllocationVerifier;
-import com.oracle.svm.core.heap.ObjectHeader;
-import com.oracle.svm.core.heap.ObjectVisitor;
-import com.oracle.svm.core.heap.PhysicalMemory;
-import com.oracle.svm.core.heap.ReferenceHandlerThreadSupport;
+import com.oracle.svm.guest.staging.core.heap.ObjectHeader;
+import com.oracle.svm.guest.staging.core.heap.ObjectVisitor;
+import com.oracle.svm.core.heap.ReferenceHandler;
+import com.oracle.svm.core.heap.ReferenceHandlerThread;
 import com.oracle.svm.core.heap.ReferenceInternals;
-import com.oracle.svm.core.heap.RuntimeCodeInfoGCSupport;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicReference;
+import com.oracle.svm.guest.staging.core.heap.RuntimeCodeInfoGCSupport;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.jfr.JfrTicks;
+import com.oracle.svm.core.jfr.events.SystemGCEvent;
 import com.oracle.svm.core.locks.VMCondition;
 import com.oracle.svm.core.locks.VMMutex;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.guest.staging.core.metaspace.Metaspace;
 import com.oracle.svm.core.nodes.CFunctionEpilogueNode;
 import com.oracle.svm.core.nodes.CFunctionPrologueNode;
-import com.oracle.svm.core.os.CommittedMemoryProvider;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.thread.JavaThreads;
-import com.oracle.svm.core.thread.ThreadStatus;
+import com.oracle.svm.core.thread.PlatformThreads;
+import com.oracle.svm.core.thread.ThreadsLock;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.UnsignedUtils;
-import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.core.thread.VMThreads.SafepointBehavior;
+import com.oracle.svm.guest.staging.SubstrateGCOptions;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.core.thread.ThreadStatus;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.option.NotifyGCRuntimeOptionKey;
+import com.oracle.svm.guest.staging.option.RuntimeOptionKey;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.MultiLayeredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.UnsignedUtils;
+import com.oracle.svm.shared.util.VMError;
 
-import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.graal.compiler.api.directives.GraalDirectives;
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.core.common.SuppressFBWarnings;
+import jdk.graal.compiler.nodes.extended.MembarNode;
 
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class)
 public final class HeapImpl extends Heap {
     /** Synchronization means for notifying {@link #refPendingList} waiters without deadlocks. */
-    private static final VMMutex REF_MUTEX = new VMMutex();
-    private static final VMCondition REF_CONDITION = new VMCondition(REF_MUTEX);
+    private static final VMMutex REF_MUTEX = new VMMutex("referencePendingList");
+    private static final VMCondition REF_CONDITION = new VMCondition(REF_MUTEX, "referencePendingList");
 
     // Singleton instances, created during image generation.
     private final YoungGeneration youngGeneration = new YoungGeneration("YoungGeneration");
-    private final OldGeneration oldGeneration = new OldGeneration("OldGeneration");
+    private final OldGeneration oldGeneration;
     private final HeapChunkProvider chunkProvider = new HeapChunkProvider();
     private final ObjectHeaderImpl objectHeaderImpl = new ObjectHeaderImpl();
     private final GCImpl gcImpl;
     private final RuntimeCodeInfoGCSupportImpl runtimeCodeInfoGcSupport;
-    private final HeapPolicy heapPolicy;
-    private final ImageHeapInfo imageHeapInfo = new ImageHeapInfo();
+    private final HeapAccounting accounting = new HeapAccounting();
+    private final ImageHeapChunkLogger imageHeapChunkLogger = new ImageHeapChunkLogger();
+    private boolean initialized;
 
     /** Head of the linked list of currently pending (ready to be enqueued) {@link Reference}s. */
     private Reference<?> refPendingList;
@@ -101,18 +123,15 @@ public final class HeapImpl extends Heap {
     /** Total number of times when threads waiting for a pending reference list were interrupted. */
     private volatile long refListWaiterWakeUpCounter;
 
-    /** Head of the linked list of object pins. */
-    private final AtomicReference<PinnedObjectImpl> pinHead = new AtomicReference<>();
-
     /** A cached list of all the classes, if someone asks for it. */
     private List<Class<?>> classList;
 
     @Platforms(Platform.HOSTED_ONLY.class)
-    public HeapImpl(FeatureAccess access) {
-        this.gcImpl = new GCImpl(access);
+    public HeapImpl() {
+        this.gcImpl = new GCImpl();
         this.runtimeCodeInfoGcSupport = new RuntimeCodeInfoGCSupportImpl();
-        this.heapPolicy = new HeapPolicy();
-        SubstrateDiagnostics.DiagnosticThunkRegister.getSingleton().register(new HeapDiagnosticsPrinter());
+        this.oldGeneration = SerialGCOptions.useCompactingOldGen() ? new CompactingOldGeneration("OldGeneration")
+                        : new CopyingOldGeneration("OldGeneration");
     }
 
     @Fold
@@ -122,14 +141,49 @@ public final class HeapImpl extends Heap {
         return (HeapImpl) heap;
     }
 
-    @Fold
-    public static ImageHeapInfo getImageHeapInfo() {
-        return getHeapImpl().imageHeapInfo;
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static ImageHeapInfo[] getImageHeapInfos() {
+        return MultiLayeredImageSingleton.getAllLayers(ImageHeapInfo.class);
+    }
+
+    @Override
+    public boolean isRuntimeStateTrimSupported(Mode mode) {
+        return !GCImpl.hasNeverCollectPolicy();
     }
 
     @Fold
     static HeapChunkProvider getChunkProvider() {
         return getHeapImpl().chunkProvider;
+    }
+
+    @Override
+    public void trimRuntimeState(Mode mode) {
+        VMOperation.guaranteeInProgressAtSafepoint("HeapImpl.trimRuntimeState");
+        VMError.guarantee(NoAllocationVerifier.isActive(), "A NoAllocationVerifier must be active.");
+
+        GCCause gcCause = mode == Mode.LATENCY || mode == Mode.CONSERVATIVE
+                        ? GCCause.RuntimeStateTrimYoungGC
+                        : GCCause.RuntimeStateTrimFullGC;
+        gcImpl.collect(gcCause);
+
+        if (mode == Mode.CONSERVATIVE || mode == Mode.SIZE) {
+            getChunkProvider().freeUnusedAlignedChunks();
+            ChunkBasedCommittedMemoryProvider.get().uncommitUnusedMemory();
+        }
+
+        if (mode == Mode.CONSERVATIVE) {
+            getChunkProvider().cleanUnusedAlignedChunks();
+        } else if (mode == Mode.BALANCED || mode == Mode.SIZE) {
+            boolean cleanFillerObjectMemory = mode == Mode.SIZE;
+            getHeapImpl().makeParseable();
+            getYoungGeneration().clean(true, cleanFillerObjectMemory);
+            getOldGeneration().clean(true, cleanFillerObjectMemory);
+            getChunkProvider().cleanUnusedAlignedChunks();
+        }
+
+        if (mode != Mode.LATENCY) {
+            gcImpl.cleanUnusedNativeMemory();
+        }
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -142,31 +196,49 @@ public final class HeapImpl extends Heap {
     }
 
     @Override
+    @AlwaysInline("GC performance")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean isInImageHeap(Pointer pointer) {
-        return imageHeapInfo.isInImageHeap(pointer) || (AuxiliaryImageHeap.isPresent() && AuxiliaryImageHeap.singleton().containsObject(pointer));
+    public boolean isInImageHeap(Pointer objPointer) {
+        return isInPrimaryImageHeap(objPointer) || (AuxiliaryImageHeap.isPresent() && AuxiliaryImageHeap.singleton().containsObject(objPointer));
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isInPrimaryImageHeap(Object obj) {
+        // This method is not really uninterruptible (mayBeInlined) but converts arbitrary objects
+        // to pointers. An object that is outside the image heap may be moved by a GC but it will
+        // never be moved into the image heap. So, this is fine.
+        return isInPrimaryImageHeap(Word.objectToUntrackedPointer(obj));
+    }
+
+    @Override
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isInPrimaryImageHeap(Pointer objPointer) {
+        for (ImageHeapInfo info : getImageHeapInfos()) {
+            if (info.isInImageHeap(objPointer)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public void suspendAllocation() {
-        ThreadLocalAllocation.suspendInCurrentThread();
+        TlabSupport.suspendAllocationInCurrentThread();
     }
 
     @Override
     public void resumeAllocation() {
-        ThreadLocalAllocation.resumeInCurrentThread();
+        // Nothing to do - the next allocation will refill the TLAB.
     }
 
     @Override
-    public boolean walkObjects(ObjectVisitor visitor) {
+    public void walkObjects(ObjectVisitor visitor) {
         VMOperation.guaranteeInProgressAtSafepoint("must only be executed at a safepoint");
-        return walkImageHeapObjects(visitor) && walkCollectedHeapObjects(visitor);
-    }
-
-    /** Walk the regions of the heap. */
-    boolean walkMemory(MemoryWalker.Visitor visitor) {
-        VMOperation.guaranteeInProgressAtSafepoint("must only be executed at a safepoint");
-        return walkNativeImageHeapRegions(visitor) && getYoungGeneration().walkHeapChunks(visitor) && getOldGeneration().walkHeapChunks(visitor) && getChunkProvider().walkHeapChunks(visitor);
+        walkImageHeapObjects(visitor);
+        walkCollectedHeapObjects(visitor);
     }
 
     /** Tear down the heap and release its memory. */
@@ -175,7 +247,8 @@ public final class HeapImpl extends Heap {
     public boolean tearDown() {
         youngGeneration.tearDown();
         oldGeneration.tearDown();
-        getChunkProvider().tearDown();
+        chunkProvider.tearDown();
+        gcImpl.tearDown();
         return true;
     }
 
@@ -185,14 +258,20 @@ public final class HeapImpl extends Heap {
         return objectHeaderImpl;
     }
 
-    ObjectHeaderImpl getObjectHeaderImpl() {
-        return objectHeaderImpl;
+    @Fold
+    static ObjectHeaderImpl getObjectHeaderImpl() {
+        return getHeapImpl().objectHeaderImpl;
     }
 
     @Fold
     @Override
     public GC getGC() {
-        return getGCImpl();
+        return getHeapImpl().gcImpl;
+    }
+
+    @Fold
+    static GCImpl getGCImpl() {
+        return getHeapImpl().gcImpl;
     }
 
     @Fold
@@ -201,40 +280,28 @@ public final class HeapImpl extends Heap {
         return runtimeCodeInfoGcSupport;
     }
 
-    GCImpl getGCImpl() {
-        return gcImpl;
+    @Fold
+    public static HeapAccounting getAccounting() {
+        return getHeapImpl().accounting;
     }
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isAllocationDisallowed() {
-        return NoAllocationVerifier.isActive() || gcImpl.isCollectionInProgress();
+        return NoAllocationVerifier.isActive() || SafepointBehavior.ignoresSafepoints();
     }
 
     /** A guard to place before an allocation, giving the call site and the allocation type. */
-    static void exitIfAllocationDisallowed(String callSite, String typeName) {
+    @AlwaysInline("Keep the allocation validity check inline in allocation slow paths.")
+    static void exitIfAllocationDisallowed(String callSite, DynamicHub hub) {
         if (HeapImpl.getHeapImpl().isAllocationDisallowed()) {
-            NoAllocationVerifier.exit(callSite, typeName);
+            throw reportAllocationDisallowed(callSite, hub);
         }
     }
 
-    @AlwaysInline("GC performance")
-    Object promoteObject(Object original, UnsignedWord header) {
-        Log trace = Log.noopLog().string("[HeapImpl.promoteObject:").string("  original: ").object(original);
-
-        Object result;
-        if (HeapPolicy.getMaxSurvivorSpaces() > 0 && !getGCImpl().isCompleteCollection()) {
-            result = getYoungGeneration().promoteObject(original, header);
-        } else {
-            result = getOldGeneration().promoteObject(original, header);
-        }
-
-        trace.string("  result: ").object(result).string("]").newline();
-        return result;
-    }
-
-    HeapPolicy getHeapPolicy() {
-        return heapPolicy;
+    @NeverInline("Keep allocation failure diagnostics out of allocation slow paths.")
+    private static RuntimeException reportAllocationDisallowed(String callSite, DynamicHub hub) {
+        return NoAllocationVerifier.exit(callSite, hub.getName());
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -247,115 +314,141 @@ public final class HeapImpl extends Heap {
         return oldGeneration;
     }
 
-    AtomicReference<PinnedObjectImpl> getPinHead() {
-        return pinHead;
+    void logUsage(Log log) {
+        if (Metaspace.isSupported()) {
+            MetaspaceImpl.singleton().logUsage(log);
+        }
+        youngGeneration.logUsage(log);
+        oldGeneration.logUsage(log);
     }
 
-    @Uninterruptible(reason = "Necessary to return a reasonably consistent value (a GC can change the queried values).")
-    public UnsignedWord getUsedBytes() {
-        return getOldGeneration().getChunkBytes().add(HeapPolicy.getYoungUsedBytes());
-    }
-
-    @Uninterruptible(reason = "Necessary to return a reasonably consistent value (a GC can change the queried values).")
-    public UnsignedWord getCommittedBytes() {
-        return getUsedBytes().add(getChunkProvider().getBytesInUnusedChunks());
-    }
-
-    void report(Log log) {
-        report(log, HeapPolicyOptions.TraceHeapChunks.getValue());
-    }
-
-    Log report(Log log, boolean traceHeapChunks) {
-        log.newline().string("[Heap:").indent(true);
-        getYoungGeneration().report(log, traceHeapChunks).newline();
-        getOldGeneration().report(log, traceHeapChunks).newline();
-        getChunkProvider().report(log, traceHeapChunks);
-        log.redent(false).string("]");
-        return log;
-    }
-
-    Log logImageHeapPartitionBoundaries(Log log) {
-        log.string("[Native image heap boundaries: ").indent(true);
-        ImageHeapWalker.logPartitionBoundaries(log, imageHeapInfo);
-        log.redent(false).string("]");
-        return log;
+    void logChunks(Log log, boolean allowUnsafe) {
+        if (Metaspace.isSupported()) {
+            MetaspaceImpl.singleton().logChunks(log);
+        }
+        imageHeapChunkLogger.initialize(log);
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+            ImageHeapWalker.walkImageHeapChunks(info, imageHeapChunkLogger);
+        }
+        if (AuxiliaryImageHeap.isPresent()) {
+            AuxiliaryImageHeap.singleton().walkHeapChunks(imageHeapChunkLogger);
+        }
+        getYoungGeneration().logChunks(log, allowUnsafe);
+        getOldGeneration().logChunks(log);
+        getChunkProvider().logFreeChunks(log);
     }
 
     /** Log the zap values to make it easier to search for them. */
-    static Log zapValuesToLog(Log log) {
-        if (HeapPolicy.getZapProducedHeapChunks() || HeapPolicy.getZapConsumedHeapChunks()) {
-            log.string("[Heap Chunk zap values: ").indent(true);
+    static void logZapValues(Log log) {
+        if (HeapParameters.getZapProducedHeapChunks() || HeapParameters.getZapConsumedHeapChunks()) {
             /* Padded with spaces so the columns line up between the int and word variants. */
-            // @formatter:off
-            if (HeapPolicy.getZapProducedHeapChunks()) {
-                log.string("  producedHeapChunkZapInt: ")
-                                .string("  hex: ").spaces(8).hex(HeapPolicy.getProducedHeapChunkZapInt())
-                                .string("  signed: ").spaces(9).signed(HeapPolicy.getProducedHeapChunkZapInt())
-                                .string("  unsigned: ").spaces(10).unsigned(HeapPolicy.getProducedHeapChunkZapInt()).newline();
-                log.string("  producedHeapChunkZapWord:")
-                                .string("  hex: ").hex(HeapPolicy.getProducedHeapChunkZapWord())
-                                .string("  signed: ").signed(HeapPolicy.getProducedHeapChunkZapWord())
-                                .string("  unsigned: ").unsigned(HeapPolicy.getProducedHeapChunkZapWord());
-                if (HeapPolicy.getZapConsumedHeapChunks()) {
-                    log.newline();
-                }
+            if (HeapParameters.getZapProducedHeapChunks()) {
+                log.string("producedHeapChunkZapInt: ") //
+                                .string(" hex: ").spaces(8).hex(HeapParameters.getProducedHeapChunkZapInt()) //
+                                .string(" signed: ").spaces(9).signed(HeapParameters.getProducedHeapChunkZapInt()) //
+                                .string(" unsigned: ").spaces(10).unsigned(HeapParameters.getProducedHeapChunkZapInt()).newline();
+                log.string("producedHeapChunkZapWord:") //
+                                .string(" hex: ").hex(HeapParameters.getProducedHeapChunkZapWord()) //
+                                .string(" signed: ").signed(HeapParameters.getProducedHeapChunkZapWord()) //
+                                .string(" unsigned: ").unsigned(HeapParameters.getProducedHeapChunkZapWord()).newline();
             }
-            if (HeapPolicy.getZapConsumedHeapChunks()) {
-                log.string("  consumedHeapChunkZapInt: ")
-                                .string("  hex: ").spaces(8).hex(HeapPolicy.getConsumedHeapChunkZapInt())
-                                .string("  signed: ").spaces(10).signed(HeapPolicy.getConsumedHeapChunkZapInt())
-                                .string("  unsigned: ").spaces(10).unsigned(HeapPolicy.getConsumedHeapChunkZapInt()).newline();
-                log.string("  consumedHeapChunkZapWord:")
-                                .string("  hex: ").hex(HeapPolicy.getConsumedHeapChunkZapWord())
-                                .string("  signed: ").signed(HeapPolicy.getConsumedHeapChunkZapWord())
-                                .string("  unsigned: ").unsigned(HeapPolicy.getConsumedHeapChunkZapWord());
+            if (HeapParameters.getZapConsumedHeapChunks()) {
+                log.string("consumedHeapChunkZapInt: ") //
+                                .string(" hex: ").spaces(8).hex(HeapParameters.getConsumedHeapChunkZapInt()) //
+                                .string(" signed: ").spaces(10).signed(HeapParameters.getConsumedHeapChunkZapInt()) //
+                                .string(" unsigned: ").spaces(10).unsigned(HeapParameters.getConsumedHeapChunkZapInt()).newline();
+                log.string("consumedHeapChunkZapWord:") //
+                                .string(" hex: ").hex(HeapParameters.getConsumedHeapChunkZapWord()) //
+                                .string(" signed: ").signed(HeapParameters.getConsumedHeapChunkZapWord()) //
+                                .string(" unsigned: ").unsigned(HeapParameters.getConsumedHeapChunkZapWord()).newline();
             }
-            log.redent(false).string("]");
-            // @formatter:on
         }
-        return log;
     }
 
     @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public int getClassCount() {
-        return imageHeapInfo.dynamicHubCount;
+        int count = 0;
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+            count += info.dynamicHubCount;
+        }
+        return count;
     }
 
     @Override
-    public List<Class<?>> getClassList() {
+    protected List<Class<?>> getClassesInImageHeap() {
         /* Two threads might race to set classList, but they compute the same result. */
         if (classList == null) {
-            List<Class<?>> list = new ArrayList<>(1024);
-            ImageHeapWalker.walkRegions(imageHeapInfo, new ClassListBuilderVisitor(list));
-            classList = Collections.unmodifiableList(list);
+            ArrayList<Class<?>> list = findAllDynamicHubs();
+            /* Ensure that other threads see consistent values once the list is published. */
+            MembarNode.memoryBarrier(MembarNode.FenceKind.STORE_STORE);
+            classList = list;
         }
-        assert classList.size() == imageHeapInfo.dynamicHubCount;
         return classList;
     }
 
+    private ArrayList<Class<?>> findAllDynamicHubs() {
+        int dynamicHubCount = getClassCount();
+
+        ArrayList<Class<?>> list = new ArrayList<>(dynamicHubCount);
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+            collectDynamicHubs(info, list);
+        }
+
+        VMError.guarantee(dynamicHubCount == list.size(), "Found fewer DynamicHubs in the image heap than expected.");
+        return list;
+    }
+
+    private static void collectDynamicHubs(ImageHeapInfo info, ArrayList<Class<?>> list) {
+        try {
+            ClassListBuilderVisitor visitor = new ClassListBuilderVisitor(list.size() + info.dynamicHubCount, list);
+            ImageHeapWalker.walkRegions(info, visitor);
+        } catch (FoundAllHubsException ignored) {
+        }
+    }
+
+    /**
+     * Iterates over the image heap parts that may contain dynamic hubs. After collecting all
+     * dynamic hubs were collected, this visitor throws a {@link FoundAllHubsException}.
+     */
     private static class ClassListBuilderVisitor implements MemoryWalker.ImageHeapRegionVisitor, ObjectVisitor {
+        private static final FoundAllHubsException FOUND_ALL_HUBS_EXCEPTION = PreallocatedExceptions.prepare(new FoundAllHubsException());
+
+        private final int dynamicHubCount;
         private final List<Class<?>> list;
 
-        ClassListBuilderVisitor(List<Class<?>> list) {
+        ClassListBuilderVisitor(int dynamicHubCount, List<Class<?>> list) {
+            this.dynamicHubCount = dynamicHubCount;
             this.list = list;
         }
 
         @Override
-        public <T> boolean visitNativeImageHeapRegion(T region, MemoryWalker.NativeImageHeapRegionAccess<T> access) {
-            if (!access.isWritable(region) && access.containsReferences(region)) {
+        public <T> void visitNativeImageHeapRegion(T region, MemoryWalker.NativeImageHeapRegionAccess<T> access) {
+            if (!access.isWritable(region) && !access.usesUnalignedChunks(region)) {
                 access.visitObjects(region, this);
             }
-            return true;
         }
 
         @Override
-        @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, overridesCallers = true, //
-                        reason = "Allocation is fine: this method traverses only the image heap.")
-        public boolean visitObject(Object o) {
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, reason = "Allocation is fine: this method traverses only the image heap.")
+        public void visitObject(Object o) {
             if (o instanceof Class<?>) {
-                list.add(KnownIntrinsics.convertUnknownValue(o, Class.class));
+                list.add((Class<?>) o);
+                if (list.size() == dynamicHubCount) {
+                    throw FOUND_ALL_HUBS_EXCEPTION;
+                }
             }
-            return true;
+        }
+    }
+
+    private static final class FoundAllHubsException extends RuntimeException {
+        @Serial private static final long serialVersionUID = 1L;
+
+        @Override
+        @SuppressWarnings("sync-override")
+        public Throwable fillInStackTrace() {
+            /* No stacktrace needed. */
+            return this;
         }
     }
 
@@ -372,78 +465,131 @@ public final class HeapImpl extends Heap {
     @Uninterruptible(reason = "Called during startup.")
     @Override
     public void attachThread(IsolateThread isolateThread) {
-        // nothing to do
+        if (!initialized) {
+            initialize();
+        }
+        TlabSupport.initialize(isolateThread);
     }
 
     @Override
+    @Uninterruptible(reason = "Current thread holds the ThreadsLock with exclusive write access.")
     public void detachThread(IsolateThread isolateThread) {
-        ThreadLocalAllocation.disableAndFlushForThread(isolateThread);
+        TlabSupport.disableAndFlushForThread(isolateThread);
     }
 
-    @Fold
-    public static boolean usesImageHeapChunks() {
-        // Chunks are needed for card marking and not very useful without it
-        return usesImageHeapCardMarking();
+    @Uninterruptible(reason = "Called during startup.")
+    private void initialize() {
+        assert ThreadsLock.hasWriteAccess() : "must hold the ThreadsLock";
+        assert !initialized : "only the first thread may initialize the heap";
+        initialized = true;
+
+        TlabSupport.startupInitialization();
+        gcImpl.updatePolicy();
     }
 
     @Fold
     public static boolean usesImageHeapCardMarking() {
-        Boolean enabled = HeapOptions.ImageHeapCardMarking.getValue();
-        if (enabled == Boolean.FALSE || enabled == null && !SubstrateOptions.useRememberedSet()) {
+        Boolean enabled = SerialGCOptions.ImageHeapCardMarking.getValue();
+        if (enabled == Boolean.FALSE || enabled == null && !SerialGCOptions.useRememberedSet()) {
             return false;
-        } else if (enabled == null) {
-            return CommittedMemoryProvider.get().guaranteesHeapPreferredAddressSpaceAlignment();
         }
-        UserError.guarantee(CommittedMemoryProvider.get().guaranteesHeapPreferredAddressSpaceAlignment(),
-                        "Enabling option %s requires a custom image heap alignment at runtime, which cannot be ensured with the current configuration (option %s might be disabled)",
-                        HeapOptions.ImageHeapCardMarking, SubstrateOptions.SpawnIsolates);
         return true;
     }
 
     @Fold
-    @Override
-    public int getPreferredAddressSpaceAlignment() {
-        if (usesImageHeapChunks()) {
-            return UnsignedUtils.safeToInt(HeapPolicy.getAlignedHeapChunkAlignment());
+    public static int getNullRegionSize() {
+        if (SubstrateOptions.UseNullRegion.getValue()) {
+            /*
+             * The image heap will be mapped in a way that there is a memory protected gap between
+             * the heap base and the start of the image heap. The gap won't need any memory in the
+             * native image file.
+             */
+            return NumUtil.safeToInt(SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getValue());
         }
-        return ConfigurationValues.getObjectLayout().getAlignment();
+        return 0;
+    }
+
+    @Fold
+    static int getMetaspaceOffsetInAddressSpace() {
+        int result = getNullRegionSize();
+        assert result % HeapParameters.getAlignedHeapChunkAlignment().rawValue() == 0 : "start of metaspace must be aligned";
+        return result;
+    }
+
+    @Fold
+    static int getReservedMetaspaceSize() {
+        if (!Metaspace.isSupported()) {
+            return 0;
+        }
+
+        int unalignedValue = SubstrateGCOptions.ConcealedOptions.getMaxMetaspaceSize();
+        long result = NumUtil.roundUp(unalignedValue, SerialAndEpsilonGCOptions.AlignedHeapChunkSize.getValue());
+        return NumUtil.safeToInt(result);
+    }
+
+    @Fold
+    @Override
+    public int getHeapBaseAlignment() {
+        return getImageHeapAlignment();
+    }
+
+    @Fold
+    @Override
+    public int getMaxInstanceSize() {
+        return NumUtil.safeToInt(AlignedHeapChunk.getUsableSizeForObjects().rawValue());
+    }
+
+    @Fold
+    @Override
+    public int getImageHeapAlignment() {
+        return UnsignedUtils.safeToInt(HeapParameters.getAlignedHeapChunkAlignment());
     }
 
     @Fold
     @Override
     public int getImageHeapOffsetInAddressSpace() {
-        return 0;
+        int result = getNullRegionSize() + getReservedMetaspaceSize();
+        assert result % getImageHeapAlignment() == 0 : "start of image heap must be aligned";
+        return result;
     }
 
     @Override
-    public boolean walkImageHeapObjects(ObjectVisitor visitor) {
+    public void walkImageHeapObjects(ObjectVisitor visitor) {
         VMOperation.guaranteeInProgressAtSafepoint("Must only be called at a safepoint");
-        if (visitor != null) {
-            return ImageHeapWalker.walkImageHeapObjects(imageHeapInfo, visitor) &&
-                            (!AuxiliaryImageHeap.isPresent() || AuxiliaryImageHeap.singleton().walkObjects(visitor));
+        if (visitor == null) {
+            return;
         }
-        return true;
+
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+            ImageHeapWalker.walkImageHeapObjects(info, visitor);
+        }
+        if (AuxiliaryImageHeap.isPresent()) {
+            AuxiliaryImageHeap.singleton().walkObjects(visitor);
+        }
     }
 
     @Override
-    public boolean walkCollectedHeapObjects(ObjectVisitor visitor) {
+    public void walkCollectedHeapObjects(ObjectVisitor visitor) {
         VMOperation.guaranteeInProgressAtSafepoint("Must only be called at a safepoint");
-        return getYoungGeneration().walkObjects(visitor) && getOldGeneration().walkObjects(visitor);
-    }
-
-    boolean walkNativeImageHeapRegions(MemoryWalker.ImageHeapRegionVisitor visitor) {
-        return ImageHeapWalker.walkRegions(imageHeapInfo, visitor) &&
-                        (!AuxiliaryImageHeap.isPresent() || AuxiliaryImageHeap.singleton().walkRegions(visitor));
+        makeParseable();
+        getYoungGeneration().walkObjects(visitor);
+        getOldGeneration().walkObjects(visitor);
     }
 
     @Override
-    public BarrierSet createBarrierSet(MetaAccessProvider metaAccess) {
-        return RememberedSet.get().createBarrierSet(metaAccess);
+    public void doReferenceHandling() {
+        if (ReferenceHandler.isExecutedManually()) {
+            GCImpl.doReferenceHandling();
+        }
+    }
+
+    void makeParseable() {
+        youngGeneration.makeParseable();
     }
 
     @SuppressFBWarnings(value = "VO_VOLATILE_INCREMENT", justification = "Only the GC increments the volatile field 'refListOfferCounter'.")
     void addToReferencePendingList(Reference<?> list) {
-        VMOperation.guaranteeGCInProgress("Must only be called during a GC.");
+        assert VMOperation.isGCInProgress();
         if (list == null) {
             return;
         }
@@ -474,10 +620,15 @@ public final class HeapImpl extends Heap {
     public boolean hasReferencePendingList() {
         REF_MUTEX.lockNoTransition();
         try {
-            return refPendingList != null;
+            return hasReferencePendingListUnsafe();
         } finally {
             REF_MUTEX.unlock();
         }
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    boolean hasReferencePendingListUnsafe() {
+        return refPendingList != null;
     }
 
     @Override
@@ -502,9 +653,13 @@ public final class HeapImpl extends Heap {
          * everything in the reverse order here: we read the wakeup count *before* the call to
          * Thread.interrupted().
          */
-        assert Thread.currentThread() == ImageSingletons.lookup(ReferenceHandlerThreadSupport.class).getThread();
+        assert ReferenceHandlerThread.isReferenceHandlerThread();
         long initialOffers = refListOfferCounter;
         long initialWakeUps = refListWaiterWakeUpCounter;
+        if (ReferenceHandlerThread.isStopping()) {
+            // Must re-check because initialWakeUps can already include the corresponding wakeup.
+            return;
+        }
         if (hasReferencePendingList()) {
             return;
         }
@@ -517,12 +672,12 @@ public final class HeapImpl extends Heap {
 
     private static boolean waitForPendingReferenceList(long initialOffers, long initialWakeUps) {
         Thread currentThread = Thread.currentThread();
-        int oldThreadStatus = JavaThreads.getThreadStatus(currentThread);
-        JavaThreads.setThreadStatus(currentThread, ThreadStatus.PARKED);
+        int oldThreadStatus = PlatformThreads.getThreadStatus(currentThread);
+        PlatformThreads.setThreadStatus(currentThread, ThreadStatus.PARKED);
         try {
             return transitionToNativeThenAwaitPendingRefs(initialOffers, initialWakeUps);
         } finally {
-            JavaThreads.setThreadStatus(currentThread, oldThreadStatus);
+            PlatformThreads.setThreadStatus(currentThread, oldThreadStatus);
         }
     }
 
@@ -585,37 +740,353 @@ public final class HeapImpl extends Heap {
         }
     }
 
-    private static class HeapDiagnosticsPrinter implements DiagnosticThunk {
+    @Override
+    public boolean printLocationInfo(Log log, UnsignedWord value, boolean allowJavaHeapAccess, boolean allowUnsafeOperations) {
+        Pointer heapBase = KnownIntrinsics.heapBase();
+        if (value.equal(heapBase)) {
+            log.string("is the heap base");
+            return true;
+        } else if (value.aboveThan(heapBase) && value.belowThan(heapBase.add(getNullRegionSize()))) {
+            log.string("points into the protected null region after the heap base");
+            return true;
+        }
+
+        if (objectHeaderImpl.isEncodedObjectHeader((Word) value)) {
+            log.string("is the encoded object header for an object of type ");
+            DynamicHub hub = (DynamicHub) objectHeaderImpl.dynamicHubFromObjectHeader((Word) value);
+            log.string(hub.getName());
+            return true;
+        }
+
+        Pointer ptr = (Pointer) value;
+        if (printLocationInfo(log, ptr, allowJavaHeapAccess, allowUnsafeOperations)) {
+            if (allowJavaHeapAccess && objectHeaderImpl.pointsToObjectHeader(ptr)) {
+                log.indent(true);
+                SubstrateDiagnostics.printObjectInfo(log, ptr.toObject());
+                log.redent(false);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void optionValueChanged(NotifyGCRuntimeOptionKey<?> key) {
+        if (SubstrateUtil.HOSTED || isIrrelevantForGCPolicy(key)) {
+            return;
+        }
+
+        GCImpl.getPolicy().updateSizeParameters();
+    }
+
+    /** For the GC policy, mainly heap-size-related GC options are relevant. */
+    private static boolean isIrrelevantForGCPolicy(RuntimeOptionKey<?> key) {
+        return key == SubstrateGCOptions.DisableExplicitGC ||
+                        key == SubstrateGCOptions.PrintGC ||
+                        key == SubstrateGCOptions.VerboseGC ||
+                        key == SubstrateGCOptions.ConcealedOptions.VerifyBeforeGC ||
+                        key == SubstrateGCOptions.ConcealedOptions.VerifyDuringGC ||
+                        key == SubstrateGCOptions.ConcealedOptions.VerifyAfterGC;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public long getThreadAllocatedMemory(IsolateThread thread) {
+        UnsignedWord allocatedBytes = ThreadLocalAllocation.getAllocatedBytes(thread);
+
+        /*
+         * The current aligned chunk in the TLAB is only partially filled and therefore not yet
+         * accounted for in ThreadLocalAllocation.allocatedBytes. The reads below are unsynchronized
+         * and unordered with the thread updating its TLAB, so races may occur. We only use the read
+         * values if they are plausible and not obviously racy. We also accept that certain races
+         * can cause that the memory in the current aligned TLAB chunk is counted twice.
+         */
+        ThreadLocalAllocation.Descriptor tlab = ThreadLocalAllocation.getTlab(thread);
+        Pointer start = tlab.getAlignedAllocationStart(SubstrateAllocationSnippets.TLAB_START_IDENTITY);
+        Pointer top = tlab.getAllocationTop(SubstrateAllocationSnippets.TLAB_TOP_IDENTITY);
+
+        if (top.aboveThan(start)) {
+            UnsignedWord usedTlabSize = top.subtract(start);
+            if (usedTlabSize.belowOrEqual(HeapParameters.getAlignedHeapChunkSize())) {
+                return allocatedBytes.add(usedTlabSize).rawValue();
+            }
+        }
+        return allocatedBytes.rawValue();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Ensure that no GC can occur between modification of the object and this call.", callerMustBe = true)
+    public void dirtyAllReferencesOf(Object obj) {
+        if (obj == null) {
+            return;
+        }
+
+        RememberedSet.get().dirtyAllReferencesIfNecessary(obj);
+    }
+
+    @Override
+    public long getMillisSinceLastWholeHeapExamined() {
+        return HeapImpl.getGCImpl().getMillisSinceLastWholeHeapExamined();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Ensure that no GC can move the object to another chunk.", callerMustBe = true)
+    public long getIdentityHashSalt(Object obj) {
+        if (!GraalDirectives.inIntrinsic()) {
+            assert !isInImageHeap(obj) : "Image heap objects have identity hash code fields";
+        }
+        HeapChunk.Header<?> chunk = HeapChunk.getEnclosingHeapChunk(obj);
+        return HeapChunk.getIdentityHashSalt(chunk).rawValue();
+    }
+
+    @Override
+    @Uninterruptible(reason = "Necessary to return a reasonably consistent value (a GC can change the queried values).")
+    public UnsignedWord getUsedMemoryAfterLastGC() {
+        return accounting.getUsedBytes();
+    }
+
+    private boolean printLocationInfo(Log log, Pointer ptr, boolean allowJavaHeapAccess, boolean allowUnsafeOperations) {
+        for (ImageHeapInfo imageHeap : HeapImpl.getImageHeapInfos()) {
+            /* Check from most-specific to least-specific. */
+            if (imageHeap.isInAlignedReadOnlyRelocatable(ptr)) {
+                log.string("points into the image heap (aligned chunk, read-only relocatables)");
+                return true;
+            } else if (imageHeap.isInAlignedReadOnly(ptr)) {
+                log.string("points into the image heap (aligned chunk, read-only)");
+                return true;
+            } else if (imageHeap.isInAlignedWritablePatched(ptr)) {
+                log.string("points into the image heap (aligned chunk, writable patched)");
+                return true;
+            } else if (imageHeap.isInAlignedWritable(ptr)) {
+                log.string("points into the image heap (aligned chunk, writable)");
+                return true;
+            } else if (imageHeap.isInUnalignedWritable(ptr)) {
+                log.string("points into the image heap (unaligned chunk, writable)");
+                return true;
+            } else if (imageHeap.isInUnalignedReadOnly(ptr)) {
+                log.string("points into the image heap (unaligned chunk, read-only)");
+                return true;
+            }
+        }
+
+        if (AuxiliaryImageHeap.isPresent() && AuxiliaryImageHeap.singleton().containsObject(ptr)) {
+            log.string("points into the auxiliary image heap");
+            return true;
+        } else if (TlabSupport.printTlabInfo(log, ptr, CurrentIsolate.getCurrentThread())) {
+            return true;
+        }
+
+        if (allowJavaHeapAccess) {
+            // Accessing spaces and chunks is safe if we prevent a GC.
+            if (youngGeneration.printLocationInfo(log, ptr)) {
+                return true;
+            } else if (oldGeneration.printLocationInfo(log, ptr)) {
+                return true;
+            }
+        }
+
+        if (allowUnsafeOperations || VMOperation.isInProgressAtSafepoint()) {
+            /* Accessing the metaspace is unsafe due to possible concurrent modifications. */
+            if (Metaspace.isSupported() && MetaspaceImpl.singleton().printLocationInfo(log, ptr)) {
+                return true;
+            }
+
+            /*
+             * If we are not at a safepoint, then it is unsafe to access thread locals of another
+             * thread as the IsolateThread could be freed at any time.
+             */
+            if (TlabSupport.printTlabInfo(log, ptr)) {
+                return true;
+            }
+        }
+
+        if (allowJavaHeapAccess) {
+            // Accessing chunks is safe if we prevent a GC.
+            if (YoungGeneration.getEdenAllocation().printLocationInfo(log, ptr)) {
+                return true;
+            }
+            if (YoungGeneration.getPinnedAllocation().printLocationInfo(log, ptr)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    boolean isInHeapSlow(Pointer ptr) {
+        return isInImageHeap(ptr) || youngGeneration.isInSpace(ptr) || oldGeneration.isInSpace(ptr) || Metaspace.singleton().isInAllocatedMemory(ptr);
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called during early startup.")
+    public boolean verifyImageHeapMapping() {
+        for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+            /* Read & write some data at the beginning and end of each writable chunk. */
+            writeToEachChunk(info.getFirstWritableAlignedChunk(), Word.nullPointer());
+            writeToEachChunk(info.getFirstWritableUnalignedChunk(), info.getLastWritableUnalignedChunk());
+        }
+        return true;
+    }
+
+    @Uninterruptible(reason = "Called during early startup.")
+    private static void writeToEachChunk(HeapChunk.Header<?> firstChunk, HeapChunk.Header<?> lastChunk) {
+        HeapChunk.Header<?> curChunk = firstChunk;
+        while (curChunk.isNonNull()) {
+            Pointer begin = (Pointer) curChunk;
+            Pointer end = HeapChunk.getTopPointer(curChunk).subtract(1);
+
+            byte val = begin.readByte(0);
+            begin.writeByte(0, val);
+
+            val = end.readByte(0);
+            end.writeByte(0, val);
+
+            if (curChunk.equal(lastChunk)) {
+                break;
+            }
+            curChunk = HeapChunk.getNext(curChunk);
+        }
+    }
+
+    public static final class DumpHeapSettingsAndStatistics extends DiagnosticThunk {
+        @Override
+        public int maxInvocationCount() {
+            return 1;
+        }
+
         @Override
         @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
-        public void invokeWithoutAllocation(Log log) {
-            HeapImpl heap = HeapImpl.getHeapImpl();
-            GCImpl gc = GCImpl.getGCImpl();
+        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
+            log.string("Heap settings and statistics:").indent(true);
+            log.string("Reserved hub pointer bits: 0b").number(Heap.getHeap().getObjectHeader().getReservedHubBitsMask(), 2, false).newline();
 
-            log.string("[Heap settings and statistics: ").indent(true);
-            log.string("Supports isolates: ").bool(SubstrateOptions.SpawnIsolates.getValue()).newline();
-            log.string("Object reference size: ").signed(ConfigurationValues.getObjectLayout().getReferenceSize()).newline();
+            log.string("Aligned chunk size: ").unsigned(HeapParameters.getAlignedHeapChunkSize()).newline();
+            log.string("Large array threshold: ").unsigned(HeapParameters.getLargeArrayThreshold()).newline();
 
-            GCAccounting accounting = gc.getAccounting();
+            GCAccounting accounting = GCImpl.getAccounting();
             log.string("Incremental collections: ").unsigned(accounting.getIncrementalCollectionCount()).newline();
-            log.string("Complete collections: ").unsigned(accounting.getCompleteCollectionCount());
-            log.redent(false).string("]").newline();
-            log.newline();
+            log.string("Complete collections: ").unsigned(accounting.getCompleteCollectionCount()).newline();
 
-            heap.logImageHeapPartitionBoundaries(log).newline();
-            zapValuesToLog(log).newline();
-            heap.report(log, true).newline();
-            log.newline();
+            logZapValues(log);
+
+            log.indent(false);
+        }
+    }
+
+    public static final class DumpHeapUsage extends DiagnosticThunk {
+        @Override
+        public int maxInvocationCount() {
+            return 1;
+        }
+
+        @Override
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
+        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
+            log.string("Heap usage:").indent(true);
+            HeapImpl.getHeapImpl().logUsage(log);
+            log.indent(false);
+        }
+    }
+
+    public static final class DumpGCPolicy extends DiagnosticThunk {
+        @Override
+        public int maxInvocationCount() {
+            return 1;
+        }
+
+        @Override
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
+        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
+            CollectionPolicy policy = GCImpl.getPolicy();
+
+            log.string("GC policy:").indent(true);
+            log.string("Name: ").string(policy.getName()).newline();
+            log.string("Max eden size: ").unsigned(policy.getMaximumEdenSize()).newline();
+            log.string("Max survivor size: ").unsigned(policy.getMaximumSurvivorSize()).newline();
+            log.string("Max young size: ").unsigned(policy.getMaximumYoungGenerationSize()).newline();
+            log.string("Max old size: ").unsigned(policy.getMaximumOldSize()).newline();
+            log.string("Max heap size: ").unsigned(policy.getMaximumHeapSize()).newline();
+            log.indent(false);
+        }
+    }
+
+    public static final class DumpImageHeapInfo extends DiagnosticThunk {
+        @Override
+        public int maxInvocationCount() {
+            return 1;
+        }
+
+        @Override
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
+        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
+            log.string("Image heap:").indent(true);
+            for (ImageHeapInfo info : HeapImpl.getImageHeapInfos()) {
+                info.print(log);
+            }
+            log.indent(false);
+
+            if (AuxiliaryImageHeap.isPresent()) {
+                ImageHeapInfo auxHeapInfo = AuxiliaryImageHeap.singleton().getImageHeapInfo();
+                if (auxHeapInfo != null) {
+                    log.string("Auxiliary image heap:").indent(true);
+                    auxHeapInfo.print(log);
+                    log.indent(false);
+                }
+            }
+        }
+    }
+
+    public static final class DumpChunkInfo extends DiagnosticThunk {
+        @Override
+        public int maxInvocationCount() {
+            return 2;
+        }
+
+        @Override
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while printing diagnostics.")
+        public void printDiagnostics(Log log, ErrorContext context, int maxDiagnosticLevel, int invocationCount) {
+            log.string("Heap chunks: E=eden, S=survivor, O=old, F=free; A=aligned chunk, U=unaligned chunk; T=to space; *=all-pinned").indent(true);
+            boolean allowUnsafe = invocationCount == 1 && SubstrateDiagnostics.DiagnosticLevel.unsafeOperationsAllowed(maxDiagnosticLevel);
+            HeapImpl.getHeapImpl().logChunks(log, allowUnsafe);
+            log.indent(false);
+        }
+    }
+
+    private static final class ImageHeapChunkLogger implements HeapChunkVisitor {
+        private Log log;
+
+        @SuppressWarnings("hiding")
+        void initialize(Log log) {
+            this.log = log;
+        }
+
+        @Override
+        public void visitAlignedChunk(AlignedHeader chunk) {
+            Pointer bottom = AlignedHeapChunk.getObjectsStart(chunk);
+            Pointer top = HeapChunk.getTopPointer(chunk);
+            Pointer end = AlignedHeapChunk.getObjectsEnd(chunk);
+            HeapChunkLogging.logChunk(log, chunk, bottom, top, end, true, "I", false);
+        }
+
+        @Override
+        public void visitUnalignedChunk(UnalignedHeader chunk) {
+            Pointer bottom = UnalignedHeapChunk.getObjectStart(chunk);
+            Pointer top = HeapChunk.getTopPointer(chunk);
+            Pointer end = UnalignedHeapChunk.getObjectEnd(chunk);
+            HeapChunkLogging.logChunk(log, chunk, bottom, top, end, false, "I", false);
         }
     }
 }
 
-@TargetClass(value = java.lang.Runtime.class, onlyWith = UseSerialGC.class)
+@TargetClass(value = java.lang.Runtime.class, onlyWith = UseSerialOrEpsilonGC.class)
 @SuppressWarnings("static-method")
 final class Target_java_lang_Runtime {
     @Substitute
     private long freeMemory() {
-        return maxMemory() - HeapImpl.getHeapImpl().getUsedBytes().rawValue();
+        /* Heap usage may exceed the configured maximum. Report zero free memory in that case. */
+        UnsignedWord maximum = Word.unsigned(maxMemory());
+        UnsignedWord used = HeapImpl.getAccounting().getUsedBytes();
+        return maximum.aboveThan(used) ? maximum.subtract(used).rawValue() : 0;
     }
 
     @Substitute
@@ -625,13 +1096,16 @@ final class Target_java_lang_Runtime {
 
     @Substitute
     private long maxMemory() {
-        // Query the physical memory size, so it gets set correctly instead of being estimated.
-        PhysicalMemory.size();
-        return HeapPolicy.getMaximumHeapSize().rawValue();
+        GCImpl.getPolicy().ensureSizeParametersInitialized();
+        return GCImpl.getPolicy().getMaximumHeapSize().rawValue();
     }
 
     @Substitute
     private void gc() {
-        HeapPolicy.maybeCauseUserRequestedCollection();
+        if (!SubstrateGCOptions.DisableExplicitGC.getValue()) {
+            long startTicks = JfrTicks.elapsedTicks();
+            GCImpl.getGCImpl().collect(GCCause.JavaLangSystemGC);
+            SystemGCEvent.emit(startTicks, false);
+        }
     }
 }

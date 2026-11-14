@@ -29,12 +29,9 @@ import java.util.function.BooleanSupplier;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.util.VMError;
 
-@AutomaticFeature
 final class GroovyIndyInterfaceFeature implements Feature {
 
     static final class IsEnabled implements BooleanSupplier {
@@ -46,7 +43,21 @@ final class GroovyIndyInterfaceFeature implements Feature {
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
-        return access.findClassByName("org.codehaus.groovy.vmplugin.v7.IndyInterface") != null;
+        Class<?> indyInterfaceClass = access.findClassByName("org.codehaus.groovy.vmplugin.v7.IndyInterface");
+        if (indyInterfaceClass == null) {
+            return false;
+        }
+        // Groovy 5 has the invalidateSwitchPoints method removed. Allow for it to not exist.
+        try {
+            return indyInterfaceClass.getDeclaredMethod("invalidateSwitchPoints") != null;
+        } catch (ReflectiveOperationException e) {
+            return false; // nothing to substitute
+        }
+    }
+
+    @Override
+    public void onRegistration(OnRegistrationAccess access) {
+        ImageSingletons.add(GroovyIndyInterfaceFeature.class, this);
     }
 }
 
@@ -54,7 +65,7 @@ final class GroovyIndyInterfaceFeature implements Feature {
 final class Target_org_codehaus_groovy_vmplugin_v7_IndyInterface_invalidateSwitchPoints {
     @Substitute
     protected static void invalidateSwitchPoints() {
-        VMError.shouldNotReachHere("IndyInterface.invalidateSwitchPoints() is not supported.");
+        throw new Error("IndyInterface.invalidateSwitchPoints() is not supported.");
     }
 }
 

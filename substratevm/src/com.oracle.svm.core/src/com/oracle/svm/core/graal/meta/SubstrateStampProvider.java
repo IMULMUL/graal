@@ -24,24 +24,28 @@
  */
 package com.oracle.svm.core.graal.meta;
 
-import static com.oracle.svm.core.util.VMError.unimplemented;
-
-import org.graalvm.compiler.core.common.type.AbstractPointerStamp;
-import org.graalvm.compiler.core.common.type.ObjectStamp;
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.core.common.type.TypeReference;
-import org.graalvm.compiler.nodes.spi.StampProvider;
-
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.meta.SubstrateMethodRefStamp;
 
+import jdk.graal.compiler.core.common.type.AbstractPointerStamp;
+import jdk.graal.compiler.core.common.type.ObjectStamp;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.core.common.type.TypeReference;
+import jdk.graal.compiler.nodes.spi.StampProvider;
+import jdk.vm.ci.meta.Constant;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.MetaAccessProvider;
 
 public class SubstrateStampProvider implements StampProvider {
 
     private final AbstractPointerStamp hubStamp;
+    private final AbstractPointerStamp methodPointerStamp;
+    private final AbstractPointerStamp methodPointerAlwaysNullStamp;
 
     public SubstrateStampProvider(MetaAccessProvider metaAccess) {
         this.hubStamp = StampFactory.objectNonNull(TypeReference.createExactTrusted(metaAccess.lookupJavaType(DynamicHub.class)));
+        this.methodPointerStamp = SubstrateMethodRefStamp.pointerNonNull();
+        this.methodPointerAlwaysNullStamp = SubstrateMethodRefStamp.pointerAlwaysNull();
     }
 
     @Override
@@ -51,6 +55,16 @@ public class SubstrateStampProvider implements StampProvider {
 
     @Override
     public AbstractPointerStamp createMethodStamp() {
-        throw unimplemented();
+        return methodPointerStamp;
+    }
+
+    @Override
+    public AbstractPointerStamp createMethodAlwaysNullStamp() {
+        return methodPointerAlwaysNullStamp;
+    }
+
+    @Override
+    public Constant methodPointerAlwaysNullConstant() {
+        return JavaConstant.NULL_POINTER;
     }
 }

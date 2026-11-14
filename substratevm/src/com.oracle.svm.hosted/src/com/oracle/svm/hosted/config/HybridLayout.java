@@ -24,60 +24,54 @@
  */
 package com.oracle.svm.hosted.config;
 
-import org.graalvm.compiler.core.common.NumUtil;
-import org.graalvm.nativeimage.ImageSingletons;
+import com.oracle.svm.core.config.ObjectLayoutCompilerSupport;
+import com.oracle.svm.hosted.HybridGuestValue;
+import java.lang.reflect.Modifier;
 
-import com.oracle.svm.core.annotate.Hybrid;
-import com.oracle.svm.core.config.ObjectLayout;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.guest.staging.hub.Hybrid;
 import com.oracle.svm.hosted.meta.HostedField;
 import com.oracle.svm.hosted.meta.HostedInstanceClass;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
 import com.oracle.svm.hosted.meta.HostedType;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
+import jdk.graal.compiler.core.common.NumUtil;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
- * Defines the layout for a hybrid class.
+ * Provides sizes and offsets of a hybrid class.
  *
  * @see Hybrid
- *
- * @param <T> The class which has a layout in hybrid form. It must be annotated with the
- *            {@link Hybrid} annotation.
  */
-public class HybridLayout<T> {
+public class HybridLayout {
 
-    public static boolean isHybrid(HostedType clazz) {
-        return ImageSingletons.lookup(HybridLayoutSupport.class).isHybrid(clazz);
-    }
-
-    public static boolean isHybridField(HostedField field) {
-        return ImageSingletons.lookup(HybridLayoutSupport.class).isHybridField(field);
-    }
-
-    public static boolean canHybridFieldsBeDuplicated(HostedType clazz) {
-        return ImageSingletons.lookup(HybridLayoutSupport.class).canHybridFieldsBeDuplicated(clazz);
+    public static boolean isHybrid(ResolvedJavaType clazz) {
+        return GuestAnnotationAccess.isAnnotationPresent(clazz, Hybrid.class);
     }
 
     private final ObjectLayout layout;
+    private final HostedType arrayComponentType;
     private final HostedField arrayField;
-    private final HostedField typeIDSlotsField;
     private final int arrayBaseOffset;
 
-    public HybridLayout(Class<T> hybridClass, ObjectLayout layout, HostedMetaAccess metaAccess) {
-        this((HostedInstanceClass) metaAccess.lookupJavaType(hybridClass), layout);
-    }
+    @SuppressWarnings("this-escape")
+    public HybridLayout(HostedInstanceClass hybridClass, ObjectLayout layout, HostedMetaAccess metaAccess) {
+        assert Modifier.isFinal(hybridClass.getModifiers()) : "Hybrid class must be final " + hybridClass;
 
-    public HybridLayout(HostedInstanceClass hybridClass, ObjectLayout layout) {
+        ResolvedJavaType componentType = HybridGuestValue.get(hybridClass).componentType();
+        assert componentType.getJavaKind() != JavaKind.Void : "@Hybrid.componentType cannot be void";
+
         this.layout = layout;
-        HybridLayoutSupport utils = ImageSingletons.lookup(HybridLayoutSupport.class);
-        HybridLayoutSupport.HybridFields hybridFields = utils.findHybridFields(hybridClass);
-        arrayField = hybridFields.arrayField;
-        typeIDSlotsField = hybridFields.typeIDSlotsField;
-        arrayBaseOffset = NumUtil.roundUp(hybridClass.getAfterFieldsOffset(), layout.sizeInBytes(getArrayElementStorageKind()));
+        var analysisComponentType = hybridClass.getWrapped().getUniverse().lookup(componentType);
+        this.arrayComponentType = metaAccess.getUniverse().lookup(analysisComponentType);
+        this.arrayField = null;
+        this.arrayBaseOffset = NumUtil.roundUp(hybridClass.getAfterFieldsOffset(), ObjectLayoutCompilerSupport.sizeInBytes(layout, getArrayElementStorageKind()));
     }
 
     public JavaKind getArrayElementStorageKind() {
-        return arrayField.getType().getComponentType().getStorageKind();
+        return arrayComponentType.getStorageKind();
     }
 
     public int getArrayBaseOffset() {
@@ -85,25 +79,18 @@ public class HybridLayout<T> {
     }
 
     public long getArrayElementOffset(int index) {
-        return getArrayBaseOffset() + index * layout.sizeInBytes(getArrayElementStorageKind());
+        return getArrayBaseOffset() + ((long) index) * ObjectLayoutCompilerSupport.sizeInBytes(layout, getArrayElementStorageKind());
     }
 
-    public long getTotalSize(int length) {
-        return layout.alignUp(getArrayElementOffset(length));
+    public long getTotalSize(int length, boolean withOptionalIdHashField) {
+        return layout.computeArrayTotalSize(getArrayElementOffset(length), withOptionalIdHashField);
+    }
+
+    public long getIdentityHashOffset(int length) {
+        return layout.getArrayIdentityHashOffset(getArrayElementOffset(length));
     }
 
     public HostedField getArrayField() {
         return arrayField;
-    }
-
-    public HostedField getTypeIDSlotsField() {
-        return typeIDSlotsField;
-    }
-
-    /**
-     * In a given build, only the bit field or the type id slot array field will exist.
-     */
-    public static int getTypeIDSlotsFieldOffset(ObjectLayout layout) {
-        return layout.getArrayLengthOffset() + layout.sizeInBytes(JavaKind.Int);
     }
 }

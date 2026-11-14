@@ -11,6 +11,10 @@
 <module name="Checker">
   <property name="severity" value="error"/>
   <module name="TreeWalker">
+    <module name="OuterTypeFilename">
+      <message key="type.file.mismatch"
+               value="The top-level type matching the filename must be declared first in the file."/>
+    </module>
     <module name="RegexpSinglelineJava">
       <property name="format" value="instanceof\s+(LLVMPointer|LLVMNativePointer|LLVMManagedPointer)\b"/>
       <property name="message" value="Found instanceof check for LLVM(Native|Managed)Pointer. Use LLVM(Native|Managed)Pointer.isInstance instead."/>
@@ -42,9 +46,6 @@
     </module>
     <module name="RedundantImport"/>
     <module name="UnusedImports"/>
-    <module name="LineLength">
-      <property name="max" value="250"/>
-    </module>
     <module name="MethodParamPad"/>
     <module name="NoWhitespaceAfter">
       <property name="tokens" value="ARRAY_INIT,BNOT,DEC,DOT,INC,LNOT,UNARY_MINUS,UNARY_PLUS"/>
@@ -206,7 +207,11 @@
     </module>
     <module name="IllegalType">
       <property name="illegalClassNames" value="TruffleObject"/>
+      <property name="tokens" value="PARAMETER_DEF,VARIABLE_DEF,RECORD_COMPONENT_DEF"/>
     </module>
+  </module>
+  <module name="LineLength">
+    <property name="max" value="250"/>
   </module>
   <module name="FileTabCharacter">
     <property name="severity" value="error"/>

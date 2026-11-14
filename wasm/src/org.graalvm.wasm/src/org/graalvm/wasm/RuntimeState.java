@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,142 +40,195 @@
  */
 package org.graalvm.wasm;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+
+import org.graalvm.wasm.constants.BytecodeBitEncoding;
+import org.graalvm.wasm.constants.SegmentMode;
+import org.graalvm.wasm.globals.WasmGlobal;
+import org.graalvm.wasm.memory.WasmMemory;
+
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import org.graalvm.wasm.memory.WasmMemory;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
 /**
  * Represents the state of a WebAssembly module.
  */
 @SuppressWarnings("static-method")
-public class RuntimeState {
-    private static final int INITIAL_GLOBALS_SIZE = 64;
-    private static final int INITIAL_TARGETS_SIZE = 32;
+public abstract class RuntimeState {
+    private static final int INITIAL_TABLES_SIZE = 1;
+    private static final int INITIAL_MEMORIES_SIZE = 1;
+    private static final int INITIAL_TAG_SIZE = 1;
 
-    private final WasmContext.Uid contextUid;
+    private final WasmStore store;
     private final WasmModule module;
 
     /**
      * An array of call targets that correspond to the WebAssembly functions of the current module.
      */
-    @CompilationFinal(dimensions = 1) private CallTarget[] targets;
+    private final CallTarget[] targets;
+    private final WasmFunctionInstance[] functionInstances;
+
+    private final GlobalRegistry globals;
+
+    @CompilationFinal(dimensions = 1) private WasmTable[] tables;
+
+    @CompilationFinal(dimensions = 1) private WasmMemory[] memories;
+
+    @CompilationFinal(dimensions = 1) private WasmTag[] tags;
 
     /**
-     * This array is monotonically populated from the left. An index i denotes the i-th global in
-     * this module. The value at the index i denotes the address of the global in the memory space
-     * for all the globals from all the modules (see {@link GlobalRegistry}).
-     *
-     * This separation of global indices is done because the index spaces of the globals are
-     * module-specific, and the globals can be imported across modules. Thus, the address-space of
-     * the globals is not the same as the module-specific index-space.
+     * The elem instances that can be used to lazily initialize tables and arrays. Passive segments
+     * contain their initial values until they are dropped. Active, declarative, and dropped segments
+     * are represented as {@code null}. Entries can be set to null even in compiled code, therefore
+     * they cannot be compilation final.
      */
-    @CompilationFinal(dimensions = 1) private int[] globalAddresses;
+    @CompilationFinal(dimensions = 0) private Object[][] elementInstances;
 
     /**
-     * The table from the context-specific table space, which this module is using.
-     *
-     * In the current WebAssembly specification, a module can use at most one table. The value
-     * {@code null} denotes that this module uses no table.
+     * The state of data instances that can be used to initialize memory. If a data segment
+     * {@code i} is dropped (or is an active segment), then {@code dataInstanceDropped[i]} will be
+     * {@code true}.
      */
-    @CompilationFinal private WasmTable table;
-
-    /**
-     * Memory that this module is using.
-     *
-     * In the current WebAssembly specification, a module can use at most one memory. The value
-     * {@code null} denotes that this module uses no memory.
-     */
-    @CompilationFinal private WasmMemory memory;
+    @CompilationFinal(dimensions = 0) private boolean[] dataInstanceDropped;
 
     @CompilationFinal private Linker.LinkState linkState;
 
-    private void ensureGlobalsCapacity(int index) {
-        while (index >= globalAddresses.length) {
-            final int[] nGlobalAddresses = new int[globalAddresses.length * 2];
-            System.arraycopy(globalAddresses, 0, nGlobalAddresses, 0, globalAddresses.length);
-            globalAddresses = nGlobalAddresses;
+    @CompilationFinal private int startFunctionIndex;
+
+    static final VarHandle LINK_STATE;
+
+    static {
+        try {
+            LINK_STATE = MethodHandles.lookup().findVarHandle(RuntimeState.class, "linkState", Linker.LinkState.class);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new ExceptionInInitializerError(e);
         }
     }
 
-    private void ensureTargetsCapacity(int index) {
-        while (index >= targets.length) {
-            final CallTarget[] nTargets = new CallTarget[targets.length * 2];
-            System.arraycopy(targets, 0, nTargets, 0, targets.length);
-            targets = nTargets;
+    private void ensureTablesCapacity(int index) {
+        if (index >= tables.length) {
+            final WasmTable[] nTables = new WasmTable[Math.max(Integer.highestOneBit(index) << 1, 2 * tables.length)];
+            System.arraycopy(tables, 0, nTables, 0, tables.length);
+            tables = nTables;
         }
     }
 
-    public RuntimeState(WasmContext context, WasmModule module) {
-        this.contextUid = context.uid();
+    private void ensureMemoriesCapacity(int index) {
+        if (index >= memories.length) {
+            final WasmMemory[] nMemories = new WasmMemory[Math.max(Integer.highestOneBit(index) << 1, 2 * memories.length)];
+            System.arraycopy(memories, 0, nMemories, 0, memories.length);
+            memories = nMemories;
+        }
+    }
+
+    private void ensureTagCapacity(int index) {
+        if (index >= tags.length) {
+            final WasmTag[] nTags = new WasmTag[Math.max(Integer.highestOneBit(index) << 1, 2 * tags.length)];
+            System.arraycopy(tags, 0, nTags, 0, tags.length);
+            tags = nTags;
+        }
+    }
+
+    public RuntimeState(WasmStore store, WasmModule module, int numberOfFunctions) {
+        this.store = store;
         this.module = module;
-        this.globalAddresses = new int[INITIAL_GLOBALS_SIZE];
-        this.targets = new CallTarget[INITIAL_TARGETS_SIZE];
+        this.globals = new GlobalRegistry(module.numInternalGlobals(), module.numExternalGlobals());
+        this.tables = new WasmTable[INITIAL_TABLES_SIZE];
+        this.memories = new WasmMemory[INITIAL_MEMORIES_SIZE];
+        this.tags = new WasmTag[INITIAL_TAG_SIZE];
+        this.targets = new CallTarget[numberOfFunctions];
+        this.functionInstances = new WasmFunctionInstance[numberOfFunctions];
         this.linkState = Linker.LinkState.nonLinked;
+        this.dataInstanceDropped = new boolean[module.dataInstanceCount()];
+        this.elementInstances = new Object[module.elemInstanceCount()][];
+        this.startFunctionIndex = -1;
     }
 
     private void checkNotLinked() {
         // The symbol table must be read-only after the module gets linked.
-        if (linkState == Linker.LinkState.linked) {
+        Linker.LinkState state = linkState();
+        if (state == Linker.LinkState.linked || state == Linker.LinkState.failed) {
             throw CompilerDirectives.shouldNotReachHere("The engine tried to modify the instance after linking.");
         }
     }
 
     public void setLinkInProgress() {
-        if (linkState != Linker.LinkState.nonLinked) {
-            throw CompilerDirectives.shouldNotReachHere("Can only switch to in-progress state when not linked.");
-        }
-        this.linkState = Linker.LinkState.inProgress;
+        setLinkState(Linker.LinkState.nonLinked, Linker.LinkState.inProgress, "Can only switch to in-progress state when not linked.");
     }
 
     public void setLinkCompleted() {
-        if (linkState != Linker.LinkState.inProgress) {
-            throw CompilerDirectives.shouldNotReachHere("Can only switch to linked state when linking is in-progress.");
-        }
-        this.linkState = Linker.LinkState.linked;
+        setLinkState(Linker.LinkState.inProgress, Linker.LinkState.linked, "Can only switch to linked state when linking is in-progress.");
     }
 
     public void setLinkFailed() {
-        if (linkState != Linker.LinkState.inProgress) {
-            throw CompilerDirectives.shouldNotReachHere("Can only switch to failed state when linking is in-progress.");
-        }
-        this.linkState = Linker.LinkState.failed;
+        setLinkState(Linker.LinkState.inProgress, Linker.LinkState.failed, "Can only switch to failed state when linking is in-progress.");
     }
 
-    public WasmContext.Uid contextUid() {
-        return contextUid;
+    public WasmStore store() {
+        return store;
+    }
+
+    public WasmContext context() {
+        return store().context();
+    }
+
+    public Linker.LinkState linkState() {
+        CompilerAsserts.neverPartOfCompilation();
+        return (Linker.LinkState) LINK_STATE.getVolatile(this);
+    }
+
+    private void setLinkState(Linker.LinkState expectedState, Linker.LinkState newState, String message) {
+        assert expectedState != Linker.LinkState.linked && expectedState != Linker.LinkState.failed : expectedState;
+        assert Thread.holdsLock(store());
+        if (!LINK_STATE.compareAndSet(this, expectedState, newState)) {
+            /*
+             * setLinkState is always invoked while the linker is holding a store lock, so we should
+             * always see the expected state here and the CAS should never fail.
+             */
+            throw CompilerDirectives.shouldNotReachHere(message);
+        }
     }
 
     public boolean isNonLinked() {
-        return linkState == Linker.LinkState.nonLinked;
+        return linkState() == Linker.LinkState.nonLinked;
     }
 
     public boolean isLinkInProgress() {
-        return linkState == Linker.LinkState.inProgress;
+        return linkState() == Linker.LinkState.inProgress;
     }
 
     public boolean isLinkCompleted() {
+        return linkState() == Linker.LinkState.linked;
+    }
+
+    /**
+     * Non-volatile link state check for use in compiled code. May read a stale value, which is OK,
+     * since in that case we'll just (deoptimize and) enter the slow path, and check again. Once
+     * this method has returned true, i.e., we've reached the state {@link Linker.LinkState#linked},
+     * we can safely rely on the module to be linked, and stay linked, since it is a final state.
+     */
+    public boolean isLinkCompletedFastPath() {
         return linkState == Linker.LinkState.linked;
     }
 
     public boolean isLinkFailed() {
-        return linkState == Linker.LinkState.failed;
+        return linkState() == Linker.LinkState.failed;
     }
 
     public SymbolTable symbolTable() {
         return module.symbolTable();
     }
 
-    public byte[] data() {
-        return module.data();
-    }
-
     public WasmModule module() {
         return module;
     }
 
-    public int targetCount() {
-        return symbolTable().numFunctions();
+    protected WasmInstance instance() {
+        return null;
     }
 
     public CallTarget target(int index) {
@@ -183,37 +236,155 @@ public class RuntimeState {
     }
 
     public void setTarget(int index, CallTarget target) {
-        ensureTargetsCapacity(index);
         targets[index] = target;
     }
 
-    public int globalAddress(int index) {
-        final int result = globalAddresses[index];
-        assert result != SymbolTable.UNINITIALIZED_GLOBAL_ADDRESS : "Uninitialized global at index: " + index;
+    public final GlobalRegistry globals() {
+        return globals;
+    }
+
+    public WasmGlobal externalGlobal(int globalIndex) {
+        assert symbolTable().globalExternal(globalIndex) : globalIndex;
+        return globals.externalGlobal(symbolTable().globalAddress(globalIndex));
+    }
+
+    public void setExternalGlobal(int globalIndex, WasmGlobal global) {
+        assert symbolTable().globalExternal(globalIndex) : globalIndex;
+        globals.setExternalGlobal(symbolTable().globalAddress(globalIndex), global);
+    }
+
+    public WasmTable table(int index) {
+        final WasmTable result = tables[index];
+        assert result != null : "Uninitialized table at index: " + index;
         return result;
     }
 
-    void setGlobalAddress(int globalIndex, int address) {
-        ensureGlobalsCapacity(globalIndex);
+    public void setTable(int tableIndex, WasmTable table) {
+        ensureTablesCapacity(tableIndex);
         checkNotLinked();
-        globalAddresses[globalIndex] = address;
+        tables[tableIndex] = table;
     }
 
-    public WasmTable table() {
-        return table;
+    public WasmMemory memory(int index) {
+        return memories[index];
     }
 
-    void setTable(WasmTable table) {
+    public void setMemory(int index, WasmMemory memory) {
+        ensureMemoriesCapacity(index);
         checkNotLinked();
-        this.table = table;
+        memories[index] = memory;
     }
 
-    public WasmMemory memory() {
-        return memory;
+    public WasmTag tag(int index) {
+        return tags[index];
     }
 
-    public void setMemory(WasmMemory memory) {
+    public void setTag(int index, WasmTag tag) {
+        ensureTagCapacity(index);
         checkNotLinked();
-        this.memory = memory;
+        tags[index] = tag;
+    }
+
+    public WasmFunctionInstance functionInstance(WasmFunction function) {
+        int functionIndex = function.index();
+        WasmFunctionInstance functionInstance = functionInstances[functionIndex];
+        if (functionInstance == null) {
+            functionInstance = allocateFunctionInstance(function, functionIndex);
+        }
+        return functionInstance;
+    }
+
+    @TruffleBoundary
+    private WasmFunctionInstance allocateFunctionInstance(WasmFunction function, int functionIndex) {
+        WasmFunctionInstance functionInstance = new WasmFunctionInstance(instance(), function, target(functionIndex));
+        functionInstances[functionIndex] = functionInstance;
+        return functionInstance;
+    }
+
+    public WasmFunctionInstance functionInstance(int index) {
+        return functionInstances[index];
+    }
+
+    public void setFunctionInstance(int index, WasmFunctionInstance functionInstance) {
+        assert functionInstance != null;
+        functionInstances[index] = functionInstance;
+    }
+
+    public void dropDataInstance(int index) {
+        dataInstanceDropped[index] = true;
+    }
+
+    public void resetDataInstance(int index) {
+        dataInstanceDropped[index] = false;
+    }
+
+    public int dataInstanceOffset(int index) {
+        if (dataInstanceDropped[index]) {
+            return 0;
+        }
+        final int bytecodeOffset = module.dataInstanceOffset(index);
+        final byte[] bytecode = module().bytecode();
+        final int encoding = bytecode[bytecodeOffset];
+        final int dataMode = encoding & BytecodeBitEncoding.DATA_SEG_MODE_VALUE;
+        assert dataMode == SegmentMode.PASSIVE;
+        final int lengthEncoding = encoding & BytecodeBitEncoding.DATA_SEG_LENGTH_MASK;
+        final int lengthLength = switch (lengthEncoding) {
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_U8 -> 1;
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_U16 -> 2;
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_I32 -> 4;
+            default -> throw CompilerDirectives.shouldNotReachHere();
+        };
+        return bytecodeOffset + 1 + lengthLength;
+    }
+
+    public int dataInstanceLength(int index) {
+        if (dataInstanceDropped[index]) {
+            return 0;
+        }
+        final int bytecodeOffset = module.dataInstanceOffset(index);
+        final byte[] bytecode = module().bytecode();
+        final int encoding = bytecode[bytecodeOffset];
+        final int dataMode = encoding & BytecodeBitEncoding.DATA_SEG_MODE_VALUE;
+        assert dataMode == SegmentMode.PASSIVE;
+        final int lengthEncoding = encoding & BytecodeBitEncoding.DATA_SEG_LENGTH_MASK;
+        final int length;
+        switch (lengthEncoding) {
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_U8:
+                length = BinaryStreamParser.rawPeekU8(bytecode, bytecodeOffset + 1);
+                break;
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_U16:
+                length = BinaryStreamParser.rawPeekU16(bytecode, bytecodeOffset + 1);
+                break;
+            case BytecodeBitEncoding.DATA_SEG_LENGTH_I32:
+                length = BinaryStreamParser.rawPeekI32(bytecode, bytecodeOffset + 1);
+                break;
+            default:
+                throw CompilerDirectives.shouldNotReachHere();
+        }
+        return length;
+    }
+
+    void setElemInstance(int index, Object[] data) {
+        assert data != null;
+        assert index < elementInstances.length;
+        elementInstances[index] = data;
+    }
+
+    public void dropElemInstance(int index) {
+        assert index < elementInstances.length;
+        elementInstances[index] = null;
+    }
+
+    public Object[] elemInstance(int index) {
+        assert index < elementInstances.length;
+        return elementInstances[index];
+    }
+
+    public int startFunctionIndex() {
+        return startFunctionIndex;
+    }
+
+    public void setStartFunctionIndex(int index) {
+        this.startFunctionIndex = index;
     }
 }

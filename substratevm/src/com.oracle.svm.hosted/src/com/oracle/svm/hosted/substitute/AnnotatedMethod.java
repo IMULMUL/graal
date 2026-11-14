@@ -24,24 +24,21 @@
  */
 package com.oracle.svm.hosted.substitute;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Executable;
 import java.lang.reflect.Type;
-import java.util.Arrays;
-import java.util.Map;
-import java.util.function.Function;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Collectors;
 
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.nodes.StructuredGraph;
-
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
-import com.oracle.graal.pointsto.infrastructure.OriginalMethodProvider;
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.svm.core.annotate.AnnotateOriginal;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.c.GraalAccess;
+import com.oracle.svm.util.AnnotatedWrapper;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
+import jdk.graal.compiler.annotation.AnnotationValue;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.ExceptionHandler;
@@ -52,23 +49,42 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 import jdk.vm.ci.meta.Signature;
 import jdk.vm.ci.meta.SpeculationLog;
+import jdk.vm.ci.meta.annotation.Annotated;
+import jdk.vm.ci.meta.annotation.AnnotationsInfo;
 
-public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, OriginalMethodProvider {
+public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, OriginalMethodProvider, AnnotatedWrapper {
 
     private final ResolvedJavaMethod original;
     private final ResolvedJavaMethod annotated;
+    private final List<AnnotationValue> injectedAnnotations;
 
     public AnnotatedMethod(ResolvedJavaMethod original, ResolvedJavaMethod annotated) {
         this.original = original;
         this.annotated = annotated;
+        this.injectedAnnotations = new ArrayList<>(GuestAnnotationAccess.getDeclaredAnnotationValues(annotated).values());
     }
 
     public ResolvedJavaMethod getOriginal() {
         return original;
     }
 
+    @Override
+    public AnnotationsInfo getParameterAnnotationInfo() {
+        return getOriginal().getParameterAnnotationInfo();
+    }
+
+    @Override
+    public AnnotationsInfo getAnnotationDefaultInfo() {
+        return getOriginal().getAnnotationDefaultInfo();
+    }
+
     public ResolvedJavaMethod getAnnotated() {
         return annotated;
+    }
+
+    @Override
+    public ResolvedJavaMethod unwrapTowardsOriginalMethod() {
+        return original;
     }
 
     @Override
@@ -82,17 +98,17 @@ public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, Origi
     }
 
     @Override
-    public StructuredGraph buildGraph(DebugContext debug, ResolvedJavaMethod method, HostedProviders providers, Purpose purpose) {
-        if (original instanceof GraphProvider) {
-            return ((GraphProvider) original).buildGraph(debug, method, providers, purpose);
+    public StructuredGraph buildGraph(DebugContext debug, AnalysisMethod method, HostedProviders providers, Purpose purpose) {
+        if (original instanceof GraphProvider graphProvider) {
+            return graphProvider.buildGraph(debug, method, providers, purpose);
         }
         return null;
     }
 
     @Override
     public boolean allowRuntimeCompilation() {
-        if (original instanceof GraphProvider) {
-            return ((GraphProvider) original).allowRuntimeCompilation();
+        if (original instanceof GraphProvider graphProvider) {
+            return graphProvider.allowRuntimeCompilation();
         }
         return true;
     }
@@ -143,6 +159,11 @@ public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, Origi
     }
 
     @Override
+    public boolean isDeclared() {
+        return original.isClassInitializer();
+    }
+
+    @Override
     public boolean isClassInitializer() {
         return original.isClassInitializer();
     }
@@ -177,47 +198,14 @@ public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, Origi
         return original.getConstantPool();
     }
 
-    private Annotation[] getAnnotationsImpl(Function<ResolvedJavaMethod, Annotation[]> src) {
-        // Collect all but @AnnotateOriginal from annotated
-        // Checkstyle: stop
-        Map<Object, Annotation> result = Arrays.stream(src.apply(annotated))//
-                        .filter(annotation -> !annotation.getClass().equals(AnnotateOriginal.class))//
-                        .collect(Collectors.toMap(annotation -> annotation.getClass(), Function.identity()));
-        // Checkstyle: resume
-        // Add remaining missing ones from original
-        for (Annotation annotation : src.apply(original)) {
-            result.putIfAbsent(annotation.getClass(), annotation);
-        }
-        return result.values().toArray(new Annotation[result.size()]);
+    @Override
+    public List<AnnotationValue> getInjectedAnnotations() {
+        return injectedAnnotations;
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return getAnnotationsImpl(ResolvedJavaMethod::getAnnotations);
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return getAnnotationsImpl(ResolvedJavaMethod::getDeclaredAnnotations);
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        if (annotationClass.equals(AnnotateOriginal.class)) {
-            return null;
-        }
-        // First look for the Annotation in annotated
-        T result = annotated.getAnnotation(annotationClass);
-        if (result != null) {
-            return result;
-        }
-        // Consider original if not found in annotated
-        return original.getAnnotation(annotationClass);
-    }
-
-    @Override
-    public Annotation[][] getParameterAnnotations() {
-        throw VMError.unimplemented();
+    public Annotated getWrappedAnnotated() {
+        return original;
     }
 
     @Override
@@ -247,7 +235,11 @@ public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, Origi
 
     @Override
     public String toString() {
-        return "AnnotatedMethod<definition/implementation " + original.toString() + ", extra annotations " + Arrays.toString(getAnnotations()) + ">";
+        var extra = injectedAnnotations.stream() //
+                        .map(AnnotationValue::getAnnotationType) //
+                        .map(ResolvedJavaType::toClassName) //
+                        .collect(Collectors.joining(", "));
+        return "AnnotatedMethod<definition/implementation " + original.toString() + ", extra annotations " + extra + ">";
     }
 
     @Override
@@ -278,10 +270,5 @@ public class AnnotatedMethod implements ResolvedJavaMethod, GraphProvider, Origi
     @Override
     public SpeculationLog getSpeculationLog() {
         return original.getSpeculationLog();
-    }
-
-    @Override
-    public Executable getJavaMethod() {
-        return OriginalMethodProvider.getJavaMethod(GraalAccess.getOriginalSnippetReflection(), original);
     }
 }

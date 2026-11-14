@@ -25,40 +25,74 @@
  */
 package com.oracle.svm.configure.trace;
 
-import java.util.List;
-import java.util.Map;
+import static com.oracle.svm.configure.trace.LazyValueUtils.lazyValue;
 
+import java.util.List;
+
+import org.graalvm.collections.EconomicMap;
+
+import com.oracle.svm.configure.NamedConfigurationTypeDescriptor;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
+import com.oracle.svm.configure.config.ConfigurationSet;
 import com.oracle.svm.configure.config.SerializationConfiguration;
+import com.oracle.svm.configure.config.TypeConfiguration;
+
+import jdk.graal.compiler.java.LambdaUtils;
 
 public class SerializationProcessor extends AbstractProcessor {
     private final AccessAdvisor advisor;
-    private final SerializationConfiguration serializationConfiguration;
 
-    public SerializationProcessor(AccessAdvisor advisor, SerializationConfiguration serializationConfiguration) {
+    public SerializationProcessor(AccessAdvisor advisor) {
         this.advisor = advisor;
-        this.serializationConfiguration = serializationConfiguration;
-    }
-
-    public SerializationConfiguration getSerializationConfiguration() {
-        return serializationConfiguration;
     }
 
     @Override
-    void processEntry(Map<String, ?> entry) {
+    @SuppressWarnings("unchecked")
+    void processEntry(EconomicMap<String, Object> entry, ConfigurationSet configurationSet) {
         boolean invalidResult = Boolean.FALSE.equals(entry.get("result"));
         if (invalidResult) {
             return;
         }
+        UnresolvedAccessCondition condition = UnresolvedAccessCondition.unconditional();
         String function = (String) entry.get("function");
         List<?> args = (List<?>) entry.get("args");
-        if ("ObjectStreamClass.<init>".equals(function)) {
-            expectSize(args, 2);
+        SerializationConfiguration serializationConfiguration = configurationSet.getSerializationConfiguration();
+        TypeConfiguration reflectionConfiguration = configurationSet.getReflectionConfiguration();
 
-            if (advisor.shouldIgnore(LazyValueUtils.lazyValue((String) args.get(0)), LazyValueUtils.lazyValue(null))) {
+        if ("ObjectStreamClass.<init>".equals(function) || "ObjectInputStream.readClassDescriptor".equals(function)) {
+            expectSize(args, 1);
+
+            if (advisor.shouldIgnore(LazyValueUtils.lazyValue((String) args.get(0)), LazyValueUtils.lazyValue(null), false, entry)) {
                 return;
             }
 
-            serializationConfiguration.add((String) args.get(0), (String) args.get(1));
+            String reflectionName = (String) args.get(0);
+
+            if (reflectionName.contains(LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING)) {
+                serializationConfiguration.registerLambdaCapturingClass(condition, reflectionName);
+            } else {
+                reflectionConfiguration.getOrCreateType(condition, NamedConfigurationTypeDescriptor.fromReflectionName(reflectionName)).setSerializable();
+            }
+        } else if ("SerializedLambda.readResolve".equals(function)) {
+            expectSize(args, 1);
+
+            if (advisor.shouldIgnore(LazyValueUtils.lazyValue((String) args.get(0)), LazyValueUtils.lazyValue(null), entry)) {
+                return;
+            }
+
+            serializationConfiguration.registerLambdaCapturingClass(condition, (String) args.get(0));
+        } else if ("ProxyClassSerialization".equals(function)) {
+            expectSize(args, 1);
+
+            List<String> interfaces = (List<String>) args.get(0);
+
+            for (String iface : interfaces) {
+                if (advisor.shouldIgnore(lazyValue(iface), LazyValueUtils.lazyValue(null), copyWithUniqueEntry(entry, "ignoredInterface", iface))) {
+                    return;
+                }
+            }
+
+            serializationConfiguration.registerProxyClass(condition, (List<String>) args.get(0));
         }
     }
 }

@@ -24,19 +24,26 @@
  */
 package com.oracle.svm.truffle.api;
 
-import org.graalvm.compiler.truffle.compiler.PartialEvaluator;
-import org.graalvm.compiler.truffle.compiler.TruffleCompilerBase;
+import jdk.graal.compiler.truffle.PartialEvaluator;
+import jdk.graal.compiler.truffle.phases.TruffleTier;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-public interface SubstrateTruffleCompiler extends TruffleCompilerBase {
+import com.oracle.truffle.compiler.TruffleCompiler;
 
-    @Override
+public interface SubstrateTruffleCompiler extends TruffleCompiler {
+
     @Platforms(Platform.HOSTED_ONLY.class)
     PartialEvaluator getPartialEvaluator();
 
+    @Platforms(Platform.HOSTED_ONLY.class)
+    TruffleTier getTruffleTier();
+
     /**
      * Called on tear-down of the current isolate.
+     *
+     * @param shutdownCompilationsAndWaitAction action to perform before a compiler isolate would
+     *            shut down to cancel work that can delay the shutdown.
      */
-    void teardown();
+    void teardown(Runnable shutdownCompilationsAndWaitAction);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -92,10 +92,34 @@ public class IntRangesBuffer extends IntArrayBuffer implements RangesBuffer {
         add(hi);
     }
 
+    /**
+     * Adds a new value. The value can be adjacent to the last range, in which case the last range
+     * is extended.
+     */
+    public void addSingleValue(int newValue) {
+        assert isEmpty() || leftOf(size() - 1, newValue, newValue);
+        if (!isEmpty() && adjacent(size() - 1, newValue, newValue)) {
+            buf[(size() - 1) * 2 + 1] = newValue;
+        } else {
+            add(newValue);
+            add(newValue);
+        }
+    }
+
     public void appendRangeAllowAdjacent(int lo, int hi) {
         assert isEmpty() || leftOf(size() - 1, lo, hi);
         add(lo);
         add(hi);
+    }
+
+    public void appendRangeConcatAdjacent(int lo, int hi) {
+        assert isEmpty() || leftOf(size() - 1, lo, hi);
+        if (isEmpty() || !adjacent(size() - 1, lo, hi)) {
+            add(lo);
+            add(hi);
+        } else {
+            set((size() - 1) * 2 + 1, hi);
+        }
     }
 
     @Override

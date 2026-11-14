@@ -27,16 +27,11 @@ package com.oracle.svm.hosted.phases;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderContext;
-import org.graalvm.compiler.nodes.graphbuilderconf.NodePlugin;
-import org.graalvm.nativeimage.impl.clinit.ClassInitializationTracking;
+import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 
-import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
-import com.oracle.svm.core.RuntimeAssertionsSupport;
-import com.oracle.svm.util.ReflectionUtil;
-
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.graphbuilderconf.NodePlugin;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MetaAccessProvider;
@@ -49,14 +44,9 @@ import jdk.vm.ci.meta.ResolvedJavaType;
  */
 public class EarlyConstantFoldLoadFieldPlugin implements NodePlugin {
 
-    private final ResolvedJavaField isImageBuildTimeField;
-    private final SnippetReflectionProvider snippetReflection;
-
     private final Map<ResolvedJavaType, ResolvedJavaType> primitiveTypes;
 
-    public EarlyConstantFoldLoadFieldPlugin(MetaAccessProvider metaAccess, SnippetReflectionProvider snippetReflection) {
-        isImageBuildTimeField = metaAccess.lookupJavaField(ReflectionUtil.lookupField(ClassInitializationTracking.class, "IS_IMAGE_BUILD_TIME"));
-        this.snippetReflection = snippetReflection;
+    public EarlyConstantFoldLoadFieldPlugin(MetaAccessProvider metaAccess) {
 
         primitiveTypes = new HashMap<>();
         for (JavaKind kind : JavaKind.values()) {
@@ -68,22 +58,9 @@ public class EarlyConstantFoldLoadFieldPlugin implements NodePlugin {
 
     @Override
     public boolean handleLoadStaticField(GraphBuilderContext b, ResolvedJavaField field) {
-        if (field.equals(isImageBuildTimeField)) {
-            /*
-             * Loads of this field are injected into class initializers to provide stack traces when
-             * a class is wrongly initialized at image build time.
-             */
-            b.addPush(JavaKind.Boolean, ConstantNode.forBoolean(false));
-            return true;
-        } else if (field.isSynthetic() && field.getName().startsWith("$assertionsDisabled")) {
-            /*
-             * Intercept assertion status: the value of the field during image generation does not
-             * matter at all (because it is the hosted assertion status), we instead return the
-             * appropriate runtime assertion status.
-             */
-            Class<?> javaClass = OriginalClassProvider.getJavaClass(snippetReflection, field.getDeclaringClass());
-            boolean assertionsEnabled = RuntimeAssertionsSupport.singleton().desiredAssertionStatus(javaClass);
-            b.addPush(JavaKind.Boolean, ConstantNode.forBoolean(!assertionsEnabled));
+        Boolean enabled = ClassInitializationSupport.foldedAssertionStatus(field);
+        if (enabled != null) {
+            b.addPush(JavaKind.Boolean, ConstantNode.forBoolean(!enabled));
             return true;
         }
 
@@ -101,4 +78,5 @@ public class EarlyConstantFoldLoadFieldPlugin implements NodePlugin {
 
         return false;
     }
+
 }

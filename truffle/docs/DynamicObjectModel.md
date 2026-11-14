@@ -1,7 +1,13 @@
+---
+layout: docs
+toc_group: truffle
+link_title: Dynamic Object Model
+permalink: /graalvm-as-a-platform/language-implementation-framework/DynamicObjectModel/
+---
 # Dynamic Object Model
 
-This guide demonstrates how to get started with using the [DynamicObject](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObject.html) and [DynamicObjectLibrary](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObjectLibrary.html) APIs introduced with GraalVM 20.2.0.
-The full documentation can be found in the [Javadoc](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObjectLibrary.html).
+This guide demonstrates how to use the [`DynamicObject`](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObject.html) and node APIs introduced with GraalVM 25.1.
+The full documentation can be found in the [Javadoc](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObject.html).
 
 ### Motivation
 
@@ -55,7 +61,7 @@ public class Array extends BasicObject {
 }
 ```
 
-Dynamic object members can be accessed using the `DynamicObjectLibrary`, which can be obtained using the `@CachedLibrary` annotation of the Truffle DSL and `DynamicObjectLibrary.getFactory()` + `getUncached()`, `create(DynamicObject)`, and `createDispatched(int)`.
+You can access dynamic object members through `DynamicObject` access nodes. To obtain these nodes, cache them using the `@Cached` annotation provided in the Truffle DSL.
 Here is an example of how it could be used to implement `InteropLibrary` messages:
 ```java
 @ExportLibrary(InteropLibrary.class)
@@ -72,9 +78,9 @@ public class SimpleObject extends BasicObject {
 
     @ExportMessage
     Object readMember(String name,
-                    @CachedLibrary("this") DynamicObjectLibrary objectLibrary)
+                    @Cached DynamicObject.GetNode getNode)
                     throws UnknownIdentifierException {
-        Object result = objectLibrary.getOrDefault(this, name, null);
+        Object result = getNode.execute(this, name, null);
         if (result == null) {
             /* Property does not exist. */
             throw UnknownIdentifierException.create(name);
@@ -84,14 +90,14 @@ public class SimpleObject extends BasicObject {
 
     @ExportMessage
     void writeMember(String name, Object value,
-                    @CachedLibrary("this") DynamicObjectLibrary objectLibrary) {
-        objectLibrary.put(this, name, value);
+                    @Cached DynamicObject.PutNode putNode) {
+        putNode.execute(this, name, value);
     }
 
     @ExportMessage
     boolean isMemberReadable(String member,
-                    @CachedLibrary("this") DynamicObjectLibrary objectLibrary) {
-        return objectLibrary.containsKey(this, member);
+                    @Cached DynamicObject.ContainsKeyNode containsKeyNode) {
+        return containsKeyNode.execute(this, member);
     }
     // ...
 }
@@ -100,7 +106,7 @@ public class SimpleObject extends BasicObject {
 In order to construct instances of these objects, you first need a `Shape` that you can pass to the `DynamicObject` constructor.
 This shape is created using [`Shape.newBuilder().build()`](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/Shape.Builder.html).
 The returned shape describes the initial shape of the object and forms the root of a new shape tree.
-As you are adding new properties with `DynamicObjectLibrary#put`, the object will mutate into other shapes in this shape tree.
+As you are adding new properties with `DynamicObject.PutNode#execute`, the object will mutate into other shapes in this shape tree.
 
 Note: You should reuse the same initial shapes because shapes are internally cached per root shape.
 It is recommended that you store the initial shapes in the `TruffleLanguage` instance, so they can be shared across contexts of the same engine.
@@ -116,7 +122,7 @@ public final class MyLanguage extends TruffleLanguage<MyContext> {
     private final Shape initialArrayShape;
 
     public MyLanguage() {
-        this.initialObjectShape = Shape.newBuilder(ExtendedObject.class).build();
+        this.initialObjectShape = Shape.newBuilder().layout(ExtendedObject.class).build();
         this.initialArrayShape = Shape.newBuilder().build();
     }
 
@@ -131,7 +137,7 @@ public final class MyLanguage extends TruffleLanguage<MyContext> {
 
 You can extend the default object layout with extra _dynamic fields_ that you hand over to the dynamic object model by adding `@DynamicField`-annotated field declarations of type `Object` or `long` in your subclasses, and specifying the _layout class_ with `Shape.newBuilder().layout(ExtendedObject.class).build();`.
 Dynamic fields declared in this class and its superclasses will then automatically be used to store dynamic object properties and allow faster access to properties that fit into this reserved space.
-Note: You must not access dynamic fields directly. Always use `DynamicObjectLibrary` for this purpose.
+Note: You must not access dynamic fields directly. Always use `DynamicObject` nodes for this purpose.
 
 ```java
 @ExportLibrary(InteropLibrary.class)
@@ -152,21 +158,20 @@ public class ExtendedObject extends SimpleObject {
 
 ## Caching Considerations
 
-In order to ensure optimal caching, avoid reusing the same cached `DynamicObjectLibrary` for multiple, independent operations (`get`, `put`, etc.).
-Try to minimize the number of different shapes and property keys seen by each cached library instance.
-When the property keys are known statically (compilation-final), always use a separate `DynamicObjectLibrary` for each property key.
-Use dispatched libraries (`@CachedLibrary(limit=...)`) when putting multiple properties in succession.
+To ensure optimal caching, avoid reusing the same cached `DynamicObject` node (`GetNode`, `PutNode`, etc.) for multiple independent operations.
+Try to minimize the number of different shapes and property keys that each cached node instance encounters.
+When the property keys are known statically (compilation-final), always use a separate `DynamicObject` node for each property key.
 For example:
 ```java
 public abstract class MakePairNode extends BinaryExpressionNode {
     @Specialization
     Object makePair(Object left, Object right,
                     @CachedLanguage MyLanguage language,
-                    @CachedLibrary(limit = "3") putLeft,
-                    @CachedLibrary(limit = "3") putRight) {
+                    @Cached DynamicObject.PutNode putLeft,
+                    @Cached DynamicObject.PutNode putRight) {
         MyObject obj = language.createObject();
-        putLeft.put(obj, "left", left);
-        putRight.put(obj, "right", right);
+        putLeft.execute(obj, "left", left);
+        putRight.execute(obj, "right", right);
         return obj;
     }
 }
@@ -178,4 +183,4 @@ public abstract class MakePairNode extends BinaryExpressionNode {
 
 A high-level description of the object model has been published in [**An Object Storage Model for the Truffle Language Implementation Framework**](http://dl.acm.org/citation.cfm?id=2647517).
 
-See [Truffle documentation](https://github.com/oracle/graal/tree/master/truffle/docs) and [publications](https://github.com/oracle/graal/blob/master/docs/Publications.md) for more tutorials, presentations, and publications about Truffle and GraalVM.
+See [Truffle publications](https://github.com/oracle/graal/blob/master/docs/Publications.md) for more presentations and publications about Truffle and GraalVM.

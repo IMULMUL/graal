@@ -45,23 +45,17 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.LoopNode;
 import com.oracle.truffle.api.nodes.RepeatingNode;
 
-public final class DefaultLoopNode extends LoopNode {
+final class DefaultLoopNode extends LoopNode {
 
     @Child private RepeatingNode repeatNode;
 
-    public DefaultLoopNode(RepeatingNode repeatNode) {
+    DefaultLoopNode(RepeatingNode repeatNode) {
         this.repeatNode = repeatNode;
     }
 
     @Override
     public RepeatingNode getRepeatingNode() {
         return repeatNode;
-    }
-
-    @SuppressWarnings("deprecation")
-    @Override
-    public void executeLoop(VirtualFrame frame) {
-        execute(frame);
     }
 
     @Override

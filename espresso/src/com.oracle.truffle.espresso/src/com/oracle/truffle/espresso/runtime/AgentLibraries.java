@@ -20,7 +20,6 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.runtime;
 
 import static com.oracle.truffle.espresso.jni.JniEnv.JNI_OK;
@@ -32,6 +31,8 @@ import java.util.Map;
 
 import org.graalvm.options.OptionMap;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
@@ -40,31 +41,30 @@ import com.oracle.truffle.api.interop.UnsupportedTypeException;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
 import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.RawPointer;
-import com.oracle.truffle.espresso.impl.ContextAccess;
-import com.oracle.truffle.espresso.impl.Method;
+import com.oracle.truffle.espresso.ffi.memory.NativeMemory.MemoryAllocationException;
+import com.oracle.truffle.espresso.impl.ContextAccessImpl;
 import com.oracle.truffle.espresso.jni.RawBuffer;
 import com.oracle.truffle.espresso.jvmti.JvmtiPhase;
 import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.meta.Meta;
 
-final class AgentLibraries implements ContextAccess {
+final class AgentLibraries extends ContextAccessImpl {
 
     private static final String AGENT_ONLOAD = "Agent_OnLoad";
     private static final NativeSignature ONLOAD_SIGNATURE = NativeSignature.create(NativeType.INT, NativeType.POINTER, NativeType.POINTER, NativeType.POINTER);
-
-    private final EspressoContext context;
 
     private final List<AgentLibrary> agents = new ArrayList<>(0);
     private final InteropLibrary interop = InteropLibrary.getUncached();
 
     AgentLibraries(EspressoContext context) {
-        this.context = context;
+        super(context);
     }
 
-    TruffleObject bind(Method method, String mangledName) {
+    TruffleObject lookupSymbol(String mangledName) {
         for (AgentLibrary agent : agents) {
-            TruffleObject bound = method.lookupAndBind(agent.lib, mangledName);
-            if (bound != null) {
-                return bound;
+            TruffleObject symbol = getNativeAccess().lookupSymbol(agent.lib, mangledName);
+            if (symbol != null) {
+                return symbol;
             }
         }
         return null;
@@ -82,16 +82,20 @@ final class AgentLibraries implements ContextAccess {
         for (AgentLibrary agent : agents) {
             TruffleObject onLoad = lookupOnLoad(agent);
             if (onLoad == null) {
-                throw context.abort("Unable to locate " + AGENT_ONLOAD + " in agent " + agent.name);
+                throw getContext().abort("Unable to locate " + AGENT_ONLOAD + " in agent " + agent.name);
             }
-            try (RawBuffer optionBuffer = RawBuffer.getNativeString(agent.options)) {
-                ret = interop.execute(onLoad, context.getVM().getJavaVM(), optionBuffer.pointer(), RawPointer.nullInstance());
+            try (RawBuffer optionBuffer = RawBuffer.getNativeString(agent.options, getContext().getNativeAccess().nativeMemory())) {
+                ret = interop.execute(onLoad, getContext().getVM().getJavaVM(), optionBuffer.pointer(), RawPointer.nullInstance());
                 assert interop.fitsInInt(ret);
                 if (interop.asInt(ret) != JNI_OK) {
-                    throw context.abort(AGENT_ONLOAD + " call for agent " + agent.name + " returned with error: " + interop.asInt(ret));
+                    throw getContext().abort(AGENT_ONLOAD + " call for agent " + agent.name + " returned with error: " + interop.asInt(ret));
                 }
             } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 throw EspressoError.shouldNotReachHere(e);
+            } catch (MemoryAllocationException e) {
+                Meta meta = getContext().getMeta();
+                throw meta.throwExceptionWithMessage(meta.java_lang_OutOfMemoryError, e.getMessage(), getContext());
             }
         }
 
@@ -117,24 +121,26 @@ final class AgentLibraries implements ContextAccess {
             library = getNativeAccess().loadLibrary(Paths.get(agent.name));
         } else {
             // Lookup standard directory
-            library = getNativeAccess().loadLibrary(context.getVmProperties().bootLibraryPath(), agent.name, false);
+            library = getNativeAccess().loadLibrary(getContext().getVmProperties().bootLibraryPath(), agent.name, false);
             if (library == null) {
                 // Try library path directory
-                library = getNativeAccess().loadLibrary(context.getVmProperties().javaLibraryPath(), agent.name, false);
+                library = getNativeAccess().loadLibrary(getContext().getVmProperties().javaLibraryPath(), agent.name, false);
             }
         }
         if (library == null) {
-            throw context.abort("Could not locate library for agent " + agent.name);
+            throw getContext().abort("Could not locate library for agent " + agent.name);
         }
         agent.lib = library;
 
-        TruffleObject onLoad = getNativeAccess().lookupAndBindSymbol(library, AGENT_ONLOAD, ONLOAD_SIGNATURE);
-        return onLoad;
+        return getNativeAccess().lookupAndBindSymbol(library, AGENT_ONLOAD, ONLOAD_SIGNATURE, true, true);
     }
 
-    @Override
-    public EspressoContext getContext() {
-        return context;
+    public void noSupportWarning(TruffleLogger logger) {
+        assert !agents.isEmpty();
+        logger.warning("Native agent support is currently disabled in Espresso.");
+        for (AgentLibrary agent : agents) {
+            logger.warning("Ignoring passed native agent: " + agent.name);
+        }
     }
 
     private static class AgentLibrary {
@@ -151,6 +157,5 @@ final class AgentLibraries implements ContextAccess {
             this.options = options;
             this.isAbsolutePath = isAbsolutePath;
         }
-
     }
 }

@@ -33,6 +33,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.graalvm.collections.EconomicSet;
+
 import com.oracle.objectfile.BuildDependency;
 import com.oracle.objectfile.ElementImpl;
 import com.oracle.objectfile.LayoutDecision;
@@ -72,6 +74,7 @@ public class PECoffObjectFile extends ObjectFile {
     private PECoffDirectiveSection directives;
     private boolean runtimeDebugInfoGeneration;
 
+    @SuppressWarnings("this-escape")
     private PECoffObjectFile(int pageSize, boolean runtimeDebugInfoGeneration) {
         super(pageSize);
         this.runtimeDebugInfoGeneration = runtimeDebugInfoGeneration;
@@ -86,6 +89,7 @@ public class PECoffObjectFile extends ObjectFile {
         directives = new PECoffDirectiveSection(".drectve", 1);
     }
 
+    @SuppressWarnings("this-escape")
     public PECoffObjectFile(int pageSize) {
         this(pageSize, false);
     }
@@ -106,13 +110,13 @@ public class PECoffObjectFile extends ObjectFile {
     }
 
     @Override
-    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal) {
+    public Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal, boolean isExported) {
         PECoffSymtab st = createSymbolTable();
-        return st.newDefinedEntry(name, (Section) baseSection, position, size, isGlobal, isCode);
+        return st.newDefinedEntry(name, (Section) baseSection, position, size, isGlobal, isCode, isExported);
     }
 
     @Override
-    public Symbol createUndefinedSymbol(String name, int size, boolean isCode) {
+    public Symbol createUndefinedSymbol(String name, boolean isCode) {
         PECoffSymtab st = createSymbolTable();
         return st.newUndefinedEntry(name, isCode);
     }
@@ -124,7 +128,7 @@ public class PECoffObjectFile extends ObjectFile {
 
     @Override
     public PECoffUserDefinedSection newUserDefinedSection(Segment segment, String name, int alignment, ElementImpl impl) {
-        PECoffUserDefinedSection userDefined = new PECoffUserDefinedSection(this, name, alignment, impl);
+        PECoffUserDefinedSection userDefined = new PECoffUserDefinedSection(this, name, alignment, impl, EnumSet.of(PECoffSectionFlag.INITIALIZED_DATA, PECoffSectionFlag.READ));
         assert userDefined.getImpl() == impl;
         if (segment != null) {
             getOrCreateSegment(segment.getName(), name, true, false).add(userDefined);
@@ -328,7 +332,7 @@ public class PECoffObjectFile extends ObjectFile {
             // The Header depends on the section count and symbol table size and offset.
 
             // We don't use the default dependencies, because our offset mustn't depend on anything.
-            HashSet<BuildDependency> dependencies = new HashSet<>();
+            EconomicSet<BuildDependency> dependencies = EconomicSet.create(4);
 
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
             LayoutDecision ourOffset = decisions.get(this).getDecision(LayoutDecision.Kind.OFFSET);
@@ -456,7 +460,7 @@ public class PECoffObjectFile extends ObjectFile {
              * Table are "Elements" and not "Sections".
              *
              */
-            HashSet<BuildDependency> deps = ObjectFile.defaultDependencies(decisions, this);
+            EconomicSet<BuildDependency> deps = ObjectFile.defaultDependencies(decisions, this);
 
             LayoutDecision ourOffset = decisions.get(this).getDecision(LayoutDecision.Kind.OFFSET);
             LayoutDecision ourContent = decisions.get(this).getDecision(LayoutDecision.Kind.CONTENT);
@@ -631,7 +635,7 @@ public class PECoffObjectFile extends ObjectFile {
 
     @Override
     public Set<Segment> getSegments() {
-        return new HashSet<>();
+        return new HashSet<>(); // noEconomicSet(streaming)
     }
 
     @Override
@@ -662,15 +666,15 @@ public class PECoffObjectFile extends ObjectFile {
         return machine;
     }
 
-    public PECoffRelocationTable getOrCreateRelocSection(PECoffSymtab syms, boolean withExplicitAddends) {
+    public PECoffRelocationTable getOrCreateRelocSection(PECoffSymtab syms) {
         Element el = elementForName(".reloctab");
         PECoffRelocationTable rs;
         if (el == null) {
-            rs = new PECoffRelocationTable(this, ".reloctab", syms, withExplicitAddends);
+            rs = new PECoffRelocationTable(this, ".reloctab", syms);
         } else if (el instanceof PECoffRelocationTable) {
             rs = (PECoffRelocationTable) el;
         } else {
-            throw new IllegalStateException("section exists but is not an PECoffRelocationTable");
+            throw new IllegalStateException("Section exists but is not an PECoffRelocationTable");
         }
         return rs;
     }
@@ -700,7 +704,7 @@ public class PECoffObjectFile extends ObjectFile {
 
     @Override
     public void installDebugInfo(DebugInfoProvider debugInfoProvider) {
-        CVDebugInfo cvDebugInfo = new CVDebugInfo(getByteOrder());
+        CVDebugInfo cvDebugInfo = new CVDebugInfo(getMachine(), getByteOrder());
 
         // we need an implementation for each section
         CVSymbolSectionImpl cvSymbolSectionImpl = cvDebugInfo.getCVSymbolSection();
@@ -719,8 +723,8 @@ public class PECoffObjectFile extends ObjectFile {
         // layout constraints included in the layout decision set and causes
         // an NPE during reloc section write. so we need to create the relevant
         // reloc sections here in advance
-        cvSymbolSectionImpl.getOrCreateRelocationElement(false);
-        cvTypeSectionImpl.getOrCreateRelocationElement(false);
+        cvSymbolSectionImpl.getOrCreateRelocationElement(0);
+        cvTypeSectionImpl.getOrCreateRelocationElement(0);
 
         // ok now we can populate the implementations
         cvDebugInfo.installDebugInfo(debugInfoProvider);

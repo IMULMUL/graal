@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,103 +24,164 @@
  */
 package com.oracle.svm.hosted.code;
 
-import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Objects;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.function.CEntryPoint.Builtin;
-
-import com.oracle.svm.core.c.function.CEntryPointOptions;
-import com.oracle.svm.core.c.function.CEntryPointOptions.DefaultNameTransformation;
-import com.oracle.svm.core.c.function.CEntryPointOptions.Publish;
-import com.oracle.svm.core.c.function.CEntryPointSetup;
-import com.oracle.svm.core.util.VMError;
+import org.graalvm.nativeimage.c.function.CEntryPoint.Publish;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions.DefaultNameTransformation;
+import com.oracle.svm.guest.staging.c.function.CEntryPointSetup;
+import com.oracle.svm.shared.util.VMError;
 import com.oracle.svm.hosted.image.NativeImage;
+import com.oracle.svm.util.GuestAccess;
 
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
+/**
+ * Encapsulates info from {@link CEntryPoint} and {@link CEntryPointOptions} annotations.
+ */
 public final class CEntryPointData {
 
-    public static final String DEFAULT_NAME = "";
-    public static final Class<? extends Function<String, String>> DEFAULT_NAME_TRANSFORMATION = DefaultNameTransformation.class;
-    public static final CEntryPoint.Builtin DEFAULT_BUILTIN = CEntryPoint.Builtin.NO_BUILTIN;
-    public static final Class<?> DEFAULT_PROLOGUE = CEntryPointOptions.AutomaticPrologue.class;
-    public static final Class<?> DEFAULT_EPILOGUE = CEntryPointSetup.LeaveEpilogue.class;
-    public static final Class<?> DEFAULT_EXCEPTION_HANDLER = CEntryPoint.FatalExceptionHandler.class;
+    /**
+     * @see CEntryPoint#name()
+     */
+    private static final String EMPTY_NAME = "";
 
-    public static CEntryPointData create(ResolvedJavaMethod method) {
-        return create(method.getAnnotation(CEntryPoint.class), method.getAnnotation(CEntryPointOptions.class),
-                        () -> NativeImage.globalSymbolNameForMethod(method));
-    }
+    /**
+     * @see CEntryPoint#documentation()
+     */
+    public static final String EMPTY_DOCUMENTATION = "";
 
-    public static CEntryPointData create(ResolvedJavaMethod method, String name, Class<? extends Function<String, String>> nameTransformation,
-                    String documentation, Class<?> prologue, Class<?> epilogue, Class<?> exceptionHandler, Publish publishAs) {
+    /**
+     * @see CEntryPointOptions#nameTransformation()
+     */
+    public static final ResolvedJavaType DEFAULT_NAME_TRANSFORMATION = GuestAccess.get().lookupType(DefaultNameTransformation.class);
 
-        return create(name, () -> NativeImage.globalSymbolNameForMethod(method), nameTransformation, documentation, Builtin.NO_BUILTIN, prologue, epilogue, exceptionHandler, publishAs);
-    }
+    /**
+     * @see CEntryPoint#builtin()
+     */
+    public static final CEntryPoint.Builtin NO_BUILTIN = CEntryPoint.Builtin.NO_BUILTIN;
 
-    public static CEntryPointData create(Method method) {
-        return create(method, DEFAULT_NAME);
-    }
+    /**
+     * @see CEntryPointOptions#prologue()
+     */
+    public static final ResolvedJavaType AUTOMATIC_PROLOGUE = GuestAccess.get().lookupType(CEntryPointOptions.AutomaticPrologue.class);
+    public static final ResolvedJavaType NO_PROLOGUE = GuestAccess.get().lookupType(CEntryPointOptions.NoPrologue.class);
 
-    public static CEntryPointData create(Method method, String name) {
-        assert method.getAnnotation(CEntryPoint.class).name().isEmpty() || name.isEmpty();
-        return create(method.getAnnotation(CEntryPoint.class), method.getAnnotation(CEntryPointOptions.class),
+    /**
+     * @see CEntryPointOptions#prologueBailout()
+     */
+    public static final ResolvedJavaType AUTOMATIC_PROLOGUE_BAILOUT = GuestAccess.get().lookupType(CEntryPointOptions.AutomaticPrologueBailout.class);
+
+    /**
+     * @see CEntryPointOptions#epilogue()
+     */
+    public static final ResolvedJavaType DEFAULT_EPILOGUE = GuestAccess.get().lookupType(CEntryPointSetup.LeaveEpilogue.class);
+    public static final ResolvedJavaType NO_EPILOGUE = GuestAccess.get().lookupType(CEntryPointOptions.NoEpilogue.class);
+
+    /**
+     * @see CEntryPoint#exceptionHandler()
+     */
+    public static final ResolvedJavaType FATAL_EXCEPTION_HANDLER = GuestAccess.get().lookupType(CEntryPoint.FatalExceptionHandler.class);
+
+    public static CEntryPointData create(ResolvedJavaMethod method, String name) {
+        CEntryPointGuestValue cEntryPoint = CEntryPointGuestValue.get(method);
+        CEntryPointOptionsGuestValue cEntryPointOptions = CEntryPointOptionsGuestValue.get(method);
+        assert cEntryPoint.name().isEmpty() || name.isEmpty();
+        return create(cEntryPoint, cEntryPointOptions,
                         () -> !name.isEmpty() ? name : NativeImage.globalSymbolNameForMethod(method));
     }
 
-    public static CEntryPointData create(Method method, String name, Class<? extends Function<String, String>> nameTransformation,
-                    String documentation, Class<?> prologue, Class<?> epilogue, Class<?> exceptionHandler, Publish publishAs) {
+    public static CEntryPointData create(ResolvedJavaMethod method) {
+        return create(method, EMPTY_NAME);
+    }
 
-        return create(name, () -> NativeImage.globalSymbolNameForMethod(method), nameTransformation, documentation, Builtin.NO_BUILTIN, prologue, epilogue, exceptionHandler, publishAs);
+    public static CEntryPointData create(ResolvedJavaMethod method,
+                    String name,
+                    ResolvedJavaType nameTransformation,
+                    String documentation,
+                    ResolvedJavaType prologue,
+                    ResolvedJavaType prologueBailout,
+                    ResolvedJavaType epilogue,
+                    ResolvedJavaType exceptionHandler,
+                    Publish publishAs) {
+
+        return create(name,
+                        () -> NativeImage.globalSymbolNameForMethod(method),
+                        nameTransformation,
+                        documentation,
+                        Builtin.NO_BUILTIN,
+                        prologue,
+                        prologueBailout,
+                        epilogue,
+                        exceptionHandler,
+                        publishAs);
     }
 
     public static CEntryPointData createCustomUnpublished() {
-        CEntryPointData unpublished = new CEntryPointData(null, DEFAULT_NAME, "", Builtin.NO_BUILTIN, CEntryPointOptions.NoPrologue.class, CEntryPointOptions.NoEpilogue.class,
-                        DEFAULT_EXCEPTION_HANDLER, Publish.NotPublished);
-        unpublished.symbolName = DEFAULT_NAME;
+        CEntryPointData unpublished = new CEntryPointData(null,
+                        EMPTY_NAME,
+                        EMPTY_DOCUMENTATION,
+                        Builtin.NO_BUILTIN,
+                        NO_PROLOGUE,
+                        null,
+                        NO_EPILOGUE,
+                        FATAL_EXCEPTION_HANDLER,
+                        Publish.NotPublished);
+        unpublished.symbolName = EMPTY_NAME;
         return unpublished;
     }
 
-    @SuppressWarnings("deprecation")
-    private static CEntryPointData create(CEntryPoint annotation, CEntryPointOptions options, Supplier<String> alternativeNameSupplier) {
-        String annotatedName = annotation.name();
-        Class<? extends Function<String, String>> nameTransformation = DEFAULT_NAME_TRANSFORMATION;
-        String documentation = String.join(System.lineSeparator(), annotation.documentation());
-        CEntryPoint.Builtin builtin = annotation.builtin();
-        Class<?> prologue = DEFAULT_PROLOGUE;
-        Class<?> epilogue = DEFAULT_EPILOGUE;
-        Class<?> exceptionHandler = annotation.exceptionHandler();
-        Publish publishAs = Publish.SymbolAndHeader;
+    private static CEntryPointData create(CEntryPointGuestValue cEntryPoint, CEntryPointOptionsGuestValue options, Supplier<String> alternativeNameSupplier) {
+        String annotatedName = cEntryPoint.name();
+        ResolvedJavaType nameTransformation = DEFAULT_NAME_TRANSFORMATION;
+        List<String> docLines = cEntryPoint.documentation();
+        String documentation = docLines.isEmpty() ? "" : String.join(System.lineSeparator(), docLines);
+        CEntryPoint.Builtin builtin = cEntryPoint.builtin();
+        ResolvedJavaType prologue = AUTOMATIC_PROLOGUE;
+        ResolvedJavaType prologueBailout = AUTOMATIC_PROLOGUE_BAILOUT;
+        ResolvedJavaType epilogue = DEFAULT_EPILOGUE;
+        ResolvedJavaType exceptionHandler = cEntryPoint.exceptionHandler();
+        Publish publishAs = cEntryPoint.publishAs();
         if (options != null) {
             nameTransformation = options.nameTransformation();
             prologue = options.prologue();
+            prologueBailout = options.prologueBailout();
             epilogue = options.epilogue();
-            publishAs = options.publishAs();
         }
-        return create(annotatedName, alternativeNameSupplier, nameTransformation, documentation, builtin, prologue, epilogue, exceptionHandler, publishAs);
+        return create(annotatedName, alternativeNameSupplier, nameTransformation, documentation, builtin, prologue, prologueBailout, epilogue, exceptionHandler, publishAs);
     }
 
-    private static CEntryPointData create(String providedName, Supplier<String> alternativeNameSupplier, Class<? extends Function<String, String>> nameTransformation,
-                    String documentation, Builtin builtin, Class<?> prologue, Class<?> epilogue, Class<?> exceptionHandler, Publish publishAs) {
+    private static CEntryPointData create(String providedName,
+                    Supplier<String> alternativeNameSupplier,
+                    ResolvedJavaType nameTransformation,
+                    String documentation,
+                    Builtin builtin,
+                    ResolvedJavaType prologue,
+                    ResolvedJavaType prologueBailout,
+                    ResolvedJavaType epilogue,
+                    ResolvedJavaType exceptionHandler,
+                    Publish publishAs) {
 
-        // Delay generating the final symbol name because this method may be called early at a time
-        // where some of the environment (such as ImageSingletons) is incomplete
+        // Delay generating the final symbol name because this method may be called before
+        // some initialization (e.g., of ImageSingletons) has completed.
         Supplier<String> symbolNameSupplier = () -> {
             String symbolName = !providedName.isEmpty() ? providedName : alternativeNameSupplier.get();
             if (nameTransformation != null) {
                 try {
-                    Function<String, String> instance = nameTransformation.getDeclaredConstructor().newInstance();
-                    symbolName = instance.apply(symbolName);
+                    GuestAccess h = GuestAccess.get();
+                    symbolName = h.asHostString(h.callFunction(nameTransformation, h.asGuestString(symbolName)));
                 } catch (Exception e) {
                     throw VMError.shouldNotReachHere(e);
                 }
             }
             return symbolName;
         };
-        return new CEntryPointData(symbolNameSupplier, providedName, documentation, builtin, prologue, epilogue, exceptionHandler, publishAs);
+        return new CEntryPointData(symbolNameSupplier, providedName, documentation, builtin, prologue, prologueBailout, epilogue, exceptionHandler, publishAs);
     }
 
     private String symbolName;
@@ -128,26 +189,28 @@ public final class CEntryPointData {
     private final String providedName;
     private final String documentation;
     private final Builtin builtin;
-    private final Class<?> prologue;
-    private final Class<?> epilogue;
-    private final Class<?> exceptionHandler;
+    private final ResolvedJavaType prologue;
+    private final ResolvedJavaType prologueBailout;
+    private final ResolvedJavaType epilogue;
+    private final ResolvedJavaType exceptionHandler;
     private final Publish publishAs;
 
     private CEntryPointData(Supplier<String> symbolNameSupplier, String providedName, String documentation, Builtin builtin,
-                    Class<?> prologue, Class<?> epilogue, Class<?> exceptionHandler, Publish publishAs) {
+                    ResolvedJavaType prologue, ResolvedJavaType prologueBailout, ResolvedJavaType epilogue, ResolvedJavaType exceptionHandler, Publish publishAs) {
 
         this.symbolNameSupplier = symbolNameSupplier;
         this.providedName = providedName;
         this.documentation = documentation;
         this.builtin = builtin;
         this.prologue = prologue;
+        this.prologueBailout = prologueBailout;
         this.epilogue = epilogue;
         this.exceptionHandler = exceptionHandler;
         this.publishAs = publishAs;
     }
 
     public CEntryPointData copyWithPublishAs(Publish customPublishAs) {
-        return new CEntryPointData(symbolNameSupplier, providedName, documentation, builtin, prologue, epilogue, exceptionHandler, customPublishAs);
+        return new CEntryPointData(symbolNameSupplier, providedName, documentation, builtin, prologue, prologueBailout, epilogue, exceptionHandler, customPublishAs);
     }
 
     public String getSymbolName() {
@@ -170,15 +233,19 @@ public final class CEntryPointData {
         return builtin;
     }
 
-    public Class<?> getPrologue() {
+    public ResolvedJavaType getPrologue() {
         return prologue;
     }
 
-    public Class<?> getEpilogue() {
+    public ResolvedJavaType getPrologueBailout() {
+        return prologueBailout;
+    }
+
+    public ResolvedJavaType getEpilogue() {
         return epilogue;
     }
 
-    public Class<?> getExceptionHandler() {
+    public ResolvedJavaType getExceptionHandler() {
         return exceptionHandler;
     }
 
@@ -191,8 +258,7 @@ public final class CEntryPointData {
         if (obj == this) {
             return true;
         }
-        if (obj instanceof CEntryPointData) {
-            CEntryPointData other = (CEntryPointData) obj;
+        if (obj instanceof CEntryPointData other) {
             return Objects.equals(getSymbolName(), other.getSymbolName()) &&
                             Objects.equals(providedName, other.providedName) &&
                             Objects.equals(documentation, other.documentation) &&

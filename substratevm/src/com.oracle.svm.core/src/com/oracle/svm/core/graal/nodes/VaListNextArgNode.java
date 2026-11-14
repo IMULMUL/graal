@@ -24,20 +24,21 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import static org.graalvm.compiler.nodeinfo.InputType.Memory;
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_8;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_8;
+import static jdk.graal.compiler.nodeinfo.InputType.Memory;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_8;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_8;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.memory.SingleMemoryKill;
-import org.graalvm.compiler.nodes.spi.Lowerable;
-import org.graalvm.compiler.nodes.spi.LoweringTool;
 import org.graalvm.word.LocationIdentity;
+import org.graalvm.word.Pointer;
 
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.nodes.spi.LoweringTool;
 import jdk.vm.ci.meta.JavaKind;
 
 /**
@@ -71,4 +72,28 @@ public final class VaListNextArgNode extends FixedWithNextNode implements Lowera
     public LocationIdentity getKilledLocationIdentity() {
         return LocationIdentity.any();
     }
+
+    @NodeIntrinsic
+    public static native boolean vaListNextBoolean(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native byte vaListNextByte(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native short vaListNextShort(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native char vaListNextChar(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native int vaListNextInt(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native long vaListNextLong(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native float vaListNextFloat(@ConstantNodeParameter JavaKind kind, Pointer vaList);
+
+    @NodeIntrinsic
+    public static native double vaListNextDouble(@ConstantNodeParameter JavaKind kind, Pointer vaList);
 }

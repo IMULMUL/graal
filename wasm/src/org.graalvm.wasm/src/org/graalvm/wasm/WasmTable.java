@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,26 +40,39 @@
  */
 package org.graalvm.wasm;
 
-import org.graalvm.wasm.constants.Sizes;
-import org.graalvm.wasm.exception.Failure;
-
-import java.util.Arrays;
-
-import static java.lang.Integer.compareUnsigned;
-import static org.graalvm.wasm.Assert.assertUnsignedIntLessOrEqual;
+import static java.lang.Long.compareUnsigned;
+import static org.graalvm.wasm.constants.Sizes.MAX_TABLE_64_DECLARATION_SIZE;
 import static org.graalvm.wasm.constants.Sizes.MAX_TABLE_DECLARATION_SIZE;
 import static org.graalvm.wasm.constants.Sizes.MAX_TABLE_INSTANCE_SIZE;
 
-public final class WasmTable {
+import java.util.Arrays;
+
+import org.graalvm.wasm.constants.Sizes;
+import org.graalvm.wasm.types.ReferenceType;
+
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.interop.TruffleObject;
+
+public final class WasmTable implements TruffleObject, EmbedderDataHolder {
     /**
      * @see #declaredMinSize()
      */
-    private final int declaredMinSize;
+    private final long declaredMinSize;
 
     /**
      * @see #declaredMaxSize()
      */
-    private final int declaredMaxSize;
+    private final long declaredMaxSize;
+
+    /**
+     * @see #elemType()
+     */
+    private final ReferenceType elemType;
+
+    /**
+     * @see #minSize()
+     */
+    private long currentMinSize;
 
     /**
      * The maximum practical size of this table instance.
@@ -72,41 +85,53 @@ public final class WasmTable {
      */
     private final int maxAllowedSize;
 
+    private final boolean indexType64;
+
     private Object[] elements;
 
-    private WasmTable(int declaredMinSize, int declaredMaxSize, int initialSize, int maxAllowedSize) {
+    private Object embedderData = WasmConstant.VOID;
+
+    @TruffleBoundary
+    private WasmTable(long declaredMinSize, long declaredMaxSize, int initialSize, int maxAllowedSize, ReferenceType elemType, Object initialValue,
+                    boolean indexType64) {
         assert compareUnsigned(declaredMinSize, initialSize) <= 0;
         assert compareUnsigned(initialSize, maxAllowedSize) <= 0;
         assert compareUnsigned(maxAllowedSize, declaredMaxSize) <= 0;
-        assert compareUnsigned(maxAllowedSize, MAX_TABLE_INSTANCE_SIZE) <= 0;
-        assert compareUnsigned(declaredMaxSize, MAX_TABLE_DECLARATION_SIZE) <= 0;
+        assert Integer.compareUnsigned(maxAllowedSize, MAX_TABLE_INSTANCE_SIZE) <= 0;
+        assert !indexType64 || compareUnsigned(declaredMaxSize, MAX_TABLE_64_DECLARATION_SIZE) <= 0;
+        assert indexType64 || Integer.compareUnsigned((int) declaredMaxSize, MAX_TABLE_DECLARATION_SIZE) <= 0;
+        assert initialValue == WasmConstant.NULL || elemType.matchesValue(initialValue);
 
         this.declaredMinSize = declaredMinSize;
         this.declaredMaxSize = declaredMaxSize;
         this.maxAllowedSize = maxAllowedSize;
-        this.elements = new Object[declaredMinSize];
+        this.indexType64 = indexType64;
+        this.currentMinSize = declaredMinSize;
+        this.elements = new Object[initialSize];
+        Arrays.fill(this.elements, initialValue);
+        this.elemType = elemType;
     }
 
-    public WasmTable(int declaredMinSize, int declaredMaxSize, int maxAllowedSize) {
-        this(declaredMinSize, declaredMaxSize, declaredMinSize, maxAllowedSize);
+    public WasmTable(long declaredMinSize, long declaredMaxSize, int maxAllowedSize, ReferenceType elemType, boolean indexType64) {
+        this(declaredMinSize, declaredMaxSize, (int) declaredMinSize, maxAllowedSize, elemType, WasmConstant.NULL, indexType64);
     }
 
-    public void ensureSizeAtLeast(int targetSize) {
-        assertUnsignedIntLessOrEqual(targetSize, maxAllowedSize, Failure.TABLE_INSTANCE_SIZE_LIMIT_EXCEEDED);
-        if (size() < targetSize) {
-            elements = Arrays.copyOf(elements, targetSize);
-        }
+    public WasmTable(long declaredMinSize, long declaredMaxSize, int maxAllowedSize, ReferenceType elemType, Object initialValue, boolean indexType64) {
+        this(declaredMinSize, declaredMaxSize, (int) declaredMinSize, maxAllowedSize, elemType, initialValue, indexType64);
     }
 
     /**
-     * Shrinks this table's size to its {@link #declaredMinSize()} initial size}, and sets all
+     * Shrinks this table's size to its {@link #declaredMinSize()} initial size, and sets all
      * elements to {@code null}.
      * <p>
      * Note: this does not restore content from elements section. For this, use
-     * {@link org.graalvm.wasm.BinaryParser#resetTableState}.
+     * {@link org.graalvm.wasm.parser.bytecode.BytecodeParser#resetTableState}.
      */
+    @TruffleBoundary
     public void reset() {
-        elements = new Object[declaredMinSize];
+        elements = new Object[(int) declaredMinSize];
+        Arrays.fill(elements, WasmConstant.NULL);
+        currentMinSize = declaredMinSize;
     }
 
     /**
@@ -118,11 +143,8 @@ public final class WasmTable {
 
     /**
      * The minimum size of this table as declared in the binary.
-     * <p>
-     * This is a lower bound on this table's size. This memory can only be imported with a lower or
-     * equal minimum size.
      */
-    public int declaredMinSize() {
+    public long declaredMinSize() {
         return declaredMinSize;
     }
 
@@ -134,8 +156,38 @@ public final class WasmTable {
      * <p>
      * This is different from internal max allowed size, which can be lower.
      */
-    public int declaredMaxSize() {
+    public long declaredMaxSize() {
         return declaredMaxSize;
+    }
+
+    /**
+     * The type of the elements in the table.
+     * <p>
+     * This table can only be imported with an equivalent elem type.
+     *
+     * @return Either an abstract reference type such as {@link ReferenceType#FUNCREF} or
+     *         {@link ReferenceType#EXTERNREF}, or some concrete reference type.
+     */
+    public ReferenceType elemType() {
+        return elemType;
+    }
+
+    /**
+     * The current minimum size of the table. The size can change based on calls to
+     * {@link #grow(long, Object)}.
+     * <p>
+     * This is a lower bound on this table's size. This table can only be imported with a lower or
+     * equal minimum size.
+     */
+    public long minSize() {
+        return currentMinSize;
+    }
+
+    /**
+     * @return Whether the index type (addressing mode) is 64-bit or 32-bit.
+     */
+    public boolean hasIndexType64() {
+        return indexType64;
     }
 
     public Object[] elements() {
@@ -161,26 +213,70 @@ public final class WasmTable {
     }
 
     /**
-     * Gets element at {@code index}.
-     *
-     * @throws IndexOutOfBoundsException if the index is negative or greater or equal to table size
+     * Initializes the content of the table based on the given elem instance.
+     * 
+     * @param elemInstance The source elem instance that should be copied to the table
+     * @param sourceOffset The offset in the source elem segment
+     * @param destinationOffset The offset in the table
+     * @param length The number of elements that should be copied
      */
-    public void initialize(int i, WasmFunctionInstance function) {
-        elements[i] = function;
+    public void initialize(Object[] elemInstance, int sourceOffset, int destinationOffset, int length) {
+        System.arraycopy(elemInstance, sourceOffset, elements, destinationOffset, length);
+    }
+
+    /**
+     * Fills the table with the given value.
+     * 
+     * @param offset The offset in the table
+     * @param length The number of elements that should be filled
+     * @param value The value that should be used for filling the table
+     */
+    @TruffleBoundary
+    public void fill(int offset, int length, Object value) {
+        assert offset + length <= size();
+        Arrays.fill(elements, offset, offset + length, value);
+    }
+
+    /**
+     * Copies elements from another table into this table.
+     * 
+     * @param source The source table
+     * @param sourceOffset The offset in the source table
+     * @param destinationOffset The offset in this table
+     * @param length The number of elements that should be copied
+     */
+    public void copyFrom(WasmTable source, int sourceOffset, int destinationOffset, int length) {
+        System.arraycopy(source.elements, sourceOffset, elements, destinationOffset, length);
     }
 
     /**
      * Grows the table so that it can contain {@code delta} more elements.
-     *
-     * @throws IllegalArgumentException if growing the table of {@code delta} would make its size
-     *             larger than the internal limit
+     * 
+     * @param delta The expected additional number of elements
+     * @param value The value of the newly added elements
+     * @return The previous size if the growing succeeded, -1 otherwise.
      */
-    public void grow(int delta) {
-        final int targetSize = size() + delta;
-        if (compareUnsigned(delta, maxAllowedSize) <= 0 && compareUnsigned(targetSize, maxAllowedSize) <= 0) {
-            ensureSizeAtLeast(size() + delta);
-        } else {
-            throw new IllegalArgumentException("Cannot grow table above max limit " + maxAllowedSize);
+    @TruffleBoundary
+    public long grow(long delta, Object value) {
+        assert elemType.matchesValue(value);
+        final int size = size();
+        if (compareUnsigned(delta, Integer.toUnsignedLong(maxAllowedSize - size)) <= 0) {
+            final int targetSize = size + (int) delta;
+            elements = Arrays.copyOf(elements, targetSize);
+            Arrays.fill(elements, size, targetSize, value);
+            currentMinSize = targetSize;
+            return size;
         }
+        return -1L;
+    }
+
+    @Override
+    public Object getEmbedderData() {
+        return embedderData;
+    }
+
+    @Override
+    public void setEmbedderData(Object embedderData) {
+        this.embedderData = embedderData;
     }
 }

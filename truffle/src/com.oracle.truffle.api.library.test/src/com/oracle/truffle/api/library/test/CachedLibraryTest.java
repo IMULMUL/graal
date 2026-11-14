@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,6 +41,7 @@
 package com.oracle.truffle.api.library.test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
 import org.junit.Test;
@@ -50,6 +51,7 @@ import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.GenerateInline;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.Introspectable;
 import com.oracle.truffle.api.dsl.NodeChild;
@@ -77,10 +79,12 @@ import com.oracle.truffle.api.library.test.CachedLibraryTestFactory.FromCached2N
 import com.oracle.truffle.api.library.test.CachedLibraryTestFactory.ReplaceCachedLibraryTestNodeGen;
 import com.oracle.truffle.api.library.test.CachedLibraryTestFactory.SimpleDispatchedNodeGen;
 import com.oracle.truffle.api.library.test.CachedLibraryTestFactory.SimpleNodeGen;
+import com.oracle.truffle.api.library.test.CachedLibraryTestFactory.TestBoundaryAndVirtualFrame3NodeGen;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.test.AbstractLibraryTest;
 import com.oracle.truffle.api.test.ExpectError;
 
+@SuppressWarnings({"truffle-inlining", "truffle-neverdefault", "truffle-sharing"})
 public class CachedLibraryTest extends AbstractLibraryTest {
 
     @GenerateLibrary
@@ -264,6 +268,7 @@ public class CachedLibraryTest extends AbstractLibraryTest {
 
     @GenerateUncached
     @SuppressWarnings("unused")
+    @GenerateInline(false)
     public abstract static class ConstantNode extends Node {
 
         abstract String execute(Object receiver);
@@ -293,7 +298,7 @@ public class CachedLibraryTest extends AbstractLibraryTest {
 
         abstract String execute(Object receiver);
 
-        @Specialization(guards = "receiver == cachedReceiver")
+        @Specialization(guards = "receiver == cachedReceiver", limit = "3")
         public static String s1(Object receiver,
                         @Cached("receiver") Object cachedReceiver,
                         @CachedLibrary("cachedReceiver") SomethingLibrary lib) {
@@ -677,6 +682,26 @@ public class CachedLibraryTest extends AbstractLibraryTest {
         @SuppressWarnings("unused")
         @Specialization(limit = "3")
         String doDefault(Object arg, @CachedLibrary("arg") SomethingLibrary interop) {
+            return null;
+        }
+    }
+
+    @Test
+    public void testBoundaryAndVirtualFrameNull() {
+        var node = adopt(TestBoundaryAndVirtualFrame3NodeGen.create());
+        assertNull(node.execute(null, new Something()));
+        assertNull(node.execute(null, new Something()));
+        assertNull(node.execute(null, new Something()));
+        assertNull(node.execute(null, new Something()));
+    }
+
+    public abstract static class TestBoundaryAndVirtualFrame3 extends Node {
+
+        public abstract Object execute(VirtualFrame frame, Object arg);
+
+        @SuppressWarnings("unused")
+        @Specialization(limit = "1")
+        String doDefault(VirtualFrame frame, Object arg, @CachedLibrary("arg") SomethingLibrary interop) {
             return null;
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,44 +24,35 @@
  */
 package com.oracle.svm.core.jdk;
 
-import java.io.File;
-import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform.HOSTED_ONLY;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport.NativeLibrary;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.AllAccess;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.Duplicable;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
-@AutomaticFeature
-class NativeLibrarySupportFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        NativeLibrarySupport.initialize();
-    }
-}
-
-public final class NativeLibrarySupport {
+@AutomaticallyRegisteredImageSingleton
+@SingletonTraits(access = AllAccess.class, layeredCallbacks = NoLayeredCallbacks.class, layeredInstallationKind = Duplicable.class, other = PartiallyLayerAware.class)
+public final class NativeLibrarySupport extends NativeLibraries {
     // Essentially a revised implementation of the relevant methods in OpenJDK's ClassLoader
 
     public interface LibraryInitializer {
         boolean isBuiltinLibrary(String name);
 
-        void initialize(NativeLibrary lib);
-    }
-
-    static void initialize() {
-        ImageSingletons.add(NativeLibrarySupport.class, new NativeLibrarySupport());
+        int initialize(NativeLibrary lib);
     }
 
     public static NativeLibrarySupport singleton() {
@@ -70,15 +61,13 @@ public final class NativeLibrarySupport {
 
     private final ReentrantLock lock = new ReentrantLock();
 
-    private final List<NativeLibrary> knownLibraries = new ArrayList<>();
+    private final List<NativeLibrary> knownLibraries = new CopyOnWriteArrayList<>();
 
     private final Deque<NativeLibrary> currentLoadContext = new ArrayDeque<>();
 
-    private String[] paths;
-
     private LibraryInitializer libraryInitializer;
 
-    private NativeLibrarySupport() {
+    NativeLibrarySupport() {
     }
 
     @Platforms(HOSTED_ONLY.class)
@@ -88,58 +77,57 @@ public final class NativeLibrarySupport {
     }
 
     @Platforms(HOSTED_ONLY.class)
-    public void preregisterUninitializedBuiltinLibrary(String name) {
+    public void registerUninitializedBuiltinLibrary(String name) {
         knownLibraries.add(PlatformNativeLibrarySupport.singleton().createLibrary(name, true));
     }
 
-    @Platforms(HOSTED_ONLY.class)
-    public boolean isPreregisteredBuiltinLibrary(String name) {
-        return knownLibraries.stream().anyMatch(l -> l.isBuiltin() && l.getCanonicalIdentifier().equals(name));
+    @Override
+    protected boolean addLibrary(String canonical, boolean builtin) {
+        return addLibrary(builtin, canonical, true);
     }
 
-    public void loadLibraryAbsolute(File file) {
-        if (loadLibrary0(file, false)) {
-            return;
-        }
-        throw new UnsatisfiedLinkError("Can't load library: " + file);
+    @Override
+    protected boolean addLibrary(String canonical, boolean builtin, boolean initialize) {
+        return addLibrary(builtin, canonical, initialize);
     }
 
-    public void loadLibraryRelative(String name) {
-        // Test if this is a built-in library
-        if (loadLibrary0(new File(name), true)) {
-            return;
-        }
-        String libname = System.mapLibraryName(name);
-        if (paths == null) {
-            String[] tokens = SubstrateUtil.split(System.getProperty("java.library.path", ""), File.pathSeparator);
-            for (int i = 0; i < tokens.length; i++) {
-                if (tokens[i].isEmpty()) {
-                    tokens[i] = ".";
+    /**
+     * Loads libjava before Java filesystem classes are initialized. Unlike
+     * {@link #loadLibraryRelative(String)}, this method must not use {@link java.io.File},
+     * {@link java.nio.file.Path}, or filesystem canonicalization.
+     */
+    NativeLibrary loadDynamicLibjava() {
+        String libName = System.mapLibraryName("java");
+        String runtimeLibraryPath = SystemPropertiesSupport.singleton().getBootLibraryPath();
+        if (runtimeLibraryPath != null) {
+            String canonical = SystemPropertiesSupport.joinPath(runtimeLibraryPath, libName);
+            if (addLibrary(canonical, false)) {
+                NativeLibrary lib = findLoadedLibrary(canonical);
+                if (lib != null) {
+                    VMError.guarantee(!lib.isBuiltin());
+                    return lib;
                 }
             }
-            paths = tokens;
         }
-        for (String path : paths) {
-            File libpath = new File(path, libname);
-            if (loadLibrary0(libpath, false)) {
-                return;
-            }
-            File altpath = Target_jdk_internal_loader_ClassLoaderHelper.mapAlternativeName(libpath);
-            if (altpath != null && loadLibrary0(libpath, false)) {
-                return;
-            }
-        }
-        throw new UnsatisfiedLinkError("no " + name + " in java.library.path");
+        throw new UnsatisfiedLinkError("Can't load dynamically linked libjava, using runtime library path: " + runtimeLibraryPath);
     }
 
-    private boolean loadLibrary0(File file, boolean asBuiltin) {
-        String canonical;
-        try {
-            canonical = asBuiltin ? file.getName() : file.getCanonicalPath();
-        } catch (IOException e) {
-            return false;
+    void loadBuiltinLibjava() {
+        if (!addLibrary("java", true)) {
+            throw new UnsatisfiedLinkError("Can't load statically linked libjava.");
         }
-        return addLibrary(asBuiltin, canonical, true);
+    }
+
+    /**
+     * The map {@code LibraryInitializer#onLoadCGlobalDataMap} uses identity equivalence, so we can't just pass on the name argument.
+     */
+    int loadBuiltinLibrary(String name) {
+        for (NativeLibrary known : knownLibraries) {
+            if (name.equals(known.getCanonicalIdentifier())) {
+                return libraryInitializer.initialize(known);
+            }
+        }
+        throw VMError.shouldNotReachHere(String.format("Built-in library %s was not found.", name));
     }
 
     private boolean addLibrary(boolean asBuiltin, String canonical, boolean initialize) {
@@ -198,23 +186,44 @@ public final class NativeLibrarySupport {
         }
     }
 
-    public PointerBase findSymbol(String name) {
+    /**
+     * Returns the loaded library, or {@code null} if it is unknown, failed to load,
+     * or has not yet completed its load and initialization sequence.
+     */
+    private NativeLibrary findLoadedLibrary(String canonical) {
         lock.lock();
         try {
-            for (NativeLibrary lib : knownLibraries) {
-                PointerBase entry = lib.findSymbol(name);
-                if (entry.isNonNull()) {
-                    return entry;
+            for (NativeLibrary loading : currentLoadContext) {
+                if (canonical.equals(loading.getCanonicalIdentifier())) {
+                    return null;
                 }
             }
-            return WordFactory.nullPointer();
+            for (NativeLibrary known : knownLibraries) {
+                if (canonical.equals(known.getCanonicalIdentifier()) && known.isLoaded()) {
+                    return known;
+                }
+            }
+            return null;
         } finally {
             lock.unlock();
         }
     }
 
-    public void registerInitializedBuiltinLibrary(String name) {
-        boolean success = addLibrary(true, name, false);
-        assert success;
+    @Override
+    public PointerBase findSymbol(String name) {
+        lock.lock();
+        try {
+            return findSymbol(knownLibraries, name);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Records a process-wide initialized library in this isolate without invoking its initialization
+     * function again. The library may have been built into the image or dynamically linked.
+     */
+    public void registerInitializedLibrary(String name) {
+        loadLibraryRelative(name, false);
     }
 }

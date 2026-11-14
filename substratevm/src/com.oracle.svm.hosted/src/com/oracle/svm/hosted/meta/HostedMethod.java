@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,32 +24,57 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
-import static com.oracle.svm.core.util.VMError.unimplemented;
+import com.oracle.svm.hosted.DeoptStubGuestValue;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHereAtRuntime;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Executable;
 import java.lang.reflect.Type;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.debug.JavaMethodContext;
-import org.graalvm.compiler.nodes.StructuredGraph;
+import com.oracle.svm.core.BuilderUtil;
+import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
 import com.oracle.graal.pointsto.constraints.UnsupportedFeatureException;
-import com.oracle.graal.pointsto.infrastructure.GraphProvider;
-import com.oracle.graal.pointsto.infrastructure.OriginalMethodProvider;
+import com.oracle.graal.pointsto.infrastructure.ResolvedSignature;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaMethod;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.graal.pointsto.meta.HostedProviders;
-import com.oracle.graal.pointsto.results.StaticAnalysisResults;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.AlwaysInline;
-import com.oracle.svm.core.annotate.StubCallingConvention;
-import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.meta.SharedMethod;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.graal.pointsto.meta.AnalysisMetaAccessExtensionProvider;
+import com.oracle.svm.shared.AlwaysInline;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.core.SkipStackOverflowCheck;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
+import com.oracle.svm.core.code.ImageCodeInfo;
+import com.oracle.svm.core.code.ImageCodeInfoProvider;
+import com.oracle.svm.jvmci.shared.meta.DeoptStub;
+import com.oracle.svm.jvmci.shared.code.CustomCallingConventionMethod;
+import com.oracle.svm.core.graal.code.ExplicitCallingConvention;
+import com.oracle.svm.core.graal.code.StubCallingConvention;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionKind;
+import com.oracle.svm.jvmci.shared.code.SubstrateCallingConventionType;
+import com.oracle.svm.core.graal.phases.SubstrateSafepointInsertionPhase;
+import com.oracle.svm.core.meta.MethodRefSupport;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
+import com.oracle.svm.core.meta.SubstrateMethodPointerConstant;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.hosted.SubstrateBytecodeHandlerStub;
 import com.oracle.svm.hosted.code.CompilationInfo;
+import com.oracle.svm.hosted.code.SubstrateCompilationDirectives;
+import com.oracle.svm.common.meta.MethodVariant;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.GuestAnnotationAccess;
+import com.oracle.svm.util.OriginalMethodProvider;
 
+import jdk.graal.compiler.api.replacements.Snippet;
+import jdk.graal.compiler.debug.Assertions;
+import jdk.graal.compiler.debug.JavaMethodContext;
+import jdk.graal.compiler.java.StableMethodNameFormatter;
+import jdk.internal.vm.annotation.ForceInline;
+import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.ExceptionHandler;
@@ -58,71 +83,165 @@ import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.LineNumberTable;
 import jdk.vm.ci.meta.Local;
 import jdk.vm.ci.meta.LocalVariableTable;
+import jdk.vm.ci.meta.ProfilingInfo;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
-import jdk.vm.ci.meta.Signature;
 import jdk.vm.ci.meta.SpeculationLog;
 
-public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvider, JavaMethodContext, Comparable<HostedMethod>, OriginalMethodProvider {
+public final class HostedMethod extends HostedElement implements SharedMethod, ImageCodeInfoProvider, WrappedJavaMethod, JavaMethodContext, OriginalMethodProvider, MethodVariant {
 
-    public static final String METHOD_NAME_DEOPT_SUFFIX = "**";
+    public static final String METHOD_NAME_COLLISION_SEPARATOR = "%";
+
+    public static final int MISSING_VTABLE_IDX = -1;
+    public static final int INVALID_CODE_ADDRESS_OFFSET = -1;
 
     public final AnalysisMethod wrapped;
 
     private final HostedType holder;
-    private final Signature signature;
+    private final ResolvedSignature<HostedType> signature;
     private final ConstantPool constantPool;
     private final ExceptionHandler[] handlers;
-    protected StaticAnalysisResults staticAnalysisResults;
-    private final boolean hasNeverInlineDirective;
-    protected int vtableIndex = -1;
+    /**
+     * Contains the index of the method computed by {@link VTableBuilder}.
+     *
+     * Within the closed type world, there exists a single table which describes all methods.
+     * However, within the open type world, each type and interface has a unique table, so this
+     * index is relative to the start of the appropriate table.
+     */
+    int computedVTableIndex = MISSING_VTABLE_IDX;
+
+    /**
+     * When using the open type world we must differentiate between the vtable index computed by
+     * {@link VTableBuilder} for this method and the vtable index used for virtual calls.
+     *
+     * Note normally {@code indirectCallTarget == this}. Only for special HotSpot methods such as
+     * miranda and overpass methods will the indirectCallTarget be a different method. The logic for
+     * setting the indirectCallTarget can be found in
+     * {@link com.oracle.svm.hosted.OpenTypeWorldSupport#computeIndirectCallTargets}.
+     *
+     * For additional information, see {@link SharedMethod#getIndirectCallTarget}.
+     */
+    private int indirectCallVTableIndex = MISSING_VTABLE_IDX;
+    private HostedMethod indirectCallTarget = null;
 
     /**
      * The address offset of the compiled code relative to the code of the first method in the
      * buffer.
      */
-    private int codeAddressOffset;
-    private boolean codeAddressOffsetValid;
+    private int codeAddressOffset = INVALID_CODE_ADDRESS_OFFSET;
+    /** Note that {@link #compiledInPriorLayer} does not imply {@link #compiled}. */
     private boolean compiled;
+    private boolean compiledInPriorLayer;
 
     /**
      * All concrete methods that can actually be called when calling this method. This includes all
      * overridden methods in subclasses, as well as this method if it is non-abstract.
+     * <p>
+     * With an open type world analysis the list of implementations is incomplete, i.e., no
+     * aggressive optimizations should be performed based on the contents of this list as one must
+     * assume that additional implementations can be discovered later.
      */
-    protected HostedMethod[] implementations;
+    HostedMethod[] implementations;
 
     public final CompilationInfo compilationInfo;
     private final LocalVariableTable localVariableTable;
 
-    public HostedMethod(HostedUniverse universe, AnalysisMethod wrapped, HostedType holder, Signature signature, ConstantPool constantPool, ExceptionHandler[] handlers) {
+    private final String name;
+    private final String uniqueShortName;
+
+    private final MethodVariantKey methodVariantKey;
+
+    /**
+     * Map from a method variant key to the corresponding method variant implementation. All method
+     * variants for a given Java method share the same map. This allows one to easily switch between
+     * different implementations when needed. When {@code methodVariantsMap} is {@code null}, then
+     * {@link #methodVariantKey} points to {@link #ORIGINAL_METHOD} and no other implementations
+     * exist for the method. This is done to reduce the memory overhead in the common case when only
+     * this one implementation is present.
+     */
+    private volatile Map<MethodVariantKey, MethodVariant> methodVariantsMap;
+
+    @SuppressWarnings("rawtypes") //
+    private static final AtomicReferenceFieldUpdater<HostedMethod, Map> METHOD_VARIANTS_UPDATER = AtomicReferenceFieldUpdater.newUpdater(HostedMethod.class, Map.class, "methodVariantsMap");
+
+    public static final HostedMethod[] EMPTY_ARRAY = new HostedMethod[0];
+
+    static HostedMethod create(HostedUniverse universe, AnalysisMethod wrapped, HostedType holder, ResolvedSignature<HostedType> signature,
+                    ConstantPool constantPool, ExceptionHandler[] handlers) {
+        LocalVariableTable localVariableTable = createLocalVariableTable(universe, wrapped);
+
+        return create0(wrapped, holder, signature, constantPool, handlers, wrapped.getMethodVariantKey(), null, localVariableTable);
+    }
+
+    private static HostedMethod create0(AnalysisMethod wrapped, HostedType holder, ResolvedSignature<HostedType> signature,
+                    ConstantPool constantPool, ExceptionHandler[] handlers, MethodVariantKey key, Map<MethodVariantKey, MethodVariant> methodVariantMap, LocalVariableTable localVariableTable) {
+        var generator = new HostedMethodNameFactory.NameGenerator() {
+
+            @Override
+            public HostedMethodNameFactory.MethodNameInfo generateMethodNameInfo(int collisionCount) {
+                // want name w/o any methodvariantkey suffix
+                String name = wrapped.wrapped.getName();
+                if (key != ORIGINAL_METHOD) {
+                    name += StableMethodNameFormatter.METHOD_VARIANT_KEY_SEPARATOR + key;
+                }
+                if (collisionCount > 0) {
+                    name = name + METHOD_NAME_COLLISION_SEPARATOR + collisionCount;
+                }
+
+                String uniqueShortName = generateUniqueName(name);
+
+                return new HostedMethodNameFactory.MethodNameInfo(name, uniqueShortName);
+            }
+
+            @Override
+            public String generateUniqueName(String name) {
+                boolean isConstructor = wrapped.isConstructor();
+                return BuilderUtil.uniqueShortName(holder.getJavaClass().getClassLoader(), holder, name, signature, isConstructor);
+            }
+        };
+
+        HostedMethodNameFactory.MethodNameInfo names = HostedMethodNameFactory.singleton().createNames(generator, wrapped);
+
+        return new HostedMethod(wrapped, holder, signature, constantPool, handlers, names.name(), names.uniqueShortName(), localVariableTable, key, methodVariantMap);
+    }
+
+    private static LocalVariableTable createLocalVariableTable(HostedUniverse universe, AnalysisMethod wrapped) {
+        LocalVariableTable lvt = wrapped.getLocalVariableTable();
+        if (lvt == null) {
+            return null;
+        }
+        try {
+            Local[] origLocals = lvt.getLocals();
+            Local[] newLocals = new Local[origLocals.length];
+            for (int i = 0; i < newLocals.length; ++i) {
+                Local origLocal = origLocals[i];
+                JavaType origType = origLocal.getType();
+                if (!universe.contains(origType)) {
+                    throw new UnsupportedFeatureException("No HostedType for given AnalysisType");
+                }
+                HostedType newType = universe.lookup(origType);
+                newLocals[i] = new Local(origLocal.getName(), newType, origLocal.getStartBCI(), origLocal.getEndBCI(), origLocal.getSlot());
+            }
+            return new LocalVariableTable(newLocals);
+        } catch (UnsupportedFeatureException e) {
+            return null;
+        }
+    }
+
+    private HostedMethod(AnalysisMethod wrapped, HostedType holder, ResolvedSignature<HostedType> signature, ConstantPool constantPool,
+                    ExceptionHandler[] handlers, String name, String uniqueShortName, LocalVariableTable localVariableTable, MethodVariantKey methodVariantKey,
+                    Map<MethodVariantKey, MethodVariant> methodVariantsMap) {
         this.wrapped = wrapped;
         this.holder = holder;
         this.signature = signature;
         this.constantPool = constantPool;
         this.handlers = handlers;
         this.compilationInfo = new CompilationInfo(this);
-
-        LocalVariableTable newLocalVariableTable = null;
-        if (wrapped.getLocalVariableTable() != null) {
-            try {
-                Local[] origLocals = wrapped.getLocalVariableTable().getLocals();
-                Local[] newLocals = new Local[origLocals.length];
-                for (int i = 0; i < newLocals.length; ++i) {
-                    Local origLocal = origLocals[i];
-                    JavaType origType = origLocal.getType();
-                    if (!universe.contains(origType)) {
-                        throw new UnsupportedFeatureException("No HostedType for given AnalysisType");
-                    }
-                    HostedType newType = universe.lookup(origType);
-                    newLocals[i] = new Local(origLocal.getName(), newType, origLocal.getStartBCI(), origLocal.getEndBCI(), origLocal.getSlot());
-                }
-                newLocalVariableTable = new LocalVariableTable(newLocals);
-            } catch (UnsupportedFeatureException e) {
-                newLocalVariableTable = null;
-            }
-        }
-        localVariableTable = newLocalVariableTable;
-        hasNeverInlineDirective = SubstrateUtil.NativeImageLoadingShield.isNeverInline(wrapped);
+        this.localVariableTable = localVariableTable;
+        this.name = name;
+        this.uniqueShortName = uniqueShortName;
+        this.methodVariantKey = methodVariantKey;
+        this.methodVariantsMap = methodVariantsMap;
     }
 
     @Override
@@ -135,9 +254,10 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
     }
 
     public void setCodeAddressOffset(int address) {
-        assert isCompiled();
+        assert isCompiled() || isCompiledInPriorLayer();
+        assert codeAddressOffset == INVALID_CODE_ADDRESS_OFFSET && address != INVALID_CODE_ADDRESS_OFFSET : Assertions.errorMessage(codeAddressOffset, address);
+
         codeAddressOffset = address;
-        codeAddressOffsetValid = true;
     }
 
     /**
@@ -145,22 +265,42 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
      * the buffer.
      */
     public int getCodeAddressOffset() {
-        if (!codeAddressOffsetValid) {
+        if (!isCodeAddressOffsetValid()) {
             throw VMError.shouldNotReachHere(format("%H.%n(%p)") + ": has no code address offset set.");
         }
         return codeAddressOffset;
     }
 
     public boolean isCodeAddressOffsetValid() {
-        return codeAddressOffsetValid;
+        return codeAddressOffset != INVALID_CODE_ADDRESS_OFFSET;
     }
 
     public void setCompiled() {
         this.compiled = true;
     }
 
+    /**
+     * Whether the method has been compiled in the current build or layer, but {@code false} if it
+     * was only {@linkplain #isCompiledInPriorLayer() compiled in a prior layer}.
+     */
     public boolean isCompiled() {
         return compiled;
+    }
+
+    public void setCompiledInPriorLayer() {
+        this.compiledInPriorLayer = true;
+    }
+
+    /**
+     * Whether the method has been compiled in a prior layer, but if so, that does not imply
+     * {@link #isCompiled}.
+     */
+    public boolean isCompiledInPriorLayer() {
+        return compiledInPriorLayer;
+    }
+
+    public String getUniqueShortName() {
+        return uniqueShortName;
     }
 
     /*
@@ -168,23 +308,39 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
      */
     public void clear() {
         compilationInfo.clear();
-        staticAnalysisResults = null;
     }
 
     @Override
-    public int getCodeOffsetInImage() {
-        throw unimplemented();
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public ImageCodeInfo getImageCodeInfo() {
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
-    public int getDeoptOffsetInImage() {
-        HostedMethod deoptTarget = compilationInfo.getDeoptTargetMethod();
+    public boolean forceIndirectCall() {
+        /*
+         * Methods delayed to the application layer need to be called indirectly as they are not
+         * available in the current layer.
+         */
+        return isCompiledInPriorLayer() || wrapped.isDelayed();
+    }
+
+    @Override
+    public boolean hasImageCodeOffset() {
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public int getImageCodeOffset() {
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
+    }
+
+    @Override
+    public int getImageCodeDeoptOffset() {
         int result = 0;
+        HostedMethod deoptTarget = getMethodVariant(SubstrateCompilationDirectives.DEOPT_TARGET_METHOD);
         if (deoptTarget != null && deoptTarget.isCodeAddressOffsetValid()) {
             result = deoptTarget.getCodeAddressOffset();
-            assert result != 0;
-        } else if (compilationInfo.isDeoptTarget()) {
-            result = getCodeAddressOffset();
             assert result != 0;
         }
         return result;
@@ -202,31 +358,86 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
 
     @Override
     public boolean isDeoptTarget() {
-        return compilationInfo.isDeoptTarget();
+        return SubstrateCompilationDirectives.isDeoptTarget(this);
     }
 
     @Override
     public boolean canDeoptimize() {
-        return compilationInfo.canDeoptForTesting();
+        return compilationInfo.canDeoptForTesting() || methodVariantKey == SubstrateCompilationDirectives.RUNTIME_COMPILED_METHOD;
+    }
+
+    @Override
+    public boolean isUninterruptible() {
+        return UninterruptibleAnnotationUtils.isUninterruptible(wrapped);
+    }
+
+    @Override
+    public boolean needSafepointCheck() {
+        return SubstrateSafepointInsertionPhase.needSafepointCheck(wrapped);
+    }
+
+    @Override
+    public boolean isLambdaFormCompiled() {
+        return AnalysisMetaAccessExtensionProvider.isLambdaFormCompiledMethod(this);
+    }
+
+    @Override
+    public boolean needStackOverflowCheck() {
+        return SharedMethod.super.needStackOverflowCheck() && !GuestAnnotationAccess.isAnnotationPresent(this, SkipStackOverflowCheck.class);
+    }
+
+    @Override
+    public boolean isForeignCallTarget() {
+        return GuestAnnotationAccess.isAnnotationPresent(this, SubstrateForeignCallTarget.class);
+    }
+
+    @Override
+    public boolean isSnippet() {
+        return GuestAnnotationAccess.isAnnotationPresent(this, Snippet.class);
     }
 
     public boolean hasVTableIndex() {
-        return vtableIndex != -1;
+        return indirectCallVTableIndex != MISSING_VTABLE_IDX;
     }
 
     @Override
     public int getVTableIndex() {
-        assert vtableIndex != -1;
-        return vtableIndex;
+        assert hasVTableIndex() : "Missing vtable index for method " + this.format("%H.%n(%p)");
+        return indirectCallVTableIndex;
+    }
+
+    public void setIndirectCallTarget(HostedMethod alias) {
+        assert indirectCallTarget == null : indirectCallTarget;
+        if (!alias.equals(this)) {
+            /*
+             * When there is an indirectCallTarget installed which is not the original method, we
+             * currently expect the target method to either have an interface as its declaring class
+             * or for the declaring class to be unchanged. If the declaring class is different, then
+             * we must ensure that the layout of the vtable matches for all relevant indexes between
+             * the original and alias methods' declaring classes.
+             */
+            VMError.guarantee(alias.getDeclaringClass().isInterface() || alias.getDeclaringClass().equals(getDeclaringClass()), "Invalid indirect call target for %s: %s", this, alias);
+        }
+        indirectCallTarget = alias;
     }
 
     @Override
-    public Deoptimizer.StubType getDeoptStubType() {
-        Deoptimizer.DeoptStub stubAnnotation = getAnnotation(Deoptimizer.DeoptStub.class);
+    public HostedMethod getIndirectCallTarget() {
+        Objects.requireNonNull(indirectCallTarget);
+        return indirectCallTarget;
+    }
+
+    void finalizeIndirectCallVTableIndex() {
+        indirectCallVTableIndex = indirectCallTarget.computedVTableIndex;
+    }
+
+    @Override
+    public DeoptStub.StubType getDeoptStubType() {
+        DeoptStubGuestValue stubAnnotation = DeoptStubGuestValue.get(this);
         if (stubAnnotation != null) {
             return stubAnnotation.stubType();
         }
-        return Deoptimizer.StubType.NoDeoptStub;
+        return DeoptStub.StubType.NoDeoptStub;
     }
 
     /**
@@ -235,7 +446,19 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
      */
     @Override
     public boolean isEntryPoint() {
-        return wrapped.isEntryPoint();
+        return wrapped.isNativeEntryPoint();
+    }
+
+    @Override
+    public SubstrateCallingConventionKind getCallingConventionKind() {
+        return ExplicitCallingConvention.Util.getCallingConventionKind(wrapped, isEntryPoint());
+    }
+
+    @Override
+    public SubstrateCallingConventionType getCustomCallingConventionType() {
+        VMError.guarantee(getCallingConventionKind().isCustom(), "%s does not have a custom calling convention.", name);
+        VMError.guarantee(wrapped.getWrapped() instanceof CustomCallingConventionMethod, "%s has a custom calling convention but doesn't implement %s", name, CustomCallingConventionMethod.class);
+        return ((CustomCallingConventionMethod) wrapped.getWrapped()).getCallingConvention();
     }
 
     @Override
@@ -244,26 +467,32 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
     }
 
     @Override
+    public boolean isBytecodeHandlerStub() {
+        return wrapped.getWrapped() instanceof SubstrateBytecodeHandlerStub;
+    }
+
+    @Override
     public String getName() {
-        if (compilationInfo.isDeoptTarget()) {
-            return wrapped.getName() + METHOD_NAME_DEOPT_SUFFIX;
-        }
+        return name;
+    }
+
+    /**
+     * Returns the original name of the method, without any suffix that might have been added by
+     * {@link HostedMethodNameFactory}.
+     */
+    public String getReflectionName() {
+        VMError.guarantee(this.isOriginalMethod());
         return wrapped.getName();
     }
 
     @Override
-    public Signature getSignature() {
+    public ResolvedSignature<HostedType> getSignature() {
         return signature;
     }
 
     @Override
-    public StructuredGraph buildGraph(DebugContext debug, ResolvedJavaMethod method, HostedProviders providers, Purpose purpose) {
-        return wrapped.buildGraph(debug, method, providers, purpose);
-    }
-
-    @Override
-    public boolean allowRuntimeCompilation() {
-        return wrapped.allowRuntimeCompilation();
+    public JavaType[] toParameterTypes() {
+        throw JVMCIError.shouldNotReachHere("ResolvedJavaMethod.toParameterTypes returns the wrong result for constructors.");
     }
 
     @Override
@@ -312,6 +541,11 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
     }
 
     @Override
+    public boolean isDeclared() {
+        return wrapped.isDeclared();
+    }
+
+    @Override
     public boolean isClassInitializer() {
         return wrapped.isClassInitializer();
     }
@@ -323,7 +557,14 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
 
     @Override
     public boolean canBeStaticallyBound() {
-        return implementations.length == 1 && implementations[0].equals(this);
+        if (holder.universe.hostVM().isClosedTypeWorld()) {
+            return implementations.length == 1 && implementations[0].equals(this);
+        }
+        /*
+         * In open type world analysis we cannot make assumptions based on discovered
+         * implementations.
+         */
+        return wrapped.canBeStaticallyBound();
     }
 
     @Override
@@ -337,38 +578,13 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
     }
 
     @Override
-    public StaticAnalysisResults getProfilingInfo() {
-        return staticAnalysisResults;
-    }
-
-    @Override
-    public StaticAnalysisResults getProfilingInfo(boolean includeNormal, boolean includeOSR) {
-        return staticAnalysisResults;
+    public ProfilingInfo getProfilingInfo(boolean includeNormal, boolean includeOSR) {
+        return null;
     }
 
     @Override
     public ConstantPool getConstantPool() {
         return constantPool;
-    }
-
-    @Override
-    public Annotation[] getAnnotations() {
-        return wrapped.getAnnotations();
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return wrapped.getDeclaredAnnotations();
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return wrapped.getAnnotation(annotationClass);
-    }
-
-    @Override
-    public Annotation[][] getParameterAnnotations() {
-        return wrapped.getParameterAnnotations();
     }
 
     @Override
@@ -378,22 +594,27 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
 
     @Override
     public boolean canBeInlined() {
-        return !hasNeverInlineDirective();
+        return wrapped.canBeInlined();
     }
 
     @Override
     public boolean hasNeverInlineDirective() {
-        return hasNeverInlineDirective;
+        return wrapped.hasNeverInlineDirective();
     }
 
     @Override
     public boolean shouldBeInlined() {
-        return getAnnotation(AlwaysInline.class) != null;
+        return GuestAnnotationAccess.isAnnotationPresent(this, AlwaysInline.class) || GuestAnnotationAccess.isAnnotationPresent(this, ForceInline.class);
     }
+
+    private LineNumberTable lineNumberTable;
 
     @Override
     public LineNumberTable getLineNumberTable() {
-        return wrapped.getLineNumberTable();
+        if (lineNumberTable == null) {
+            lineNumberTable = wrapped.getLineNumberTable();
+        }
+        return lineNumberTable;
     }
 
     @Override
@@ -408,31 +629,27 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
 
     @Override
     public void reprofile() {
-        throw unimplemented();
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public boolean isInVirtualMethodTable(ResolvedJavaType resolved) {
-        /*
-         * This method is used by Graal to decide if method-based inlining guards are possible. As
-         * long as getEncoding() is unimplemented, this method needs to return false.
-         */
-        return false;
+        return hasVTableIndex();
     }
 
     @Override
     public Constant getEncoding() {
-        throw unimplemented();
+        return new SubstrateMethodPointerConstant(MethodRefSupport.createMethodPointer(this));
     }
 
     @Override
     public boolean isDefault() {
-        throw unimplemented();
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public SpeculationLog getSpeculationLog() {
-        throw shouldNotReachHere();
+        throw shouldNotReachHereAtRuntime(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
@@ -446,44 +663,71 @@ public class HostedMethod implements SharedMethod, WrappedJavaMethod, GraphProvi
     }
 
     @Override
-    public int compareTo(HostedMethod other) {
-        if (this.equals(other)) {
-            return 0;
-        }
-
-        /*
-         * Sort deoptimization targets towards the end of the code cache. They are rarely executed,
-         * and we do not want a deoptimization target as the first method (because offset 0 means no
-         * deoptimization target available).
-         */
-        int result = Boolean.compare(this.compilationInfo.isDeoptTarget(), other.compilationInfo.isDeoptTarget());
-
-        if (result == 0) {
-            result = this.getDeclaringClass().compareTo(other.getDeclaringClass());
-        }
-        if (result == 0) {
-            result = this.getName().compareTo(other.getName());
-        }
-        if (result == 0) {
-            result = this.getSignature().getParameterCount(false) - other.getSignature().getParameterCount(false);
-        }
-        if (result == 0) {
-            for (int i = 0; i < this.getSignature().getParameterCount(false); i++) {
-                result = ((HostedType) this.getSignature().getParameterType(i, null)).compareTo((HostedType) other.getSignature().getParameterType(i, null));
-                if (result != 0) {
-                    break;
-                }
-            }
-        }
-        if (result == 0) {
-            result = ((HostedType) this.getSignature().getReturnType(null)).compareTo((HostedType) other.getSignature().getReturnType(null));
-        }
-        assert result != 0;
-        return result;
+    public ResolvedJavaMethod unwrapTowardsOriginalMethod() {
+        return wrapped;
     }
 
     @Override
-    public Executable getJavaMethod() {
-        return OriginalMethodProvider.getJavaMethod(getDeclaringClass().universe.getSnippetReflection(), wrapped);
+    public MethodVariantKey getMethodVariantKey() {
+        return methodVariantKey;
+    }
+
+    void setMethodVariantsMap(ConcurrentHashMap<MethodVariantKey, MethodVariant> newMethodVariantsMap) {
+        VMError.guarantee(methodVariantsMap == null, "Resetting already initialized methods variant map.");
+        if (!METHOD_VARIANTS_UPDATER.compareAndSet(this, null, newMethodVariantsMap)) {
+            throw VMError.shouldNotReachHere("unable to set methodVariantsMap");
+        }
+    }
+
+    @Override
+    public HostedMethod getOrCreateMethodVariant(MethodVariantKey key) {
+        if (key == methodVariantKey) {
+            return this;
+        }
+
+        if (methodVariantsMap == null) {
+            ConcurrentHashMap<MethodVariantKey, MethodVariant> newMethodVariantsMap = new ConcurrentHashMap<>();
+            newMethodVariantsMap.put(methodVariantKey, this);
+            METHOD_VARIANTS_UPDATER.compareAndSet(this, null, newMethodVariantsMap);
+        }
+
+        return (HostedMethod) methodVariantsMap.computeIfAbsent(key, (k) -> {
+            HostedMethod newMethodVariant = create0(wrapped, holder, signature, constantPool, handlers, k, methodVariantsMap, localVariableTable);
+            newMethodVariant.implementations = implementations;
+            newMethodVariant.computedVTableIndex = computedVTableIndex;
+            newMethodVariant.indirectCallTarget = indirectCallTarget;
+            newMethodVariant.indirectCallVTableIndex = indirectCallVTableIndex;
+            return newMethodVariant;
+        });
+    }
+
+    @Override
+    public HostedMethod getMethodVariant(MethodVariantKey key) {
+        if (key == methodVariantKey) {
+            return this;
+        } else if (methodVariantsMap == null) {
+            return null;
+        } else {
+            return (HostedMethod) methodVariantsMap.get(key);
+        }
+    }
+
+    @Override
+    public Collection<MethodVariant> getAllMethodVariants() {
+        if (methodVariantsMap == null) {
+            return Collections.singleton(this);
+        } else {
+            return methodVariantsMap.values();
+        }
+    }
+
+    @Override
+    public CFunctionPointer getAOTEntrypoint() {
+        throw VMError.intentionallyUnimplemented();
+    }
+
+    @Override
+    public ResolvedJavaMethod getInterpreterMethod() {
+        return null;
     }
 }

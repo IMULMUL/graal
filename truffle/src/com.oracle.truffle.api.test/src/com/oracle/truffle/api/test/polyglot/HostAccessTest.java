@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,9 +40,11 @@
  */
 package com.oracle.truffle.api.test.polyglot;
 
+import static com.oracle.truffle.api.test.common.AbstractExecutableTestLanguage.evalTestLanguage;
 import static com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest.assertFails;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
@@ -50,18 +52,26 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.math.BigInteger;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -69,29 +79,81 @@ import java.util.function.Predicate;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.HostAccess;
+import org.graalvm.polyglot.HostAccess.Builder;
 import org.graalvm.polyglot.HostAccess.Export;
 import org.graalvm.polyglot.HostAccess.Implementable;
+import org.graalvm.polyglot.HostAccess.MutableTargetMapping;
 import org.graalvm.polyglot.HostAccess.TargetMappingPrecedence;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.TypeLiteral;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.proxy.ProxyArray;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
+import org.graalvm.polyglot.proxy.ProxyHashMap;
+import org.graalvm.polyglot.proxy.ProxyIterator;
 import org.graalvm.polyglot.proxy.ProxyObject;
-import org.junit.After;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.interop.UnsupportedMessageException;
+import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.test.common.AbstractExecutableTestLanguage;
+import com.oracle.truffle.api.test.common.NullObject;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 import com.oracle.truffle.tck.tests.ValueAssert;
 import com.oracle.truffle.tck.tests.ValueAssert.Trait;
 
-public class HostAccessTest {
+public class HostAccessTest extends AbstractHostAccessTest {
+
+    public static final String INSTANTIATION_FAILED = "Instantiation failed";
+    public static final String RETURNED_STRING = "Returned string";
+
     public static class OK {
         public int value = 42;
     }
 
     public static class Ban {
         public int value = 24;
+    }
+
+    public static class SelectiveAccess {
+
+        public int allowedField = 42;
+        public int deniedField = 43;
+
+        public SelectiveAccess() {
+        }
+
+        public SelectiveAccess(int value) {
+            allowedField = value;
+        }
+
+        public String allowedMethod() {
+            return "allowed";
+        }
+
+        public String deniedMethod() {
+            return "denied";
+        }
+
+        public String overloaded(String value) {
+            return value;
+        }
+
+        public int overloaded(int value) {
+            return value;
+        }
+
+        @Export
+        public String annotatedMethod() {
+            return "annotated";
+        }
+
+        public String explicitlyAllowedMethod() {
+            return "explicit";
+        }
     }
 
     @Test
@@ -110,18 +172,177 @@ public class HostAccessTest {
     }
 
     @Test
+    public void usefulToStringConstrained() {
+        assertEquals("HostAccess.CONSTRAINED", HostAccess.CONSTRAINED.toString());
+    }
+
+    @Test
+    public void usefulToStringIsolated() {
+        assertEquals("HostAccess.ISOLATED", HostAccess.ISOLATED.toString());
+    }
+
+    @Test
+    public void usefulToStringUntrusted() {
+        assertEquals("HostAccess.UNTRUSTED", HostAccess.UNTRUSTED.toString());
+    }
+
+    @Test
     public void constantsCanBeCopied() {
         verifyObjectImpl(HostAccess.NONE);
         verifyObjectImpl(HostAccess.EXPLICIT);
+        verifyObjectImpl(HostAccess.SCOPED);
         verifyObjectImpl(HostAccess.ALL);
     }
 
-    private static void verifyObjectImpl(HostAccess access) {
-        HostAccess otherAccess = HostAccess.newBuilder(access).build();
-        assertNotSame(access, otherAccess);
-        assertEquals(access, otherAccess);
-        assertEquals(access.hashCode(), otherAccess.hashCode());
-        assertNotNull(access.toString());
+    @Test
+    public void allowSelectedPublicMembers() throws Exception {
+        Predicate<Member> methodSelector = member -> member instanceof Method method && (method.getName().equals("allowedMethod") ||
+                        (method.getName().equals("overloaded") && Arrays.equals(method.getParameterTypes(), new Class<?>[]{String.class})));
+        Predicate<Member> fieldSelector = member -> member instanceof Field field && field.getName().equals("allowedField");
+        Predicate<Member> constructorSelector = member -> member instanceof Constructor<?> constructor && constructor.getParameterCount() == 0;
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(methodSelector.or(fieldSelector).or(constructorSelector)).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertTrue(value.hasMember("allowedMethod"));
+        assertEquals("allowed", value.invokeMember("allowedMethod").asString());
+        assertFalse(value.hasMember("deniedMethod"));
+        assertTrue(value.hasMember("allowedField"));
+        assertEquals(42, value.getMember("allowedField").asInt());
+        assertFalse(value.hasMember("deniedField"));
+        assertEquals("selected", value.invokeMember("overloaded", "selected").asString());
+        assertTrue(value.canInvokeMember("overloaded(java.lang.String)"));
+        assertFalse(value.canInvokeMember("overloaded(int)"));
+
+        Value type = context.asValue(SelectiveAccess.class);
+        assertTrue(type.canInstantiate());
+        assertTrue(type.newInstance().asHostObject() instanceof SelectiveAccess);
+        assertFails(() -> type.newInstance(42), IllegalArgumentException.class);
+    }
+
+    @Test
+    public void selectedPublicMembersComposeWithExistingAccessRules() throws Exception {
+        Predicate<Member> selector = member -> member.getName().equals("allowedMethod");
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(selector).allowAccess(SelectiveAccess.class.getMethod("explicitlyAllowedMethod")).allowAccessAnnotatedBy(Export.class).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertEquals("allowed", value.invokeMember("allowedMethod").asString());
+        assertEquals("annotated", value.invokeMember("annotatedMethod").asString());
+        assertEquals("explicit", value.invokeMember("explicitlyAllowedMethod").asString());
+        assertFalse(value.hasMember("deniedMethod"));
+    }
+
+    @Test
+    public void denyAccessOverridesSelectedPublicMembers() {
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> true).denyAccess(SelectiveAccess.class).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertFalse(value.hasMember("allowedMethod"));
+        assertFalse(value.hasMember("allowedField"));
+    }
+
+    @Test
+    public void publicAccessPredicateOverridesPreviousConfiguration() {
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> true).allowPublicAccess(true).allowPublicAccess(member -> member.getName().equals("allowedMethod")).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertEquals("allowed", value.invokeMember("allowedMethod").asString());
+        assertFalse(value.hasMember("deniedMethod"));
+    }
+
+    @Test
+    public void unrestrictedPublicAccessOverridesPredicate() {
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> false).allowPublicAccess(true).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertEquals("denied", value.invokeMember("deniedMethod").asString());
+        assertEquals(43, value.getMember("deniedField").asInt());
+    }
+
+    @Test
+    public void alwaysTruePublicAccessPredicateMatchesUnrestrictedPublicAccess() {
+        Set<String> unrestrictedMembers = getPrivatePointMembers(HostAccess.newBuilder().allowPublicAccess(true).build());
+        Set<String> predicateMembers = getPrivatePointMembers(HostAccess.newBuilder().allowPublicAccess(member -> true).build());
+        assertEquals(unrestrictedMembers, predicateMembers);
+    }
+
+    private Set<String> getPrivatePointMembers(HostAccess access) {
+        setupEnv(access);
+        Value point = context.asValue(new PrivatePoint());
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+        return new HashSet<>(point.getMemberKeys());
+    }
+
+    @Test
+    public void disabledPublicAccessOverridesPredicate() {
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> true).allowPublicAccess(false).build();
+        setupEnv(access);
+
+        Value value = context.asValue(new SelectiveAccess());
+        assertFalse(value.hasMember("allowedMethod"));
+        assertFalse(value.hasMember("allowedField"));
+    }
+
+    @Test
+    public void publicAccessPredicateError() {
+        IllegalArgumentException error = new IllegalArgumentException();
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> {
+            throw error;
+        }).build();
+        setupEnv(access);
+
+        try {
+            context.asValue(new SelectiveAccess()).hasMember("allowedMethod");
+            fail();
+        } catch (PolyglotException e) {
+            assertTrue(e.isHostException());
+            assertSame(error, e.asHostException());
+        }
+    }
+
+    static class SelectiveBridgeBase {
+
+        public String inherited(String value) {
+            return value;
+        }
+
+        public String varargs(String... values) {
+            return String.join("", values);
+        }
+    }
+
+    public static final class SelectiveBridgeSubclass extends SelectiveBridgeBase {
+    }
+
+    static class SelectiveGenericBridgeBase<T> {
+
+        public T generic(T value) {
+            return value;
+        }
+    }
+
+    public static final class SelectiveGenericBridgeSubclass extends SelectiveGenericBridgeBase<String> {
+    }
+
+    @Test
+    public void selectedPublicBridgeMethods() {
+        assertTrue(Arrays.stream(SelectiveBridgeSubclass.class.getDeclaredMethods()).anyMatch(Method::isBridge));
+        assertTrue(Arrays.stream(SelectiveGenericBridgeSubclass.class.getDeclaredMethods()).anyMatch(Method::isBridge));
+        HostAccess access = HostAccess.newBuilder().allowPublicAccess(member -> member instanceof Method method &&
+                        (method.getName().equals("inherited") || method.getName().equals("varargs") || method.getName().equals("generic"))).build();
+        setupEnv(access);
+
+        Value bridge = context.asValue(new SelectiveBridgeSubclass());
+        assertEquals("inherited", bridge.invokeMember("inherited", "inherited").asString());
+        assertEquals("varargs", bridge.invokeMember("varargs", (Object) new String[]{"var", "args"}).asString());
+        Value genericBridge = context.asValue(new SelectiveGenericBridgeSubclass());
+        assertEquals("generic", genericBridge.invokeMember("generic", "generic").asString());
     }
 
     public static class MyEquals {
@@ -349,7 +570,7 @@ public class HostAccessTest {
             fail();
         } catch (UnsupportedOperationException e) {
         }
-        assertEquals(0, value.getMemberKeys().size());
+        assertEquals(2 /* arr.length and arr.clone(). */, value.getMemberKeys().size());
         ValueAssert.assertValue(value, false, Trait.ARRAY_ELEMENTS, Trait.ITERABLE, Trait.MEMBERS, Trait.HOST_OBJECT);
     }
 
@@ -370,6 +591,65 @@ public class HostAccessTest {
         Value value = context.asValue(array);
         assertSame(array, value.asHostObject());
         ValueAssert.assertValue(value, false, Trait.MEMBERS, Trait.HOST_OBJECT);
+    }
+
+    @Test
+    public void testBufferAccessEnabled() {
+        setupEnv(HostAccess.newBuilder().allowBufferAccess(true));
+        assertBufferAccessEnabled(context);
+    }
+
+    @Test
+    public void testBufferAccessEnabledHostAccessCloned() {
+        HostAccess hostAccess = HostAccess.newBuilder().allowBufferAccess(true).build();
+        setupEnv(HostAccess.newBuilder(hostAccess));
+        assertBufferAccessEnabled(context);
+    }
+
+    private static void assertBufferAccessEnabled(Context context) {
+        ByteBuffer buffer = ByteBuffer.allocate(2);
+        buffer.put((byte) 42);
+        Value value = context.asValue(buffer);
+        assertTrue(value.hasBufferElements());
+        assertTrue(value.isBufferWritable());
+        assertEquals(2, value.getBufferSize());
+        assertEquals(42, value.readBufferByte(0));
+        value.writeBufferByte(1, (byte) 24);
+        assertEquals(24, value.readBufferByte(1));
+        ValueAssert.assertValue(value, false, Trait.BUFFER_ELEMENTS, Trait.MEMBERS, Trait.HOST_OBJECT);
+    }
+
+    @Test
+    public void testBufferAccessDisabled() {
+        setupEnv(HostAccess.newBuilder().allowBufferAccess(false));
+        ByteBuffer buffer = ByteBuffer.allocate(2);
+        Value value = context.asValue(buffer);
+        assertSame(buffer, value.asHostObject());
+        ValueAssert.assertValue(value, false, Trait.MEMBERS, Trait.HOST_OBJECT);
+    }
+
+    /*
+     * Test for GR-32346.
+     */
+    @Test
+    public void testBuilderCannotChangeMembersAndTargetMappingsOfHostAccess() throws Exception {
+        // Set up hostAccess
+        Builder builder = HostAccess.newBuilder();
+        builder.allowAccess(OK.class.getField("value"));
+        builder.targetTypeMapping(Value.class, String.class, (v) -> v.isString(), (v) -> "foo");
+        HostAccess hostAccess = builder.build();
+
+        // Try to change members or targetMappings through child builder
+        Builder childBuilder = HostAccess.newBuilder(hostAccess);
+        childBuilder.allowAccess(Ban.class.getField("value"));
+        childBuilder.targetTypeMapping(Value.class, Integer.class, null, (v) -> 42);
+
+        // Ensure hostAccess has not been altered by child builder
+        try (Context c = Context.newBuilder().allowHostAccess(hostAccess).build()) {
+            assertAccess(c);
+            assertEquals("foo", c.asValue("a string").as(String.class));
+            assertEquals(123, (int) c.asValue(123).as(Integer.class));
+        }
     }
 
     @Test
@@ -484,7 +764,7 @@ public class HostAccessTest {
 
     @Test
     public void testMapAccessDisabled() {
-        setupEnv(HostAccess.newBuilder().allowIterableAccess(false));
+        setupEnv(HostAccess.newBuilder().allowMapAccess(false));
         assertMapAccessDisabled(context);
     }
 
@@ -532,34 +812,6 @@ public class HostAccessTest {
         ValueAssert.assertValue(value, false, Trait.MEMBERS, Trait.HOST_OBJECT);
     }
 
-    private Context context;
-
-    private void setupEnv(HostAccess.Builder builder) {
-        tearDown();
-        if (builder != null) {
-            builder.allowImplementationsAnnotatedBy(FunctionalInterface.class);
-            builder.allowImplementationsAnnotatedBy(HostAccess.Implementable.class);
-            builder.allowAccessAnnotatedBy(HostAccess.Export.class);
-            HostAccess access = builder.build();
-            verifyObjectImpl(access);
-            setupEnv(access);
-        }
-    }
-
-    private void setupEnv(HostAccess access) {
-        tearDown();
-        verifyObjectImpl(access);
-        context = Context.newBuilder().allowHostAccess(access).build();
-    }
-
-    @After
-    public void tearDown() {
-        if (context != null) {
-            context.close();
-            context = null;
-        }
-    }
-
     public static final class TargetClass1 {
 
         private final Object o;
@@ -578,7 +830,7 @@ public class HostAccessTest {
     }
 
     @SuppressWarnings("static-method")
-    public static final class MultiMethod1 {
+    public static final class MethodVariant1 {
         @Export
         public TargetClass1 m(TargetClass1 arg0) {
             return arg0;
@@ -591,7 +843,7 @@ public class HostAccessTest {
     }
 
     @SuppressWarnings("static-method")
-    public static final class MultiMethod2 {
+    public static final class MethodVariant2 {
         @Export
         public Object m(@SuppressWarnings("unused") TargetClass1 arg0, Object arg1) {
             return arg1;
@@ -638,7 +890,7 @@ public class HostAccessTest {
         builder.targetTypeMapping(String.class, TargetClass1.class, (v) -> v.equals("42"), (v) -> new TargetClass1(v));
         builder.targetTypeMapping(String.class, TargetClass2.class, (v) -> v.equals("43"), (v) -> new TargetClass2(v));
         setupEnv(builder);
-        methods = context.asValue(new MultiMethod1());
+        methods = context.asValue(new MethodVariant1());
         assertEquals(TargetClass1.class, methods.invokeMember("m", "42").asHostObject().getClass());
         assertEquals(TargetClass2.class, methods.invokeMember("m", "43").asHostObject().getClass());
 
@@ -647,7 +899,7 @@ public class HostAccessTest {
         builder.targetTypeMapping(String.class, TargetClass1.class, (v) -> v.equals("42"), (v) -> new TargetClass1(v));
         builder.targetTypeMapping(String.class, TargetClass2.class, (v) -> v.equals("42"), (v) -> new TargetClass2(v));
         setupEnv(builder);
-        methods = context.asValue(new MultiMethod1());
+        methods = context.asValue(new MethodVariant1());
         try {
             methods.invokeMember("m", "42");
             fail();
@@ -658,7 +910,7 @@ public class HostAccessTest {
         builder = HostAccess.newBuilder();
         builder.targetTypeMapping(String.class, TargetClass1.class, null, (v) -> new TargetClass1(v));
         setupEnv(builder);
-        methods = context.asValue(new MultiMethod2());
+        methods = context.asValue(new MethodVariant2());
         assertEquals("42", methods.invokeMember("m", "42", "42").asString());
         assertEquals(42, methods.invokeMember("m", "42", 42).asInt());
     }
@@ -695,7 +947,7 @@ public class HostAccessTest {
 
     }
 
-    static final TypeLiteral<List<TargetClass1>> TARGET_CLASS_LIST = new TypeLiteral<List<TargetClass1>>() {
+    static final TypeLiteral<List<TargetClass1>> TARGET_CLASS_LIST = new TypeLiteral<>() {
     };
 
     @Test
@@ -730,10 +982,10 @@ public class HostAccessTest {
         assertEquals("422", list.get(1).o);
     }
 
-    static final TypeLiteral<Map<String, TargetClass1>> TARGET_CLASS_MAP_STRING = new TypeLiteral<Map<String, TargetClass1>>() {
+    static final TypeLiteral<Map<String, TargetClass1>> TARGET_CLASS_MAP_STRING = new TypeLiteral<>() {
     };
 
-    static final TypeLiteral<Map<Long, TargetClass1>> TARGET_CLASS_MAP_LONG = new TypeLiteral<Map<Long, TargetClass1>>() {
+    static final TypeLiteral<Map<Long, TargetClass1>> TARGET_CLASS_MAP_LONG = new TypeLiteral<>() {
     };
 
     @Test
@@ -821,6 +1073,9 @@ public class HostAccessTest {
         assertEquals("422", map.get("f1").o);
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @Implementable
     public interface ConverterProxy {
 
@@ -862,6 +1117,9 @@ public class HostAccessTest {
         assertEquals("422", map.f1().o);
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @FunctionalInterface
     public interface ConverterFunction {
 
@@ -884,6 +1142,58 @@ public class HostAccessTest {
         });
         ConverterFunction f = identity.as(ConverterFunction.class);
         assertEquals("42", f.m("42").o);
+    }
+
+    public static class OverloadedFunctionalMethod implements Function<String, Object> {
+        @Export
+        @Override
+        public Object apply(String arg0) {
+            return arg0;
+        }
+
+        @Export
+        public Object apply(int intArg) {
+            return intArg;
+        }
+
+        @Export
+        public Object apply(@SuppressWarnings("unused") String arg0, Object arg1) {
+            return arg1;
+        }
+    }
+
+    @Test
+    public void testOverloadedFunctionalMethod() throws Exception {
+        setupEnv(HostAccess.EXPLICIT);
+
+        Value function = context.asValue(new OverloadedFunctionalMethod());
+        function.execute("ok");
+        // when calling a functional interface implementation, only dispatch to implementations of
+        // the single abstract method and not other methods with the same name in the subclass.
+        assertFails(() -> function.execute(42), Exception.class, e -> {
+            assertTrue(e instanceof IllegalArgumentException);
+            assertTrue(e.getMessage(), e.getMessage().contains("Cannot convert '42'(language: Java, type: java.lang.Integer)"));
+        });
+        assertFails(() -> function.execute("ok", "not ok"), IllegalArgumentException.class);
+
+        // of course, this does not apply when invoking "apply" as a method.
+        assertEquals("ok", function.invokeMember("apply", "ok").asString());
+        assertEquals(42, function.invokeMember("apply", 42).asInt());
+        assertEquals("also ok", function.invokeMember("apply", "ok", "also ok").asString());
+
+        // explicitly invoke overloads using qualified parameter types
+        for (String methodNameWithParams : new String[]{
+                        "apply(java.lang.String)",
+                        "apply(int)",
+                        "apply(java.lang.String,java.lang.Object)"}) {
+            assertTrue(methodNameWithParams, function.canInvokeMember(methodNameWithParams));
+        }
+        assertEquals("ok", function.invokeMember("apply(java.lang.String)", "ok").asString());
+        assertEquals(42, function.invokeMember("apply(int)", 42).asInt());
+        assertEquals("also ok", function.invokeMember("apply(java.lang.String,java.lang.Object)", "ok", "also ok").asString());
+
+        // [GR-42882] bridge method apply(Object) for Function.apply(T) not exposed anymore.
+        assertFalse("apply(java.lang.Object)", function.hasMember("apply(java.lang.Object)"));
     }
 
     static class CountingPredicate implements Predicate<Value> {
@@ -947,7 +1257,7 @@ public class HostAccessTest {
         HostAccess.Builder builder = HostAccess.newBuilder();
         builder.allowPublicAccess(true);
         final IllegalArgumentException error = new IllegalArgumentException();
-        Predicate<Integer> errorAccepts = new Predicate<Integer>() {
+        Predicate<Integer> errorAccepts = new Predicate<>() {
             public boolean test(Integer t) {
                 error.initCause(new RuntimeException());
                 throw error;
@@ -1015,6 +1325,13 @@ public class HostAccessTest {
 
     @Test
     public void testConverterReturnsNull() {
+        /*
+         * HotSpot uses GuestToHostCodeCache#methodHandleHostInvoke and SVM uses
+         * GuestToHostCodeCache#reflectionHostInvoke. These two methods throw a different exception
+         * when a null value is passed as a method int argument. The former throws
+         * NullPointerException during automatic unboxing, the latter throws
+         * IllegalArgumentException.
+         */
         HostAccess.Builder builder = HostAccess.newBuilder();
         builder.targetTypeMapping(Integer.class, Integer.class, (v) -> v.equals(42), (v) -> {
             return null;
@@ -1025,7 +1342,7 @@ public class HostAccessTest {
             fail();
         } catch (PolyglotException e) {
             assertTrue(e.isHostException());
-            assertTrue(e.asHostException() instanceof NullPointerException);
+            assertTrue(TruffleTestAssumptions.isAOT() ? e.asHostException() instanceof IllegalArgumentException : e.asHostException() instanceof NullPointerException);
         }
 
         assertNull(context.asValue(42).as(int.class));
@@ -1083,29 +1400,32 @@ public class HostAccessTest {
         Function<Void, String> convertedFunction = (a) -> "ConvertedFunction";
 
         setupEnv(HostAccess.ALL);
-        assertEquals("OriginalFunction", ((Function<Void, String>) context.asValue(new TestProxyExecutable()).as(Function.class)).apply(null));
+        assertEquals("OriginalFunction", context.asValue(new TestProxyExecutable()).as(Function.class).apply(null));
 
         setupEnv(HostAccess.newBuilder().targetTypeMapping(Value.class, Function.class, null,
                         (v) -> convertedFunction, TargetMappingPrecedence.HIGHEST));
-        assertEquals("ConvertedFunction", ((Function<Void, String>) context.asValue(new TestProxyExecutable()).as(Function.class)).apply(null));
+        assertEquals("ConvertedFunction", context.asValue(new TestProxyExecutable()).as(Function.class).apply(null));
 
         setupEnv(HostAccess.newBuilder().targetTypeMapping(Value.class, Function.class, null,
                         (v) -> convertedFunction, TargetMappingPrecedence.HIGH));
-        assertEquals("ConvertedFunction", ((Function<Void, String>) context.asValue(new TestProxyExecutable()).as(Function.class)).apply(null));
+        assertEquals("ConvertedFunction", context.asValue(new TestProxyExecutable()).as(Function.class).apply(null));
 
         setupEnv(HostAccess.newBuilder().targetTypeMapping(Value.class, Function.class, null,
                         (v) -> convertedFunction, TargetMappingPrecedence.LOW));
-        assertEquals("ConvertedFunction", ((Function<Void, String>) context.asValue(new TestProxyExecutable()).as(Function.class)).apply(null));
+        assertEquals("ConvertedFunction", context.asValue(new TestProxyExecutable()).as(Function.class).apply(null));
 
         setupEnv(HostAccess.newBuilder().targetTypeMapping(Value.class, Function.class, null,
                         (v) -> convertedFunction, TargetMappingPrecedence.LOWEST));
-        assertEquals("OriginalFunction", ((Function<Void, String>) context.asValue(new TestProxyExecutable()).as(Function.class)).apply(null));
+        assertEquals("OriginalFunction", context.asValue(new TestProxyExecutable()).as(Function.class).apply(null));
     }
 
     public static class NoCoercion {
 
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @Implementable
     public interface TestInterface {
 
@@ -1561,25 +1881,6 @@ public class HostAccessTest {
     }
 
     @Test
-    public void testReturnsNull() {
-        HostAccess.Builder builder = HostAccess.newBuilder();
-        builder.targetTypeMapping(Integer.class, Integer.class, (v) -> v.equals(42), (v) -> {
-            return null;
-        });
-        setupEnv(builder);
-        try {
-            context.asValue(new PassPrimitive()).invokeMember("f0", 42);
-            fail();
-        } catch (PolyglotException e) {
-            assertTrue(e.isHostException());
-            assertTrue(e.asHostException() instanceof NullPointerException);
-        }
-
-        assertNull(context.asValue(42).as(int.class));
-        assertEquals(43, context.asValue(43).asInt());
-    }
-
-    @Test
     public void testPassNullValue() {
         HostAccess.Builder builder = HostAccess.newBuilder();
         AtomicInteger invoked = new AtomicInteger();
@@ -1666,6 +1967,253 @@ public class HostAccessTest {
         c2.close();
     }
 
+    @Test
+    public void testInterfaceMethodExportsWithInheritance() {
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(true).build());
+
+        Value point;
+        point = context.asValue(new BarePoint());
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(new AnnotatedPoint());
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(new PrivatePoint());
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+    }
+
+    @Test
+    public void testInterfaceMethodExportsWithNoInheritance() {
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(false).build());
+
+        Value point;
+        point = context.asValue(new BarePoint());
+        assertFalse(point.hasMember("x"));
+        assertFalse(point.hasMember("y"));
+        assertFalse(point.canInvokeMember("x"));
+        assertFalse(point.canInvokeMember("y"));
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(new AnnotatedPoint());
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(new PrivatePoint());
+        assertFalse(point.canInvokeMember("x"));
+        assertFalse(point.canInvokeMember("y"));
+        assertEquals(44, point.invokeMember("z").asInt());
+    }
+
+    public interface PointInterface {
+        @Export
+        int x();
+
+        @Export
+        int y();
+
+        @Export
+        default int z() {
+            return 44;
+        }
+    }
+
+    public static class BarePoint implements PointInterface {
+        @Override
+        public int x() {
+            return 42;
+        }
+
+        @Override
+        public int y() {
+            return 43;
+        }
+    }
+
+    public static class AnnotatedPoint implements PointInterface {
+        @Export
+        @Override
+        public int x() {
+            return 42;
+        }
+
+        @Export
+        @Override
+        public int y() {
+            return 43;
+        }
+    }
+
+    static class PrivatePoint implements PointInterface {
+        @Export
+        @Override
+        public int x() {
+            return 42;
+        }
+
+        public int y() {
+            return 43;
+        }
+    }
+
+    /**
+     * Referenced in {@code proxy-config.json}.
+     */
+    public interface ProxiedPoint {
+        /** Not exported. */
+        default int w() {
+            return 41;
+        }
+
+        @Export
+        int x();
+
+        @Export
+        default int y() {
+            return 43;
+        }
+
+        @Export
+        default int z() {
+            return 44;
+        }
+    }
+
+    /**
+     * Referenced in {@code proxy-config.json}.
+     */
+    public interface ProxiedPoint2 extends ProxiedPoint {
+        @Export
+        @Override
+        int x();
+
+        /** Exported in {@link ProxiedPoint} but not in {@link ProxiedPoint2}. */
+        @Override
+        int z();
+    }
+
+    @Test
+    public void testProxyInterfaceMethodExportInheritance() {
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(false).build());
+
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        InvocationHandler invocationHandler = (proxy, method, args) -> {
+            if (method.getName().equals("x")) {
+                return 42;
+            } else if (method.getName().equals("y")) {
+                return 43;
+            } else if (method.getName().equals("z")) {
+                return 44;
+            } else {
+                throw new IllegalArgumentException(method.getName());
+            }
+        };
+
+        Object proxy = Proxy.newProxyInstance(classLoader, new Class<?>[]{ProxiedPoint.class}, invocationHandler);
+        Value point;
+        point = context.asValue(proxy);
+        assertFalse(point.canInvokeMember("w"));
+        assertFalse(point.canInvokeMember("x"));
+        assertFalse(point.canInvokeMember("y"));
+        assertFalse(point.canInvokeMember("z"));
+
+        Object proxy2 = Proxy.newProxyInstance(classLoader, new Class<?>[]{ProxiedPoint2.class}, invocationHandler);
+        point = context.asValue(proxy2);
+        assertFalse(point.canInvokeMember("w"));
+        assertFalse(point.canInvokeMember("x"));
+        assertFalse(point.canInvokeMember("y"));
+        assertFalse(point.canInvokeMember("z"));
+
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(true).build());
+
+        point = context.asValue(proxy);
+        assertFalse(point.canInvokeMember("w"));
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(proxy2);
+        assertFalse(point.canInvokeMember("w"));
+        assertEquals(42, point.invokeMember("x").asInt());
+        // @Export on ProxiedPoint.x is inherited
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+    }
+
+    @FunctionalInterface
+    public interface LambdaInterface {
+        /** Not exported. */
+        default int w() {
+            return 41;
+        }
+
+        @Export
+        int x();
+
+        @Export
+        default int y() {
+            return 43;
+        }
+
+        @Export
+        default int z() {
+            return 44;
+        }
+    }
+
+    @FunctionalInterface
+    public interface LambdaInterface2 extends LambdaInterface {
+        @Export
+        @Override
+        int x();
+
+        /** Exported in {@link LambdaInterface} but not in {@link LambdaInterface2}. */
+        @Override
+        default int z() {
+            return 44;
+        }
+    }
+
+    @Test
+    public void testLambdaInterfaceMethodExportInheritance() {
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(false).build());
+
+        LambdaInterface lambda = () -> 42;
+        Value point;
+        point = context.asValue(lambda);
+        assertFalse(point.canInvokeMember("w"));
+        assertFalse(point.canInvokeMember("x"));
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        LambdaInterface2 lambda2 = () -> 42;
+        point = context.asValue(lambda2);
+        assertFalse(point.canInvokeMember("w"));
+        assertFalse(point.canInvokeMember("x"));
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertFalse(point.canInvokeMember("z"));
+
+        setupEnv(HostAccess.newBuilder(HostAccess.EXPLICIT).allowAccessInheritance(true).build());
+
+        point = context.asValue(lambda);
+        assertFalse(point.canInvokeMember("w"));
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+
+        point = context.asValue(lambda2);
+        assertFalse(point.canInvokeMember("w"));
+        assertEquals(42, point.invokeMember("x").asInt());
+        assertEquals(43, point.invokeMember("y").asInt());
+        assertEquals(44, point.invokeMember("z").asInt());
+    }
+
     public static class MyClassLoader extends URLClassLoader {
         public MyClassLoader(URL[] urls) {
             super(urls);
@@ -1715,6 +2263,474 @@ public class HostAccessTest {
         @Override
         public Iterator<T> iterator() {
             return new IteratorImpl<>(values);
+        }
+    }
+
+    public abstract static class NoArgumentConstructorTestClass {
+        public NoArgumentConstructorTestClass() {
+        }
+
+        public String returnString() {
+            return RETURNED_STRING;
+        }
+    }
+
+    public static class NoArgumentConstructorTestSubClass extends NoArgumentConstructorTestClass {
+    }
+
+    public abstract static class ArgumentConstructorTestClass {
+        private final String str;
+
+        public ArgumentConstructorTestClass(String str) {
+            this.str = str;
+        }
+
+        public String returnString() {
+            return str;
+        }
+    }
+
+    public static class ArgumentConstructorTestSubClass extends ArgumentConstructorTestClass {
+        public ArgumentConstructorTestSubClass(String str) {
+            super(str);
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class NoArgAbstractClassInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            try {
+                Object classObj = env.lookupHostSymbol(NoArgumentConstructorTestClass.class.getName());
+                interop.instantiate(classObj);
+                fail();
+            } catch (UnsupportedMessageException e) {
+                return INSTANTIATION_FAILED;
+            }
+            return null;
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class NoArgSubclassInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            Object classObj = env.lookupHostSymbol(NoArgumentConstructorTestSubClass.class.getName());
+            Object obj = interop.instantiate(classObj);
+            return interop.invokeMember(obj, "returnString");
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class ArgAbstractClassInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            try {
+                Object classObj = env.lookupHostSymbol(ArgumentConstructorTestClass.class.getName());
+                interop.instantiate(classObj, RETURNED_STRING);
+                fail();
+            } catch (UnsupportedMessageException e) {
+                return INSTANTIATION_FAILED;
+            }
+            return null;
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class ArgSubclassInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            Object classObj = env.lookupHostSymbol(ArgumentConstructorTestSubClass.class.getName());
+            Object obj = interop.instantiate(classObj, RETURNED_STRING);
+            return interop.invokeMember(obj, "returnString");
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class NoArgAdapterInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            Object classObj = env.lookupHostSymbol(NoArgumentConstructorTestClass.class.getName());
+            classObj = env.createHostAdapter(new Object[]{classObj});
+            Object obj = interop.instantiate(classObj, NullObject.SINGLETON);
+            return interop.invokeMember(obj, "returnString");
+        }
+    }
+
+    @TruffleLanguage.Registration
+    static class ArgAdapterInstantiationTestLanguage extends AbstractExecutableTestLanguage {
+
+        @Override
+        @CompilerDirectives.TruffleBoundary
+        protected Object execute(RootNode node, Env env, Object[] contextArguments, Object[] frameArguments) throws Exception {
+            Object classObj = env.lookupHostSymbol(ArgumentConstructorTestClass.class.getName());
+            classObj = env.createHostAdapter(new Object[]{classObj});
+            Object obj = interop.instantiate(classObj, RETURNED_STRING, NullObject.SINGLETON);
+            return interop.invokeMember(obj, "returnString");
+        }
+    }
+
+    @Test
+    public void testNoArgAbstractClassInstantiation() {
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(INSTANTIATION_FAILED, evalTestLanguage(c, NoArgAbstractClassInstantiationTestLanguage.class, "no argument constructor abstract class failure").asString());
+        }
+    }
+
+    @Test
+    public void testNoArgSubclassInstantiation() {
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(RETURNED_STRING, evalTestLanguage(c, NoArgSubclassInstantiationTestLanguage.class, "no argument constructor sub class success").asString());
+        }
+    }
+
+    @Test
+    public void testArgAbstractClassInstantiation() {
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(INSTANTIATION_FAILED, evalTestLanguage(c, ArgAbstractClassInstantiationTestLanguage.class, "argument constructor abstract class failure").asString());
+        }
+    }
+
+    @Test
+    public void testArgSubclassInstantiation() {
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(RETURNED_STRING, evalTestLanguage(c, ArgSubclassInstantiationTestLanguage.class, "argument constructor sub class success").asString());
+        }
+    }
+
+    @Test
+    public void testNoArgAdapterInstantiation() {
+        TruffleTestAssumptions.assumeNotAOT();
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(RETURNED_STRING, evalTestLanguage(c, NoArgAdapterInstantiationTestLanguage.class, "no argument constructor adapter success").asString());
+        }
+    }
+
+    @Test
+    public void testArgAdapterInstantiation() {
+        TruffleTestAssumptions.assumeNotAOT();
+        try (Context c = Context.newBuilder().allowAllAccess(true).build()) {
+            assertEquals(RETURNED_STRING, evalTestLanguage(c, ArgAdapterInstantiationTestLanguage.class, "argument constructor adapter success").asString());
+        }
+    }
+
+    @Test
+    public void testHostFunctionDisplayName() {
+        try (Context cxt = Context.newBuilder().allowHostAccess(HostAccess.ALL).allowHostClassLookup((s) -> true).build()) {
+            assertEquals(BigInteger.class.getName() + ".valueOf", cxt.asValue(BigInteger.class).getMember("static").getMember("valueOf").toString());
+            assertEquals(Class.class.getName() + ".getName", cxt.asValue(BigInteger.class).getMember("getName").toString());
+            assertEquals(BigInteger.class.getName() + ".add", cxt.asValue(BigInteger.ZERO).getMember("add").toString());
+            assertEquals(int[].class.getName() + ".clone", cxt.asValue(new int[0]).getMember("clone").toString());
+        }
+    }
+
+    public static class StringMapTestObject {
+
+        public String s0;
+        public String s1;
+
+        StringMapTestObject(String s0, String s1) {
+            this.s0 = s0;
+            this.s1 = s1;
+        }
+
+    }
+
+    static final class Executable implements ProxyExecutable {
+
+        public Object execute(Value... arguments) {
+            return null;
+        }
+
+    }
+
+    static final class IteratorTO implements ProxyIterator {
+
+        public boolean hasNext() {
+            return false;
+        }
+
+        public Object getNext() throws NoSuchElementException, UnsupportedOperationException {
+            return null;
+        }
+
+    }
+
+    /*
+     * Referenced in proxy-config.json
+     */
+    @FunctionalInterface
+    interface FuncInterface {
+        void execute();
+    }
+
+    /*
+     * Referenced in proxy-config.json
+     */
+    interface HostMembers {
+    }
+
+    @Test
+    public void testMutableObjectMapping() {
+        for (MutableTargetMapping m : MutableTargetMapping.values()) {
+            testMutableObjectMappingEnabled(m);
+            testMutableObjectMappingDisabled(m);
+        }
+    }
+
+    public void testMutableObjectMappingDisabled(MutableTargetMapping mapping) {
+        MutableTargetMapping[] allowed = new MutableTargetMapping[MutableTargetMapping.values().length - 1];
+        int i = 0;
+        for (MutableTargetMapping m : MutableTargetMapping.values()) {
+            if (m != mapping) {
+                allowed[i++] = m;
+            }
+        }
+        setupEnv(HostAccess.newBuilder(HostAccess.ALL).allowMutableTargetMappings(allowed).build());
+
+        ProxyArray array = ProxyArray.fromArray();
+        StringMapTestObject stringMap = new StringMapTestObject("a", "b");
+
+        switch (mapping) {
+            case ARRAY_TO_JAVA_LIST:
+                Value v1 = context.asValue(array);
+                assertFails(() -> v1.as(List.class), ClassCastException.class);
+                break;
+            case ITERABLE_TO_JAVA_ITERABLE:
+                Value v2 = context.asValue(array);
+                assertFails(() -> v2.as(Iterable.class), ClassCastException.class);
+                break;
+            case ITERATOR_TO_JAVA_ITERATOR:
+                IteratorTO it = new IteratorTO();
+                Value v3 = context.asValue(it);
+                assertFails(() -> v3.as(Iterator.class), ClassCastException.class);
+                break;
+            case HASH_TO_JAVA_MAP:
+                Object hash = ProxyHashMap.from(new HashMap<>());
+                Value v4 = context.asValue(hash);
+                assertFails(() -> v4.as(Map.class), ClassCastException.class);
+                break;
+            case MEMBERS_TO_JAVA_MAP:
+                Value v5 = context.asValue(stringMap);
+                assertFails(() -> v5.as(Map.class), ClassCastException.class);
+                break;
+            case EXECUTABLE_TO_JAVA_INTERFACE:
+                Value v6 = context.asValue(new Executable());
+                assertFails(() -> v6.as(FuncInterface.class), ClassCastException.class);
+                break;
+            case MEMBERS_TO_JAVA_INTERFACE:
+                Value v7 = context.asValue(ProxyObject.fromMap(new HashMap<>()));
+                assertFails(() -> v7.as(HostMembers.class), ClassCastException.class);
+                break;
+            default:
+                fail("No test for target mapping " + mapping);
+        }
+    }
+
+    private void testMutableObjectMappingEnabled(MutableTargetMapping mapping) {
+        setupEnv(HostAccess.newBuilder(HostAccess.ALL).allowMutableTargetMappings(mapping).build());
+        Object array = ProxyArray.fromArray();
+        StringMapTestObject stringMap = new StringMapTestObject("a", "b");
+        Value v = null;
+        switch (mapping) {
+            case ARRAY_TO_JAVA_LIST:
+                v = context.asValue(array);
+                assertNotNull(v.as(List.class));
+                break;
+            case ITERABLE_TO_JAVA_ITERABLE:
+                v = context.asValue(array);
+                assertNotNull(v.as(Iterable.class));
+                break;
+            case ITERATOR_TO_JAVA_ITERATOR:
+                IteratorTO it = new IteratorTO();
+                v = context.asValue(it);
+                assertNotNull(v.as(Iterator.class));
+                break;
+            case HASH_TO_JAVA_MAP:
+                Object hash = ProxyHashMap.from(new HashMap<>());
+                v = context.asValue(hash);
+                assertNotNull(v.as(Map.class));
+                break;
+            case MEMBERS_TO_JAVA_MAP:
+                v = context.asValue(stringMap);
+                assertNotNull(v.as(Map.class));
+                break;
+            case EXECUTABLE_TO_JAVA_INTERFACE:
+                v = context.asValue(new Executable());
+                assertNotNull(v.as(FuncInterface.class));
+                break;
+            case MEMBERS_TO_JAVA_INTERFACE:
+                v = context.asValue(ProxyObject.fromMap(new HashMap<>()));
+                assertNotNull(v.as(HostMembers.class));
+                break;
+            default:
+                fail("No test for target mapping " + mapping);
+        }
+    }
+
+    /**
+     * Target type mappings with lower precedence than default are still applied even if mutable
+     * default mappings are disabled.
+     */
+
+    @Test
+    public void testMutableObjectWithCustomTargetType() {
+        for (MutableTargetMapping m : MutableTargetMapping.values()) {
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.HIGHEST, true, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.HIGH, true, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.LOW, true, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.LOWEST, true, true);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.HIGHEST, false, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.HIGH, false, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.LOW, false, false);
+            testMutableObjectWithCustomTargetType(m, TargetMappingPrecedence.LOWEST, false, false);
+        }
+    }
+
+    private void testMutableObjectWithCustomTargetType(MutableTargetMapping mapping, TargetMappingPrecedence precedence, boolean defaultEnabled, boolean defaultApplied) {
+        HostAccess.Builder habuilder = HostAccess.newBuilder(HostAccess.ALL);
+        if (!defaultEnabled) {
+            habuilder.allowMutableTargetMappings();
+        }
+        Value v;
+        switch (mapping) {
+            case ARRAY_TO_JAVA_LIST:
+                habuilder = setupTargetTypeMapping(habuilder, List.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(ProxyArray.fromArray());
+                assertTargetType(List.class, v, defaultApplied);
+                break;
+            case ITERABLE_TO_JAVA_ITERABLE:
+                habuilder = setupTargetTypeMapping(habuilder, Iterable.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(ProxyArray.fromArray());
+                assertTargetType(Iterable.class, v, defaultApplied);
+                break;
+            case ITERATOR_TO_JAVA_ITERATOR:
+                habuilder = setupTargetTypeMapping(habuilder, Iterator.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(new IteratorTO());
+                assertTargetType(Iterator.class, v, defaultApplied);
+                break;
+            case HASH_TO_JAVA_MAP:
+                habuilder = setupTargetTypeMapping(habuilder, Map.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(ProxyHashMap.from(new HashMap<>()));
+                assertTargetType(Map.class, v, defaultApplied);
+                break;
+            case MEMBERS_TO_JAVA_MAP:
+                habuilder = setupTargetTypeMapping(habuilder, Map.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(new StringMapTestObject("a", "b"));
+                assertTargetType(Map.class, v, defaultApplied);
+                break;
+            case EXECUTABLE_TO_JAVA_INTERFACE:
+                habuilder = setupTargetTypeMapping(habuilder, FuncInterface.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(new Executable());
+                assertTargetType(FuncInterface.class, v, defaultApplied);
+                break;
+            case MEMBERS_TO_JAVA_INTERFACE:
+                habuilder = setupTargetTypeMapping(habuilder, HostMembers.class, precedence);
+                setupEnv(habuilder.build());
+                v = context.asValue(ProxyObject.fromMap(new HashMap<>()));
+                assertTargetType(HostMembers.class, v, defaultApplied);
+                break;
+            default:
+                fail("No test for target mapping " + mapping);
+        }
+    }
+
+    private static final Map<?, ?> customMap = Map.of("replaced", "a");
+    private static final List<?> customList = List.of("replaced");
+    private static final Iterable<?> customIterable = new Iterable<>() {
+        public Iterator<Object> iterator() {
+            return customIterator;
+        }
+    };
+    private static final Iterator<Object> customIterator = new Iterator<>() {
+        public boolean hasNext() {
+            return false;
+        }
+
+        public Object next() {
+            return null;
+        }
+    };
+    private static final FuncInterface customFunctional = new FuncInterface() {
+        public void execute() {
+        }
+    };
+    private static final HostMembers customHostMembers = new HostMembers() {
+    };
+
+    private static HostAccess.Builder setupTargetTypeMapping(HostAccess.Builder builder, Class<?> c, TargetMappingPrecedence precedence) {
+        if (c == Map.class) {
+            return builder.targetTypeMapping(Value.class, Map.class, null, (s) -> {
+                return customMap;
+            }, precedence);
+        }
+        if (c == List.class) {
+            return builder.targetTypeMapping(Value.class, List.class, null, (s) -> {
+                return customList;
+            }, precedence);
+        }
+        if (c == Iterable.class) {
+            return builder.targetTypeMapping(Value.class, Iterable.class, null, (s) -> {
+                return customIterable;
+            }, precedence);
+        }
+        if (c == Iterator.class) {
+            return builder.targetTypeMapping(Value.class, Iterator.class, null, (s) -> {
+                return customIterator;
+            }, precedence);
+        }
+        if (c == FuncInterface.class) {
+            return builder.targetTypeMapping(Value.class, FuncInterface.class, null, (s) -> {
+                return customFunctional;
+            }, precedence);
+        }
+        if (c == HostMembers.class) {
+            return builder.targetTypeMapping(Value.class, HostMembers.class, null, (s) -> {
+                return customHostMembers;
+            }, precedence);
+        }
+        fail("No target type mapping for " + c.getName());
+        return null;
+    }
+
+    private static void assertTargetType(Class<?> c, Value v, boolean defaultApplied) {
+        Object customTarget = null;
+        if (c == Map.class) {
+            customTarget = customMap;
+        } else if (c == List.class) {
+            customTarget = customList;
+        } else if (c == Iterable.class) {
+            customTarget = customIterable;
+        } else if (c == Iterator.class) {
+            customTarget = customIterator;
+        } else if (c == FuncInterface.class) {
+            customTarget = customFunctional;
+        } else if (c == HostMembers.class) {
+            customTarget = customHostMembers;
+        } else {
+            fail("No target type assert for " + c.getName());
+        }
+
+        if (defaultApplied) {
+            assertNotEquals(customTarget, v.as(c));
+        } else {
+            assertEquals(customTarget, v.as(c));
         }
     }
 }

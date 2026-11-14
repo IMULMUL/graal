@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,7 +31,10 @@ import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CFieldAddress;
 import org.graalvm.nativeimage.c.struct.CStruct;
+import org.graalvm.nativeimage.c.type.CLongPointer;
+import org.graalvm.nativeimage.c.type.VoidPointer;
 import org.graalvm.word.PointerBase;
 
 import com.oracle.svm.core.RegisterDumper;
@@ -48,6 +51,12 @@ public class ErrHandlingAPI {
     @CFunction(transition = NO_TRANSITION)
     public static native PointerBase AddVectoredContinueHandler(int first, CFunctionPointer handler);
 
+    @CFunction(transition = NO_TRANSITION)
+    public static native CFunctionPointer SetUnhandledExceptionFilter(CFunctionPointer handler);
+
+    @CFunction
+    public static native void RaiseException(int dwExceptionCode, int dwExceptionFlags, int nNumberOfArguments, CLongPointer lpArguments);
+
     @CConstant
     public static native int EXCEPTION_CONTINUE_SEARCH();
 
@@ -62,14 +71,29 @@ public class ErrHandlingAPI {
     }
 
     /** Contains a description of the exception. */
-    @CStruct
+    @CStruct(isIncomplete = true)
     public interface EXCEPTION_RECORD extends PointerBase {
         @CField
         int ExceptionCode();
+
+        @CField
+        VoidPointer ExceptionAddress();
+
+        @CField
+        int NumberParameters();
+
+        @CFieldAddress
+        CLongPointer ExceptionInformation();
     }
 
     @CConstant
     public static native int EXCEPTION_ACCESS_VIOLATION();
+
+    @CConstant
+    public static native int EXCEPTION_IN_PAGE_ERROR();
+
+    @CConstant
+    public static native int EXCEPTION_STACK_OVERFLOW();
 
     /** Contains processor-specific register data. */
     @CStruct

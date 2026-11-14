@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -44,10 +44,15 @@ import java.util.List;
 
 public final class DarwinLinker extends Driver {
 
-    public static final String LD = "/usr/bin/ld";
+    public static final String LLD = "lld";
+    public static final String LD64_LLD = "ld64.lld";
 
     private DarwinLinker() {
-        super(LD, false);
+        super(LD64_LLD);
+    }
+
+    public static List<String> getLinkerFlags() {
+        return Arrays.asList("--lto-O0");
     }
 
     public static void link(String[] args) {
@@ -58,8 +63,6 @@ public final class DarwinLinker extends Driver {
         List<String> sulongArgs = new ArrayList<>();
         sulongArgs.add(exe);
         sulongArgs.add("-L" + getSulongHome().resolve(ClangLike.NATIVE_PLATFORM).resolve("lib"));
-        sulongArgs.add("-lto_library");
-        sulongArgs.add(getLLVMBinDir().resolve("..").resolve("lib").resolve("libLTO.dylib").toString());
         List<String> userArgs = Arrays.asList(args);
         boolean verbose = userArgs.contains("-v");
         runDriver(sulongArgs, userArgs, verbose, false, false);
@@ -81,7 +84,7 @@ public final class DarwinLinker extends Driver {
                     String newOutput = tempDir.resolve("temp.out").toString();
                     List<String> newUserArgs = newUserArgs(userArgs, newOutput, linkerOptionPrefix, outputFlagPos);
                     driver.runDriverReturn(sulongArgs, newUserArgs, verb, hlp, earlyexit);
-                    String bcFile = newOutput + ".lto.bc";
+                    String bcFile = newOutput + ".0.5.precodegen.bc";
                     if (Files.exists(Paths.get(bcFile))) {
                         sulongArgs.add(linkerOptionPrefix + "-sectcreate");
                         sulongArgs.add(linkerOptionPrefix + "__LLVM");
@@ -91,7 +94,7 @@ public final class DarwinLinker extends Driver {
                 } catch (Exception e) {
                     // something went wrong -- let the normal driver run fail
                     if (verb) {
-                        System.err.println("Running clang with `-save-temps` failed: " + e);
+                        driver.log("Running clang with `-save-temps` failed: " + e);
                     }
                 }
             }
@@ -99,7 +102,7 @@ public final class DarwinLinker extends Driver {
         } catch (IOException e) {
             returnCode = 1;
         } catch (Exception e) {
-            System.err.println("Exception: " + e);
+            driver.log("Exception: " + e);
             returnCode = 1;
         } finally {
             if (tempDir != null) {
@@ -107,7 +110,7 @@ public final class DarwinLinker extends Driver {
                     Files.walk(tempDir).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
                 } catch (IOException e) {
                     if (verb) {
-                        System.err.println("Deleting the temporary directory (" + tempDir + ") failed: " + e);
+                        driver.log("Deleting the temporary directory (" + tempDir + ") failed: " + e);
                     }
                 }
             }

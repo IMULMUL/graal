@@ -27,16 +27,18 @@ package com.oracle.svm.core.heap;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.RuntimeCodeCache.CodeInfoVisitor;
+import com.oracle.svm.core.code.RuntimeCodeInfoAccess;
+import com.oracle.svm.core.code.RuntimeCodeInfoHistory;
+import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
 import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.meta.SpeculationLog.SpeculationReason;
-
-import com.oracle.svm.core.code.RuntimeCodeInfoAccess;
-import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
 
 /**
  * Cleans the code cache and frees the unmanaged memory that is used by {@link CodeInfo} objects.
@@ -50,7 +52,7 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
      * <ul>
      * <li>{@link SpeculationReason} objects are embedded in the code and only needed when a
      * deoptimization is triggered.</li>
-     * <li>{@link SharedRuntimeMethod} objects are sometimes used as artifical methods (e.g., for
+     * <li>{@link SharedRuntimeMethod} objects are sometimes used as artificial methods (e.g., for
      * adapter code) and are located in the frame info object constants.</li>
      * </ul>
      */
@@ -61,26 +63,36 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
     }
 
     @Override
-    public <T extends CodeInfo> boolean visitCode(T codeInfo) {
+    @Uninterruptible(reason = "Avoid unnecessary safepoint checks in GC for performance.")
+    public void visitCode(CodeInfo codeInfo) {
         if (RuntimeCodeInfoAccess.areAllObjectsOnImageHeap(codeInfo)) {
-            return true;
+            return;
         }
 
         int state = CodeInfoAccess.getState(codeInfo);
-        if (state == CodeInfo.STATE_UNREACHABLE) {
-            freeMemory(codeInfo);
-        } else if (state == CodeInfo.STATE_READY_FOR_INVALIDATION) {
-            // All objects that are accessed during invalidation must still be reachable.
-            CodeInfoTable.invalidateNonStackCodeAtSafepoint(codeInfo);
-            assert CodeInfoAccess.getState(codeInfo) == CodeInfo.STATE_PARTIALLY_FREED;
-            freeMemory(codeInfo);
+        if (state == CodeInfo.STATE_PENDING_FREE || state == CodeInfo.STATE_PENDING_REMOVAL_FROM_CODE_CACHE) {
+            clean(codeInfo, state);
         }
-        return true;
+    }
+
+    @Uninterruptible(reason = "Removal, invalidation and logging are not marked uninterruptible.", mayBeInlined = true, calleeMustBe = false)
+    private static void clean(CodeInfo codeInfo, int state) {
+        if (state == CodeInfo.STATE_PENDING_FREE) {
+            freeMemory(codeInfo);
+            return;
+        }
+
+        VMError.guarantee(state == CodeInfo.STATE_PENDING_REMOVAL_FROM_CODE_CACHE);
+        // All objects that are accessed during invalidation must still be reachable.
+        CodeInfoTable.invalidateNonStackCodeAtSafepoint(codeInfo);
+        assert CodeInfoAccess.getState(codeInfo) == CodeInfo.STATE_REMOVED_FROM_CODE_CACHE;
+        freeMemory(codeInfo);
     }
 
     private static void freeMemory(CodeInfo codeInfo) {
         boolean removed = RuntimeCodeInfoMemory.singleton().removeDuringGC(codeInfo);
         assert removed : "must have been present";
-        RuntimeCodeInfoAccess.releaseMethodInfoMemory(codeInfo, false);
+        RuntimeCodeInfoHistory.singleton().logFree(codeInfo);
+        RuntimeCodeInfoAccess.free(codeInfo);
     }
 }

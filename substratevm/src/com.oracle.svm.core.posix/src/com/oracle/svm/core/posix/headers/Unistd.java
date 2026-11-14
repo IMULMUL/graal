@@ -36,6 +36,8 @@ import org.graalvm.word.PointerBase;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.UnsignedWord;
 
+import com.oracle.svm.core.posix.PosixLibCHelper;
+
 // Checkstyle: stop
 
 /**
@@ -59,8 +61,25 @@ public class Unistd {
     @CFunction
     public static native CCharPointer getcwd(CCharPointer buf, UnsignedWord size);
 
-    @CFunction
-    public static native int execv(CCharPointer path, CCharPointerPointer argv);
+    /**
+     * Calls {@code execv} and captures {@code errno} before the return transition to Java can
+     * overwrite it. A successful call replaces the process and does not return.
+     *
+     * @return the captured {@code errno} value on failure
+     */
+    public static int execv(CCharPointer path, CCharPointerPointer argv) {
+        return PosixLibCHelper.execv(path, argv);
+    }
+
+    /**
+     * Calls {@code execve} and captures {@code errno} before the return transition to Java can
+     * overwrite it. A successful call replaces the process and does not return.
+     *
+     * @return the captured {@code errno} value on failure
+     */
+    public static int execve(CCharPointer path, CCharPointerPointer argv, CCharPointerPointer envp) {
+        return PosixLibCHelper.execve(path, argv, envp);
+    }
 
     @CConstant
     public static native int _SC_CLK_TCK();
@@ -73,6 +92,9 @@ public class Unistd {
 
     @CConstant
     public static native int _SC_PAGE_SIZE();
+
+    @CConstant
+    public static native int _SC_GETPW_R_SIZE_MAX();
 
     @CConstant
     @Platforms(Platform.LINUX.class)
@@ -93,9 +115,6 @@ public class Unistd {
 
     @CFunction
     public static native int getuid();
-
-    @CFunction
-    public static native int geteuid();
 
     @CFunction
     public static native int getgid();
@@ -127,5 +146,23 @@ public class Unistd {
 
         @CFunction(transition = Transition.NO_TRANSITION)
         public static native SignedWord lseek(int fd, SignedWord offset, int whence);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int getpagesize();
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int ftruncate(int fd, SignedWord offset);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int getpid();
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int geteuid();
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native int fsync(int fd);
+
+        @CFunction(transition = Transition.NO_TRANSITION)
+        public static native SignedWord pread(int fd, PointerBase buf, UnsignedWord nbytes, SignedWord offset);
     }
 }

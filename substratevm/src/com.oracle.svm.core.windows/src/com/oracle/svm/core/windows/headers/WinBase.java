@@ -28,12 +28,15 @@ import org.graalvm.nativeimage.c.CContext;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
 import org.graalvm.nativeimage.c.function.CFunction.Transition;
+import org.graalvm.nativeimage.c.struct.CField;
 import org.graalvm.nativeimage.c.struct.CPointerTo;
+import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.CLongPointer;
+import org.graalvm.nativeimage.c.type.VoidPointer;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.windows.headers.LibC.WCharPointer;
+import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
 
 // Checkstyle: stop
 
@@ -49,9 +52,14 @@ public class WinBase {
     public interface HANDLE extends PointerBase {
     }
 
+    @CConstant
+    public static native HANDLE INVALID_HANDLE_VALUE();
+
     @CPointerTo(nameOfCType = "HANDLE")
     public interface LPHANDLE extends PointerBase {
         HANDLE read();
+
+        void write(HANDLE value);
     }
 
     /**
@@ -62,9 +70,22 @@ public class WinBase {
 
     @CPointerTo(nameOfCType = "HMODULE")
     public interface HMODULEPointer extends PointerBase {
-        public HMODULE read();
+        HMODULE read();
 
-        public void write(HMODULE value);
+        void write(HMODULE value);
+    }
+
+    /**
+     * Contains a 64-bit value representing the number of 100-nanosecond intervals since January 1,
+     * 1601 (UTC).
+     */
+    @CStruct
+    public interface FILETIME extends PointerBase {
+        @CField
+        int dwLowDateTime();
+
+        @CField
+        int dwHighDateTime();
     }
 
     /**
@@ -76,18 +97,20 @@ public class WinBase {
     @CConstant
     public static native int ERROR_TIMEOUT();
 
+    @CConstant
+    public static native int ERROR_SUCCESS();
+
     /**
      * QueryPerformance Counter - used for elapsed time
      */
-
     @CFunction(transition = Transition.NO_TRANSITION)
-    public static native void QueryPerformanceCounter(CLongPointer counter);
+    public static native int QueryPerformanceCounter(CLongPointer counter);
 
     /**
      * QueryPerformance Frequency - used for elapsed time
      */
     @CFunction(transition = Transition.NO_TRANSITION)
-    public static native void QueryPerformanceFrequency(CLongPointer counter);
+    public static native int QueryPerformanceFrequency(CLongPointer counter);
 
     /**
      * CloseHandle
@@ -107,4 +130,8 @@ public class WinBase {
 
     @CFunction(transition = Transition.NO_TRANSITION)
     public static native int GetUserProfileDirectoryW(HANDLE hToken, WCharPointer lpProfileDir, CIntPointer lpcchSize);
+
+    @CFunction(transition = Transition.NO_TRANSITION)
+    public static native WinBase.HANDLE CreateSemaphoreA(VoidPointer lpSemaphoreAttributes, int lInitialCount, int lMaximumCount, VoidPointer lpName);
+
 }

@@ -24,15 +24,23 @@
  */
 package com.oracle.svm.core.code;
 
+import static com.oracle.svm.core.deopt.Deoptimizer.Options.LazyDeoptimization;
+
 import org.graalvm.nativeimage.c.function.CodePointer;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.deopt.Deoptimizer.Options;
 import com.oracle.svm.core.heap.CodeReferenceMapDecoder;
 import com.oracle.svm.core.heap.CodeReferenceMapEncoder;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.shared.Uninterruptible;
 
 /**
  * Information about an instruction pointer (IP), created and returned by methods in
- * {@link CodeInfoTable}.
+ * {@link CodeInfoTable}. In situations where we can't allocate any Java heap memory, we use the
+ * structure {@link SimpleCodeInfoQueryResult} instead.
+ *
+ * During a stack walk, this class holds information about a physical Java frame (see
+ * {@link FrameInfoQueryResult} for the virtual Java frames).
  */
 public class CodeInfoQueryResult {
 
@@ -48,10 +56,21 @@ public class CodeInfoQueryResult {
      */
     protected static final FrameInfoQueryResult NO_FRAME_INFO = null;
 
+    /**
+     * Marker value of {@link #getFramePointerSaveAreaOffset()} when the frame does not have a save
+     * area or no information is available for the {@linkplain #getIP() IP}.
+     */
+    public static final int NO_FRAME_POINTER_SAVE_AREA_OFFSET = -1;
+
     protected CodePointer ip;
     protected long encodedFrameSize;
     protected long exceptionOffset;
     protected long referenceMapIndex;
+    protected long framePointerSaveAreaOffset = NO_FRAME_POINTER_SAVE_AREA_OFFSET;
+    /**
+     * Only set for deopt entry points and only if {@link Options#LazyDeoptimization} is enabled.
+     */
+    protected boolean deoptReturnValueIsObject;
     protected FrameInfoQueryResult frameInfo;
 
     /**
@@ -72,7 +91,7 @@ public class CodeInfoQueryResult {
         return getTotalFrameSize(encodedFrameSize);
     }
 
-    @Uninterruptible(reason = "called from uninterruptible code", mayBeInlined = true)
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static long getTotalFrameSize(long encodedFrameSize) {
         return CodeInfoDecoder.decodeTotalFrameSize(encodedFrameSize);
     }
@@ -84,7 +103,7 @@ public class CodeInfoQueryResult {
         return isEntryPoint(encodedFrameSize);
     }
 
-    @Uninterruptible(reason = "called from uninterruptible code", mayBeInlined = true)
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static boolean isEntryPoint(long encodedFrameSize) {
         return CodeInfoDecoder.decodeIsEntryPoint(encodedFrameSize);
     }
@@ -96,7 +115,7 @@ public class CodeInfoQueryResult {
         return hasCalleeSavedRegisters(encodedFrameSize);
     }
 
-    @Uninterruptible(reason = "called from uninterruptible code", mayBeInlined = true)
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static boolean hasCalleeSavedRegisters(long encodedFrameSize) {
         return CodeInfoDecoder.decodeHasCalleeSavedRegisters(encodedFrameSize);
     }
@@ -118,10 +137,20 @@ public class CodeInfoQueryResult {
         return referenceMapIndex;
     }
 
+    public long getFramePointerSaveAreaOffset() {
+        return framePointerSaveAreaOffset;
+    }
+
+    public boolean getDeoptReturnValueIsObject() {
+        assert LazyDeoptimization.getValue();
+        return deoptReturnValueIsObject;
+    }
+
     /**
      * Stack frame information used, e.g., for deoptimization and printing of stack frames in debug
      * builds.
      */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public FrameInfoQueryResult getFrameInfo() {
         return frameInfo;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,46 +24,39 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import org.graalvm.compiler.nodes.ParameterNode;
-
-import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 import jdk.vm.ci.code.BytecodePosition;
 
 public class FormalParamTypeFlow extends TypeFlow<BytecodePosition> {
-
-    /** The holding method. */
-    protected final AnalysisMethod method;
-    /** The position of the parameter in the method signature. */
+    /**
+     * The position of the parameter in the method signature. The holding method can be accessed
+     * through the source position.
+     */
     protected final int position;
 
-    public FormalParamTypeFlow(ParameterNode source, AnalysisType declaredType, AnalysisMethod method, int position) {
-        super(source.getNodeSourcePosition(), declaredType);
+    public FormalParamTypeFlow(BytecodePosition sourcePosition, AnalysisType declaredType, int position) {
+        super(sourcePosition, dropUncheckedInterfaceBound(declaredType));
         this.position = position;
-        this.method = method;
     }
 
     protected FormalParamTypeFlow(FormalParamTypeFlow original, MethodFlowsGraph methodFlows) {
         super(original, methodFlows);
         this.position = original.position;
-        this.method = original.method;
     }
 
     @Override
-    public TypeFlow<BytecodePosition> copy(BigBang bb, MethodFlowsGraph methodFlows) {
+    public TypeFlow<BytecodePosition> copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows) {
         return new FormalParamTypeFlow(this, methodFlows);
     }
 
+    /**
+     * Filters the incoming type state using the declared type.
+     */
     @Override
-    public AnalysisMethod method() {
-        return method;
-    }
-
-    @Override
-    public TypeState filter(BigBang bb, TypeState newState) {
+    protected TypeState processInputState(PointsToAnalysis bb, TypeState newState) {
         /*
          * If the type flow constraints are relaxed filter the incoming value using the parameter's
          * declared type.
@@ -76,10 +69,10 @@ public class FormalParamTypeFlow extends TypeFlow<BytecodePosition> {
     }
 
     @Override
-    public String toString() {
-        StringBuilder str = new StringBuilder();
-        str.append("FormalParamFlow").append("[").append(method.format("%H.%n")).append("]").append("[").append(position).append("]<").append(getState()).append(">");
-        return str.toString();
+    public String format(boolean withState, boolean withSource) {
+        return "Parameter " + position + " of " + method().format("%H.%n(%p)") +
+                        (withSource ? " at " + formatSource() : "") +
+                        (withState ? " with state <" + getStateDescription() + ">" : "");
     }
 
 }

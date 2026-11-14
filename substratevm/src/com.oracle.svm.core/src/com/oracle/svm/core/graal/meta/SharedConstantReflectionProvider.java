@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,89 +24,29 @@
  */
 package com.oracle.svm.core.graal.meta;
 
-//Checkstyle: allow reflection
-
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
-
-import java.lang.reflect.Array;
-
-import com.oracle.svm.core.meta.ObjectConstantEquality;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
 
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
-import jdk.vm.ci.meta.JavaKind;
-import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 public abstract class SharedConstantReflectionProvider implements ConstantReflectionProvider {
 
-    @Override
-    public Boolean constantEquals(Constant x, Constant y) {
-        if (x == y) {
-            return true;
-        } else if (x instanceof SubstrateObjectConstant) {
-            return y instanceof SubstrateObjectConstant && ObjectConstantEquality.get().test((SubstrateObjectConstant) x, (SubstrateObjectConstant) y);
-        } else {
-            return x.equals(y);
-        }
-    }
+    /**
+     * Determines whether {@code constant} refers to an image heap object with an offset that is
+     * known or can be patched once known.
+     */
+    public abstract boolean canRepresentAsImageHeapOffset(JavaConstant constant);
 
     @Override
-    public Integer readArrayLength(JavaConstant array) {
-        if (array.getJavaKind() != JavaKind.Object || array.isNull() || !SubstrateObjectConstant.asObject(array).getClass().isArray()) {
-            return null;
-        }
-        return java.lang.reflect.Array.getLength(SubstrateObjectConstant.asObject(array));
-    }
-
-    @Override
-    public JavaConstant readArrayElement(JavaConstant array, int index) {
-        if (array.getJavaKind() != JavaKind.Object || array.isNull()) {
-            return null;
-        }
-
-        Object a = KnownIntrinsics.convertUnknownValue(SubstrateObjectConstant.asObject(array), Object.class);
-
-        if (index < 0 || index >= Array.getLength(a)) {
-            return null;
-        }
-
-        if (a instanceof Object[]) {
-            Object element = ((Object[]) a)[index];
-            return SubstrateObjectConstant.forObject(element);
-        } else {
-            return JavaConstant.forBoxedPrimitive(Array.get(a, index));
-        }
-    }
-
-    @Override
-    public JavaConstant boxPrimitive(JavaConstant source) {
-        if (!source.getJavaKind().isPrimitive()) {
-            return null;
-        }
-        return SubstrateObjectConstant.forObject(source.asBoxedPrimitive());
-    }
-
-    @Override
-    public JavaConstant unboxPrimitive(JavaConstant source) {
-        if (!source.getJavaKind().isObject()) {
-            return null;
-        }
-        return JavaConstant.forBoxedPrimitive(KnownIntrinsics.convertUnknownValue(SubstrateObjectConstant.asObject(source), Object.class));
-    }
-
-    @Override
-    public JavaConstant forString(String value) {
-        return SubstrateObjectConstant.forObject(value);
-    }
-
-    @Override
-    public final MethodHandleAccessProvider getMethodHandleAccess() {
-        throw shouldNotReachHere();
+    public final JavaConstant boxPrimitive(JavaConstant source) {
+        /*
+         * This method is likely not going to do what you want: sub-integer constants in Graal IR
+         * are usually represented as constants with JavaKind.Integer, which means this method would
+         * give you an Integer box instead of a Byte, Short, ... box.
+         */
+        throw VMError.intentionallyUnimplemented();
     }
 
     @Override
@@ -118,7 +58,5 @@ public abstract class SharedConstantReflectionProvider implements ConstantReflec
         return asJavaClass(type);
     }
 
-    public int getImageHeapOffset(@SuppressWarnings("unused") JavaConstant constant) {
-        throw VMError.shouldNotReachHere("Can only be used during JIT compilation at run time: " + getClass().getName());
-    }
+    public abstract int getImageHeapOffset(JavaConstant constant);
 }

@@ -24,26 +24,34 @@
  */
 package com.oracle.svm.hosted.code;
 
+import com.oracle.svm.hosted.RestrictHeapAccessGuestValue;
 import java.lang.reflect.Constructor;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import org.graalvm.collections.EconomicSet;
+import org.graalvm.collections.UnmodifiableEconomicSet;
 import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
-import com.oracle.svm.core.annotate.RestrictHeapAccess.Access;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.UninterruptibleAnnotationUtils;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess.Access;
 import com.oracle.svm.core.heap.RestrictHeapAccessCallees;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.hosted.DeadlockWatchdog;
 import com.oracle.svm.hosted.FeatureImpl.DuringAnalysisAccessImpl;
 import com.oracle.svm.hosted.meta.HostedMethod;
+import com.oracle.svm.util.GuestAnnotationAccess;
 
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -52,6 +60,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * Construct a list of all the methods that are, or are called from, methods annotated with
  * {@link RestrictHeapAccess} or {@link Uninterruptible}.
  */
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees {
 
     /**
@@ -61,7 +70,7 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
     private Map<AnalysisMethod, RestrictionInfo> calleeToCallerMap;
 
     /** AssertionErrors are cut points, because their allocations are removed. */
-    private List<ResolvedJavaMethod> assertionErrorConstructorList;
+    private UnmodifiableEconomicSet<ResolvedJavaMethod> assertionErrorConstructorList;
 
     /** Initialize the set of callees only once. */
     private boolean initialized;
@@ -69,12 +78,12 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
     /** Constructor for the singleton instance. */
     public RestrictHeapAccessCalleesImpl() {
         calleeToCallerMap = Collections.emptyMap();
-        this.assertionErrorConstructorList = Collections.emptyList();
+        this.assertionErrorConstructorList = EconomicSet.create();
         initialized = false;
     }
 
     /** This gets called multiple times, but I only need one AnalysisMethod to be happy. */
-    public void setAssertionErrorConstructors(List<ResolvedJavaMethod> resolvedConstructorList) {
+    public void setAssertionErrorConstructors(EconomicSet<ResolvedJavaMethod> resolvedConstructorList) {
         if (assertionErrorConstructorList.isEmpty()) {
             assertionErrorConstructorList = resolvedConstructorList;
         }
@@ -84,10 +93,29 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
         return calleeToCallerMap.get(methodToKey(method));
     }
 
+    /**
+     * Returns the effective restriction once the hosted call graph has been aggregated, or the
+     * explicit annotation during analysis. UNRESTRICTED also represents an unannotated method.
+     */
+    public static Access heapAccessRestriction(AnalysisMethod method) {
+        var restrictions = (RestrictHeapAccessCalleesImpl) ImageSingletons.lookup(RestrictHeapAccessCallees.class);
+        var info = restrictions.getRestrictionInfo(method);
+        if (info != null) {
+            return info.getAccess();
+        }
+        return GuestAnnotationAccess.isAnnotationPresent(method, RestrictHeapAccess.class)
+                        ? RestrictHeapAccessGuestValue.get(method).access()
+                        : Access.UNRESTRICTED;
+    }
+
     @Override
     public boolean mustNotAllocate(ResolvedJavaMethod method) {
+        return isRestricted(method) || UninterruptibleAnnotationUtils.isUninterruptible(method);
+    }
+
+    private boolean isRestricted(ResolvedJavaMethod method) {
         RestrictionInfo info = getRestrictionInfo(method);
-        return info != null && (info.getAccess() == Access.NO_ALLOCATION || info.getAccess().isMoreRestrictiveThan(Access.NO_ALLOCATION));
+        return info != null && info.getAccess() != Access.UNRESTRICTED;
     }
 
     /** Get the map from a callee to a caller. */
@@ -96,24 +124,53 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
     }
 
     /**
-     * Aggregate a set of methods that are annotated with {@link RestrictHeapAccess} or with
-     * {@link Uninterruptible}, or methods that are called from those methods.
+     * Aggregate a set of methods that are annotated with {@link RestrictHeapAccess}, or methods
+     * that are called from those methods.
      */
     public void aggregateMethods(Collection<AnalysisMethod> methods) {
         assert !initialized : "RestrictHeapAccessCallees.aggregateMethods: Should only initialize once.";
-        final Map<AnalysisMethod, RestrictionInfo> aggregation = new HashMap<>();
-        final MethodAggregator visitor = new MethodAggregator(aggregation, assertionErrorConstructorList);
-        final AnalysisMethodCalleeWalker walker = new AnalysisMethodCalleeWalker();
+        Map<AnalysisMethod, RestrictionInfo> aggregation = new HashMap<>();
+        DeadlockWatchdog watchdog = DeadlockWatchdog.singleton();
+        watchdog.recordActivity();
         for (AnalysisMethod method : methods) {
-            final RestrictHeapAccess annotation = method.getAnnotation(RestrictHeapAccess.class);
-            if ((annotation != null && annotation.access() != Access.UNRESTRICTED) || method.isAnnotationPresent(Uninterruptible.class)) {
-                for (AnalysisMethod calleeImpl : method.getImplementations()) {
-                    walker.walkMethod(calleeImpl, visitor);
-                }
+            if (GuestAnnotationAccess.isAnnotationPresent(method, RestrictHeapAccess.class)) {
+                setMethodRestrictionInfo(method, aggregation);
             }
+        }
+        MethodAggregator visitor = new MethodAggregator(aggregation, assertionErrorConstructorList);
+        AnalysisMethodCalleeWalker walker = new AnalysisMethodCalleeWalker();
+        watchdog.recordActivity();
+        for (AnalysisMethod method : aggregation.keySet().toArray(AnalysisMethod.EMPTY_ARRAY)) {
+            walker.walkMethod(method, visitor);
         }
         calleeToCallerMap = Collections.unmodifiableMap(aggregation);
         initialized = true;
+    }
+
+    /**
+     * Set RestrictionInfo for annotated method and its overrides.
+     *
+     * Unless the overrides themselves are annotated, treat them as if they were annotated with the
+     * same annotation as the method.
+     */
+    private static void setMethodRestrictionInfo(AnalysisMethod method, Map<AnalysisMethod, RestrictionInfo> aggregation) {
+        assert GuestAnnotationAccess.isAnnotationPresent(method, RestrictHeapAccess.class);
+        if (aggregation.get(method) != null) {
+            return;
+        }
+        Set<AnalysisMethod> implementations = method.collectMethodImplementations(false);
+        for (AnalysisMethod impl : implementations) {
+            if (GuestAnnotationAccess.isAnnotationPresent(impl, RestrictHeapAccess.class) && !impl.equals(method)) {
+                /* Annotated overrides take precedence, so process them first. */
+                setMethodRestrictionInfo(impl, aggregation);
+            }
+        }
+        assert aggregation.get(method) == null;
+        Access access = RestrictHeapAccessGuestValue.get(method).access();
+        aggregation.put(method, new RestrictionInfo(access, null, null, method));
+        for (AnalysisMethod impl : implementations) {
+            aggregation.putIfAbsent(impl, new RestrictionInfo(access, null, null, impl));
+        }
     }
 
     /**
@@ -140,10 +197,10 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
         private final Map<AnalysisMethod, RestrictionInfo> calleeToCallerMap;
 
         /** The constructor {@link AssertionError#AssertionError()}. */
-        private final List<ResolvedJavaMethod> assertionErrorConstructorList;
+        private final UnmodifiableEconomicSet<ResolvedJavaMethod> assertionErrorConstructorList;
 
         /** Constructor. */
-        MethodAggregator(Map<AnalysisMethod, RestrictionInfo> calleeToCallerMap, List<ResolvedJavaMethod> assertionErrorConstructorList) {
+        MethodAggregator(Map<AnalysisMethod, RestrictionInfo> calleeToCallerMap, UnmodifiableEconomicSet<ResolvedJavaMethod> assertionErrorConstructorList) {
             this.calleeToCallerMap = calleeToCallerMap;
             this.assertionErrorConstructorList = assertionErrorConstructorList;
         }
@@ -151,52 +208,32 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
         /** Visit a method and add it to the set of methods that should not allocate. */
         @Override
         public VisitResult visitMethod(AnalysisMethod callee, AnalysisMethod caller, BytecodePosition invokePosition, int depth) {
-            Access access = Access.UNRESTRICTED;
-            boolean overridesCallers = false;
-            boolean fromUninterruptible = false;
-            if (callee.isAnnotationPresent(Uninterruptible.class)) {
-                access = Access.NO_ALLOCATION;
-                fromUninterruptible = true;
+            RestrictionInfo existingRestrictionInfo = calleeToCallerMap.get(callee);
+            if (caller == null) {
+                /* Start a new traversal. */
+                assert existingRestrictionInfo != null && existingRestrictionInfo.isExplicit();
+                return existingRestrictionInfo.getAccess() == Access.UNRESTRICTED ? VisitResult.CUT : VisitResult.CONTINUE;
             }
-            RestrictHeapAccess annotation = callee.getAnnotation(RestrictHeapAccess.class);
-            if (annotation != null) {
-                access = annotation.access();
-                overridesCallers = annotation.overridesCallers();
-                fromUninterruptible = false;
-            }
-            if (overridesCallers || caller == null) {
-                if (access == Access.UNRESTRICTED) {
-                    return VisitResult.CUT;
-                }
-            } else {
-                RestrictionInfo callerInfo = calleeToCallerMap.get(caller);
-                Access callerAccess = callerInfo.getAccess();
-                if (callerAccess.equals(access) || callerAccess.isMoreRestrictiveThan(access)) {
-                    if (callerInfo.isFromUninterruptible()) {
-                        if (caller.getAnnotation(Uninterruptible.class) != null && caller.getAnnotation(Uninterruptible.class).calleeMustBe()) {
-                            access = callerAccess;
-                            fromUninterruptible = true;
-                        } else if (access == Access.UNRESTRICTED) {
-                            return VisitResult.CUT;
-                        }
-                    } else {
-                        access = callerAccess;
-                        fromUninterruptible = false;
-                    }
-                }
-            }
-            if (access == Access.NO_ALLOCATION && assertionErrorConstructorList != null && assertionErrorConstructorList.contains(callee)) {
-                /* Ignore AssertionError allocations: ImplicitExceptionsPlugin will replace them */
+
+            /* Propagate caller restriction. */
+            Access access = calleeToCallerMap.get(caller).getAccess();
+            assert access != Access.UNRESTRICTED;
+
+            if (existingRestrictionInfo != null && existingRestrictionInfo.isExplicit()) {
+                /* No propagation to callees with explicit restrictions, so stop here. */
                 return VisitResult.CUT;
             }
-            RestrictionInfo restrictionInfo = calleeToCallerMap.get(callee);
-            if (restrictionInfo != null && !access.isMoreRestrictiveThan(restrictionInfo.getAccess())) {
+            if (existingRestrictionInfo != null && !access.isMoreRestrictiveThan(existingRestrictionInfo.getAccess())) {
                 /* Earlier traversal with same or higher level of restriction, so stop here. */
                 return VisitResult.CUT;
             }
-            StackTraceElement callerStackTraceElement = (invokePosition != null) ? invokePosition.getMethod().asStackTraceElement(invokePosition.getBCI()) : null;
-            restrictionInfo = new RestrictionInfo(access, caller, callerStackTraceElement, callee, fromUninterruptible);
-            calleeToCallerMap.put(callee, restrictionInfo);
+            if (assertionErrorConstructorList != null && assertionErrorConstructorList.contains(callee)) {
+                /* Ignore AssertionError allocations: ImplicitExceptionsPlugin will replace them */
+                return VisitResult.CUT;
+            }
+            assert invokePosition != null;
+            StackTraceElement callerStackTraceElement = invokePosition.getMethod().asStackTraceElement(invokePosition.getBCI());
+            calleeToCallerMap.put(callee, new RestrictionInfo(access, caller, callerStackTraceElement, callee));
             return VisitResult.CONTINUE;
         }
     }
@@ -212,15 +249,17 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
         private final StackTraceElement invocationStackTraceElement;
         /** The method to which the restriction applies. */
         private final AnalysisMethod method;
-        /** Whether the restriction is <em>solely</em> due to @{@link Uninterruptible}. */
-        private final boolean fromUninterruptible;
 
-        RestrictionInfo(Access access, AnalysisMethod caller, StackTraceElement stackTraceElement, AnalysisMethod method, boolean fromUninterruptible) {
+        RestrictionInfo(Access access, AnalysisMethod caller, StackTraceElement stackTraceElement, AnalysisMethod method) {
             this.access = access;
             this.caller = caller;
             this.invocationStackTraceElement = stackTraceElement;
             this.method = method;
-            this.fromUninterruptible = fromUninterruptible;
+        }
+
+        /** Return whether the restriction is explicit or inferred. */
+        boolean isExplicit() {
+            return caller == null;
         }
 
         public Access getAccess() {
@@ -238,15 +277,11 @@ public class RestrictHeapAccessCalleesImpl implements RestrictHeapAccessCallees 
         public AnalysisMethod getMethod() {
             return method;
         }
-
-        public boolean isFromUninterruptible() {
-            return fromUninterruptible;
-        }
     }
 }
 
-@AutomaticFeature
-class RestrictHeapAccessCalleesFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class RestrictHeapAccessCalleesFeature implements InternalFeature {
 
     /** This is called early, to register in the VMConfiguration. */
     @Override
@@ -257,12 +292,12 @@ class RestrictHeapAccessCalleesFeature implements Feature {
     /** This is called during analysis, to find the AssertionError constructors. */
     @Override
     public void duringAnalysis(DuringAnalysisAccess access) {
-        List<ResolvedJavaMethod> assertionErrorConstructorList = initializeAssertionErrorConstructors(access);
+        EconomicSet<ResolvedJavaMethod> assertionErrorConstructorList = initializeAssertionErrorConstructors(access);
         ((RestrictHeapAccessCalleesImpl) ImageSingletons.lookup(RestrictHeapAccessCallees.class)).setAssertionErrorConstructors(assertionErrorConstructorList);
     }
 
-    private static List<ResolvedJavaMethod> initializeAssertionErrorConstructors(DuringAnalysisAccess access) {
-        final List<ResolvedJavaMethod> result = new ArrayList<>();
+    private static EconomicSet<ResolvedJavaMethod> initializeAssertionErrorConstructors(DuringAnalysisAccess access) {
+        final EconomicSet<ResolvedJavaMethod> result = EconomicSet.create(9);
         result.add(findAssertionConstructor(access));
         result.add(findAssertionConstructor(access, boolean.class));
         result.add(findAssertionConstructor(access, char.class));

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,7 +25,6 @@
 package com.oracle.svm.hosted;
 
 import java.io.IOException;
-import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,23 +32,33 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 
 import com.oracle.svm.core.c.libc.TemporaryBuildDirectoryProvider;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.hosted.c.util.FileUtils;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.TimeUtils;
+import com.oracle.svm.shared.util.VMError;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class TemporaryBuildDirectoryProviderImpl implements TemporaryBuildDirectoryProvider, AutoCloseable {
 
+    private final Path tempDirectoryOptionValue;
     private Path tempDirectory;
     private boolean deleteTempDirectory;
+
+    public TemporaryBuildDirectoryProviderImpl(Path tempDirectoryOptionValue) {
+        this.tempDirectoryOptionValue = tempDirectoryOptionValue;
+    }
 
     @Override
     public synchronized Path getTemporaryBuildDirectory() {
         if (tempDirectory == null) {
             try {
-                String tempName = NativeImageOptions.TempDirectory.getValue();
-                if (tempName == null || tempName.isEmpty()) {
+                if (tempDirectoryOptionValue == null) {
                     tempDirectory = Files.createTempDirectory("SVM-");
                     deleteTempDirectory = true;
                 } else {
-                    tempDirectory = FileSystems.getDefault().getPath(tempName).resolve("SVM-" + System.currentTimeMillis());
+                    tempDirectory = tempDirectoryOptionValue.resolve("SVM-" + TimeUtils.currentTimeMillis());
                     assert !Files.exists(tempDirectory);
                     Files.createDirectories(tempDirectory);
                 }
@@ -72,18 +81,21 @@ public class TemporaryBuildDirectoryProviderImpl implements TemporaryBuildDirect
             Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    Files.delete(file);
+                    FileUtils.deleteWithRetry(file);
                     return FileVisitResult.CONTINUE;
                 }
 
                 @Override
                 public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                    Files.delete(dir);
+                    FileUtils.deleteWithRetry(dir);
                     return FileVisitResult.CONTINUE;
                 }
             });
         } catch (IOException ex) {
-            throw VMError.shouldNotReachHere(ex);
+            throw VMError.shouldNotReachHere(
+                            String.format("Unable to remove the temporary build directory at '%s'. If you are using the '%s' option, you may want to delete the temporary directory manually.",
+                                            path, NativeImageOptions.TempDirectory.getName()),
+                            ex);
         }
     }
 }

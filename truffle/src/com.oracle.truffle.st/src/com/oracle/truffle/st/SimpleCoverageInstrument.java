@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -179,7 +179,7 @@ public final class SimpleCoverageInstrument extends TruffleInstrument {
      * @param env
      */
     @Override
-    protected void onDispose(Env env) {
+    protected void onFinalize(Env env) {
         if (PRINT_COVERAGE.getValue(env.getOptions())) {
             printResults(env);
         }
@@ -188,7 +188,7 @@ public final class SimpleCoverageInstrument extends TruffleInstrument {
     /**
      * Print the coverage results for each source.
      *
-     * The printing is one the the {@link Env#out output stream} specified by the {@link Env
+     * The printing is one the {@link Env#out output stream} specified by the {@link Env
      * enviroment}.
      *
      * @param env

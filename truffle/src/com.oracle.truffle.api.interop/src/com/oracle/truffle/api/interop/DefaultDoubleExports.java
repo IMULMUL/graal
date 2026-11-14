@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,8 +40,11 @@
  */
 package com.oracle.truffle.api.interop;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.source.SourceSection;
@@ -74,8 +77,18 @@ final class DefaultDoubleExports {
     @ExportMessage
     static boolean fitsInLong(Double receiver) {
         double d = receiver;
-        long l = (long) d;
-        return NumberUtils.inSafeIntegerRange(d) && !NumberUtils.isNegativeZero(d) && l == d;
+        if (!NumberUtils.isNegativeZero(d)) {
+            long l = (long) d;
+            if (l != Long.MAX_VALUE && l == d) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @ExportMessage
+    static boolean fitsInBigInteger(Double receiver) {
+        return receiver % 1 == 0 && !NumberUtils.isNegativeZero(receiver);
     }
 
     @ExportMessage
@@ -118,13 +131,30 @@ final class DefaultDoubleExports {
     @ExportMessage
     static long asLong(Double receiver) throws UnsupportedMessageException {
         double d = receiver;
-        if (NumberUtils.inSafeIntegerRange(d) && !NumberUtils.isNegativeZero(d)) {
+        if (!NumberUtils.isNegativeZero(d)) {
             long l = (long) d;
-            if (l == d) {
+            if (l != Long.MAX_VALUE && l == d) {
                 return l;
             }
         }
         throw UnsupportedMessageException.create();
+    }
+
+    @ExportMessage
+    static BigInteger asBigInteger(Double receiver) throws UnsupportedMessageException {
+        if (!fitsInBigInteger(receiver)) {
+            throw UnsupportedMessageException.create();
+        }
+        return toBigInteger(receiver);
+    }
+
+    @TruffleBoundary
+    private static BigInteger toBigInteger(double receiver) {
+        try {
+            return new BigDecimal(receiver).toBigIntegerExact();
+        } catch (ArithmeticException e) {
+            throw CompilerDirectives.shouldNotReachHere(e);
+        }
     }
 
     @ExportMessage
@@ -150,20 +180,6 @@ final class DefaultDoubleExports {
     @ExportMessage
     static double asDouble(Double receiver) {
         return receiver;
-    }
-
-    /*
-     * We export these messages explicitly because the legacy default is very costly. Remove with
-     * the complicated legacy implementation in InteropLibrary.
-     */
-    @ExportMessage
-    static boolean hasLanguage(Double receiver) {
-        return false;
-    }
-
-    @ExportMessage
-    static Class<? extends TruffleLanguage<?>> getLanguage(Double receiver) throws UnsupportedMessageException {
-        throw UnsupportedMessageException.create();
     }
 
     @ExportMessage

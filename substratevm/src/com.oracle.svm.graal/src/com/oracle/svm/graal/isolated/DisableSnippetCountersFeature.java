@@ -24,28 +24,50 @@
  */
 package com.oracle.svm.graal.isolated;
 
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
-import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderContext;
-import org.graalvm.compiler.nodes.graphbuilderconf.NodePlugin;
-import org.graalvm.compiler.phases.util.Providers;
-import org.graalvm.compiler.replacements.SnippetCounter;
-import org.graalvm.compiler.replacements.SnippetIntegerHistogram;
-
 import com.oracle.svm.core.ParsingReason;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.graal.GraalFeature;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.shared.option.HostedOptionValues;
 
+import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.core.common.GraalOptions;
+import jdk.graal.compiler.hotspot.SymbolicSnippetEncoder;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.graphbuilderconf.NodePlugin;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.replacements.SnippetCounter;
+import jdk.graal.compiler.replacements.SnippetIntegerHistogram;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 /**
- * Adapted from code of {@link org.graalvm.compiler.hotspot.SymbolicSnippetEncoder}.
+ * Disables snippet counters because they need a {@link SnippetReflectionProvider} which is not
+ * fully supported for cross-isolate compilations.
+ *
+ * In general snippets counters should only enabled if the flag SnippetCounters is set.
+ */
+@AutomaticallyRegisteredFeature
+final class DisableSnippetCountersFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return SubstrateOptions.SupportCompileInIsolates.getValue() || !GraalOptions.SnippetCounters.getValue(HostedOptionValues.singleton().get());
+    }
+
+    @Override
+    public void registerGraphBuilderPlugins(Providers providers, GraphBuilderConfiguration.Plugins plugins, ParsingReason reason) {
+        if (reason == ParsingReason.JITCompilation) {
+            plugins.appendNodePlugin(new DisableSnippetCountersPlugin());
+        }
+    }
+}
+
+/**
+ * Adapted from code of {@link SymbolicSnippetEncoder}.
  */
 final class DisableSnippetCountersPlugin implements NodePlugin {
     private static final String snippetCounterName = 'L' + SnippetCounter.class.getName().replace('.', '/') + ';';
@@ -58,32 +80,13 @@ final class DisableSnippetCountersPlugin implements NodePlugin {
             return true;
         }
         if (field.getType().getName().equals(snippetCounterName)) {
-            b.addPush(JavaKind.Object, ConstantNode.forConstant(SubstrateObjectConstant.forObject(SnippetCounter.DISABLED_COUNTER), b.getMetaAccess()));
+            b.addPush(JavaKind.Object, ConstantNode.forConstant(b.getSnippetReflection().forObject(SnippetCounter.DISABLED_COUNTER), b.getMetaAccess()));
             return true;
         }
         if (field.getType().getName().equals(snippetIntegerHistogramName)) {
-            b.addPush(JavaKind.Object, ConstantNode.forConstant(SubstrateObjectConstant.forObject(SnippetIntegerHistogram.DISABLED_COUNTER), b.getMetaAccess()));
+            b.addPush(JavaKind.Object, ConstantNode.forConstant(b.getSnippetReflection().forObject(SnippetIntegerHistogram.DISABLED_COUNTER), b.getMetaAccess()));
             return true;
         }
         return false;
-    }
-}
-
-/**
- * Disables snippet counters because they need a {@link SnippetReflectionProvider} which is not
- * fully supported for cross-isolate compilations.
- */
-@AutomaticFeature
-final class DisableSnippetCountersFeature implements GraalFeature {
-    @Override
-    public boolean isInConfiguration(IsInConfigurationAccess access) {
-        return SubstrateOptions.supportCompileInIsolates();
-    }
-
-    @Override
-    public void registerGraphBuilderPlugins(Providers providers, GraphBuilderConfiguration.Plugins plugins, ParsingReason reason) {
-        if (reason == ParsingReason.JITCompilation) {
-            plugins.appendNodePlugin(new DisableSnippetCountersPlugin());
-        }
     }
 }

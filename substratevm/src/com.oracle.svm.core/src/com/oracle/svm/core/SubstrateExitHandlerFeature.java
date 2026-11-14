@@ -24,28 +24,34 @@
  */
 package com.oracle.svm.core;
 
-import org.graalvm.nativeimage.ImageInfo;
-import org.graalvm.nativeimage.hosted.Feature;
-
 import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.jdk.RuntimeSupport;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+import com.oracle.svm.guest.staging.jdk.RuntimeSupport;
 
-@AutomaticFeature
-public class SubstrateExitHandlerFeature implements Feature {
+@AutomaticallyRegisteredFeature
+public class SubstrateExitHandlerFeature implements InternalFeature {
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return ImageLayerBuildingSupport.firstImageBuild();
+    }
+
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
-        if (SubstrateOptions.InstallExitHandlers.getValue() && ImageInfo.isExecutable()) {
+        if (SubstrateOptions.InstallExitHandlers.getValue()) {
             RuntimeSupport.getRuntimeSupport().addStartupHook(new SubstrateExitHandlerStartupHook());
         }
     }
 }
 
-final class SubstrateExitHandlerStartupHook implements Runnable {
+final class SubstrateExitHandlerStartupHook implements RuntimeSupport.Hook {
     @Override
-    public void run() {
-        Target_java_lang_Terminator.setup();
+    public void execute(boolean isFirstIsolate) {
+        if (SubstrateOptions.isSignalHandlingAllowed() && isFirstIsolate) {
+            Target_java_lang_Terminator.setup();
+        }
     }
 }
 

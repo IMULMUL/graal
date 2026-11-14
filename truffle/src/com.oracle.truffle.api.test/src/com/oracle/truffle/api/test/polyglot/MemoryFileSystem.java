@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,13 +44,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.io.File;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException;
-import java.nio.channels.NonReadableChannelException;
-import java.nio.channels.NonWritableChannelException;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.AccessMode;
@@ -65,9 +60,6 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.WatchEvent;
-import java.nio.file.WatchKey;
-import java.nio.file.WatchService;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.GroupPrincipal;
@@ -85,10 +77,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+
 import org.graalvm.polyglot.io.FileSystem;
+import org.junit.BeforeClass;
+
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public final class MemoryFileSystem implements FileSystem {
+
     private static final byte[] EMPTY = new byte[0];
     private static final UserPrincipal USER = new UserPrincipal() {
         @Override
@@ -118,6 +115,11 @@ public final class MemoryFileSystem implements FileSystem {
         }
     };
 
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
+
     private final Map<Long, FileInfo> inodes;
     private final Map<Long, byte[]> blocks;
     private final Path root;
@@ -132,7 +134,11 @@ public final class MemoryFileSystem implements FileSystem {
     public MemoryFileSystem(String tmpDirPath) throws IOException {
         this.inodes = new HashMap<>();
         this.blocks = new HashMap<>();
-        root = MemoryPath.getRootDirectory();
+        List<? extends Path> rootDirectories = FileSystemsTest.getRootDirectories();
+        if (rootDirectories.isEmpty()) {
+            throw new IllegalStateException("No root directory.");
+        }
+        root = rootDirectories.get(0);
         userDir = root;
         createDirectoryImpl();
         tmpDir = root.resolve(tmpDirPath);
@@ -141,14 +147,14 @@ public final class MemoryFileSystem implements FileSystem {
 
     @Override
     public Path parsePath(String path) {
-        return new MemoryPath(Paths.get(path));
+        return Paths.get(path);
     }
 
     @Override
     public Path parsePath(URI uri) {
         try {
-            return new MemoryPath(Paths.get(uri));
-        } catch (IllegalArgumentException | FileSystemNotFoundException e) {
+            return Paths.get(uri);
+        } catch (FileSystemNotFoundException e) {
             throw new UnsupportedOperationException(e);
         }
     }
@@ -266,33 +272,37 @@ public final class MemoryFileSystem implements FileSystem {
             }
         }
         final boolean deleteOnClose = options.contains(StandardOpenOption.DELETE_ON_CLOSE);
-        final byte[] origData = blocks.get(inode);
-        final byte[] data = write && options.contains(StandardOpenOption.TRUNCATE_EXISTING) ? EMPTY : Arrays.copyOf(origData, origData.length);
+        byte[] origData = blocks.get(inode);
+        byte[] data;
+        boolean truncate = write && options.contains(StandardOpenOption.TRUNCATE_EXISTING);
+        if (truncate) {
+            data = origData = EMPTY;
+        } else {
+            data = Arrays.copyOf(origData, origData.length);
+        }
         final long inodeFin = inode;
-        final BiConsumer<byte[], Long> syncAction = new BiConsumer<byte[], Long>() {
-            @Override
-            public void accept(byte[] t, Long u) {
-                blocks.put(inodeFin, Arrays.copyOf(t, (int) u.longValue()));
+        final Consumer<MemoryFileChannel> syncAction = (channel) -> {
+            if (truncate || channel.dirty) {
+                byte[] newData = Arrays.copyOf(channel.data, (int) channel.limit);
+                blocks.put(inodeFin, newData);
+                channel.originalData = newData;
             }
         };
         final boolean readFin = read;
         final boolean writeFin = write;
-        final BiConsumer<byte[], Long> metaSyncAction = new BiConsumer<byte[], Long>() {
-            @Override
-            public void accept(byte[] t, Long u) {
-                final long time = System.currentTimeMillis();
-                final FileInfo fileInfo = inodes.get(inodeFin);
-                if (readFin) {
-                    fileInfo.atime = time;
-                }
-                if (writeFin) {
-                    fileInfo.mtime = time;
-                }
+        final Consumer<MemoryFileChannel> metaSyncAction = (channel) -> {
+            final long time = System.currentTimeMillis();
+            final FileInfo fileInfo = inodes.get(inodeFin);
+            if (readFin) {
+                fileInfo.atime = time;
+            }
+            if (writeFin) {
+                fileInfo.mtime = time;
             }
         };
-        final BiConsumer<byte[], Long> closeAction = new BiConsumer<byte[], Long>() {
+        final Consumer<MemoryFileChannel> closeAction = new Consumer<>() {
             @Override
-            public void accept(byte[] t, Long u) {
+            public void accept(MemoryFileChannel channel) {
                 if (deleteOnClose) {
                     try {
                         delete(absolutePath);
@@ -300,8 +310,8 @@ public final class MemoryFileSystem implements FileSystem {
                         sthrow(ioe);
                     }
                 } else {
-                    syncAction.accept(t, u);
-                    metaSyncAction.accept(t, u);
+                    syncAction.accept(channel);
+                    metaSyncAction.accept(channel);
                 }
             }
 
@@ -310,7 +320,8 @@ public final class MemoryFileSystem implements FileSystem {
                 throw (E) t;
             }
         };
-        return new ChannelImpl(
+        return new MemoryFileChannelImpl(
+                        origData,
                         data,
                         closeAction,
                         read,
@@ -413,12 +424,37 @@ public final class MemoryFileSystem implements FileSystem {
 
     @Override
     public String getSeparator() {
-        return ((MemoryPath) root).delegate.getFileSystem().getSeparator();
+        return root.getFileSystem().getSeparator();
     }
 
     @Override
     public Path getTempDirectory() {
         return tmpDir;
+    }
+
+    @Override
+    public long getFileStoreTotalSpace(Path path) {
+        return Runtime.getRuntime().maxMemory();
+    }
+
+    @Override
+    public long getFileStoreUnallocatedSpace(Path path) {
+        return Runtime.getRuntime().freeMemory();
+    }
+
+    @Override
+    public long getFileStoreUsableSpace(Path path) {
+        return getFileStoreUnallocatedSpace(path);
+    }
+
+    @Override
+    public long getFileStoreBlockSize(Path path) {
+        return 1024;
+    }
+
+    @Override
+    public boolean isFileStoreReadOnly(Path path) {
+        return false;
     }
 
     private static Object[] parse(String attributesSelector) {
@@ -526,7 +562,7 @@ public final class MemoryFileSystem implements FileSystem {
 
         @Override
         public Iterator<Path> iterator() {
-            return new Iterator<Path>() {
+            return new Iterator<>() {
                 private final Iterator<? extends String> delegate = names.iterator();
 
                 @Override
@@ -732,137 +768,6 @@ public final class MemoryFileSystem implements FileSystem {
         }
     }
 
-    private static final class ChannelImpl implements SeekableByteChannel {
-        private final BiConsumer<byte[], Long> closeAction;
-        private final boolean read;
-        private final boolean write;
-        private final boolean append;
-        private byte[] data;
-        private boolean closed;
-        private long limit;
-        private long pos;
-
-        ChannelImpl(
-                        final byte[] data,
-                        final BiConsumer<byte[], Long> closeAction,
-                        final boolean read,
-                        final boolean write,
-                        final boolean append) {
-            this.data = data;
-            this.closeAction = closeAction;
-            this.read = read;
-            this.write = write;
-            this.append = append;
-            this.limit = data.length;
-            this.pos = append ? limit : 0;
-        }
-
-        @Override
-        public int read(ByteBuffer dst) throws IOException {
-            checkClosed();
-            checkRead();
-            final long available = limit - pos;
-            if (available == 0) {
-                return -1;
-            }
-            final int toRead = Math.min((int) available, dst.limit());
-            dst.put(data, (int) pos, toRead);
-            pos += toRead;
-            return toRead;
-        }
-
-        @Override
-        public int write(ByteBuffer src) throws IOException {
-            checkClosed();
-            checkWrite();
-            final int len = src.limit() - src.position();
-            ensureCapacity((int) (pos + len));
-            src.get(data, (int) pos, len);
-            pos += len;
-            if (pos > limit) {
-                limit = pos;
-            }
-            return len;
-        }
-
-        @Override
-        public long position() throws IOException {
-            checkClosed();
-            return pos;
-        }
-
-        @Override
-        public SeekableByteChannel position(long newPosition) throws IOException {
-            checkClosed();
-            if (newPosition < 0) {
-                throw new IllegalArgumentException(String.valueOf(newPosition));
-            }
-            pos = newPosition;
-            return this;
-        }
-
-        @Override
-        public long size() throws IOException {
-            checkClosed();
-            return limit;
-        }
-
-        @Override
-        public SeekableByteChannel truncate(long size) throws IOException {
-            checkClosed();
-            checkWrite();
-            if (size < 0) {
-                throw new IllegalArgumentException(String.valueOf(size));
-            }
-            if (append) {
-                throw new IOException("Truncate not allowed in append mode.");
-            }
-            if (size < limit) {
-                limit = size;
-            }
-            if (pos > limit) {
-                pos = limit;
-            }
-            return this;
-        }
-
-        @Override
-        public boolean isOpen() {
-            return !closed;
-        }
-
-        @Override
-        public void close() throws IOException {
-            closed = true;
-            closeAction.accept(data, limit);
-        }
-
-        private void checkRead() {
-            if (!read) {
-                throw new NonReadableChannelException();
-            }
-        }
-
-        private void checkWrite() {
-            if (!write) {
-                throw new NonWritableChannelException();
-            }
-        }
-
-        private void checkClosed() throws ClosedChannelException {
-            if (closed) {
-                throw new ClosedChannelException();
-            }
-        }
-
-        private byte[] ensureCapacity(final int requiredLength) {
-            if (requiredLength > data.length) {
-                data = Arrays.copyOf(data, Math.max(requiredLength, data.length << 1));
-            }
-            return data;
-        }
-    }
-
     private static final class FileInfo {
         private final FileType type;
         private final Set<AccessMode> permissions;
@@ -931,211 +836,6 @@ public final class MemoryFileSystem implements FileSystem {
             FileInfo build() {
                 return new FileInfo(type, permissions, ctime, mtime, atime);
             }
-        }
-    }
-
-    private static final class MemoryPath implements Path {
-
-        private final Path delegate;
-
-        MemoryPath(Path delegate) {
-            assert delegate != null;
-            this.delegate = delegate;
-        }
-
-        @Override
-        public java.nio.file.FileSystem getFileSystem() {
-            throw new UnsupportedOperationException("Not supported");
-        }
-
-        @Override
-        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>[] events, WatchEvent.Modifier... modifiers) throws IOException {
-            throw new UnsupportedOperationException("Not supported.");
-        }
-
-        @Override
-        public WatchKey register(WatchService watcher, WatchEvent.Kind<?>... events) throws IOException {
-            throw new UnsupportedOperationException("Not supported.");
-        }
-
-        @Override
-        public File toFile() {
-            throw new UnsupportedOperationException("Not supported.");
-        }
-
-        @Override
-        public boolean isAbsolute() {
-            return delegate.isAbsolute();
-        }
-
-        @Override
-        public Path getRoot() {
-            Path delegateRoot = delegate.getRoot();
-            return delegateRoot == null ? null : new MemoryPath(delegateRoot);
-        }
-
-        @Override
-        public Path getFileName() {
-            Path delegateFileName = delegate.getFileName();
-            return delegateFileName == null ? null : new MemoryPath(delegateFileName);
-        }
-
-        @Override
-        public Path getParent() {
-            Path delegateParent = delegate.getParent();
-            return delegateParent == null ? null : new MemoryPath(delegateParent);
-        }
-
-        @Override
-        public int getNameCount() {
-            return delegate.getNameCount();
-        }
-
-        @Override
-        public Path getName(int index) {
-            Path delegateName = delegate.getName(index);
-            return new MemoryPath(delegateName);
-        }
-
-        @Override
-        public Path subpath(int beginIndex, int endIndex) {
-            Path delegateSubpath = delegate.subpath(beginIndex, endIndex);
-            return new MemoryPath(delegateSubpath);
-        }
-
-        @Override
-        public boolean startsWith(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return delegate.startsWith(((MemoryPath) other).delegate);
-        }
-
-        @Override
-        public boolean startsWith(String other) {
-            return delegate.startsWith(other);
-        }
-
-        @Override
-        public boolean endsWith(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return delegate.endsWith(((MemoryPath) other).delegate);
-        }
-
-        @Override
-        public boolean endsWith(String other) {
-            return delegate.endsWith(other);
-        }
-
-        @Override
-        public Path normalize() {
-            return new MemoryPath(delegate.normalize());
-        }
-
-        @Override
-        public Path resolve(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return new MemoryPath(delegate.resolve(((MemoryPath) other).delegate));
-        }
-
-        @Override
-        public Path resolve(String other) {
-            return new MemoryPath(delegate.resolve(other));
-        }
-
-        @Override
-        public Path resolveSibling(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return new MemoryPath(delegate.resolveSibling(((MemoryPath) other).delegate));
-        }
-
-        @Override
-        public Path resolveSibling(String other) {
-            return new MemoryPath(delegate.resolveSibling(other));
-        }
-
-        @Override
-        public Path relativize(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return new MemoryPath(delegate.relativize(((MemoryPath) other).delegate));
-        }
-
-        @Override
-        public URI toUri() {
-            return delegate.toUri();
-        }
-
-        @Override
-        public Path toAbsolutePath() {
-            return new MemoryPath(delegate.toAbsolutePath());
-        }
-
-        @Override
-        public Path toRealPath(LinkOption... options) throws IOException {
-            return this;
-        }
-
-        @Override
-        public Iterator<Path> iterator() {
-            return new Iterator<Path>() {
-
-                private final Iterator<Path> delegateIt = delegate.iterator();
-
-                @Override
-                public boolean hasNext() {
-                    return delegateIt.hasNext();
-                }
-
-                @Override
-                public Path next() {
-                    return new MemoryPath(delegateIt.next());
-                }
-            };
-        }
-
-        @Override
-        public int compareTo(Path other) {
-            if (other.getClass() != MemoryPath.class) {
-                throw new IllegalArgumentException("Unsupported path: " + other.getClass().getName());
-            }
-            return delegate.compareTo(((MemoryPath) other).delegate);
-        }
-
-        @Override
-        public String toString() {
-            return delegate.toString();
-        }
-
-        @Override
-        public int hashCode() {
-            return delegate.hashCode();
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            if (other == this) {
-                return true;
-            }
-            if (other == null || other.getClass() != MemoryPath.class) {
-                return false;
-            }
-            return delegate.equals(((MemoryPath) other).delegate);
-        }
-
-        static Path getRootDirectory() {
-            List<? extends Path> rootDirectories = FileSystemsTest.getRootDirectories();
-            if (rootDirectories.isEmpty()) {
-                throw new IllegalStateException("No root directory.");
-            }
-            return new MemoryPath(rootDirectories.get(0));
         }
     }
 }

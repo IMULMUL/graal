@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,26 +25,32 @@
 
 package com.oracle.svm.hosted.xml;
 
-import com.oracle.svm.core.configure.ResourcesRegistry;
-import com.oracle.svm.core.jdk.JNIRegistrationUtil;
-import com.oracle.svm.hosted.FeatureImpl;
-import com.oracle.svm.hosted.classinitialization.ConfigurableClassInitialization;
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.nativeimage.hosted.RuntimeReflection;
-import org.graalvm.nativeimage.impl.RuntimeClassInitializationSupport;
-
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import org.graalvm.nativeimage.dynamicaccess.AccessCondition;
+import org.graalvm.nativeimage.hosted.Feature;
+
+import com.oracle.svm.configure.ResourcesRegistry;
+import com.oracle.svm.core.jdk.JNIRegistrationUtil;
+import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeReflection;
+
 public abstract class XMLParsersRegistration extends JNIRegistrationUtil {
 
-    public void registerConfigs(Feature.DuringAnalysisAccess access) {
+    public void registerConfigs(Feature.DuringAnalysisAccess a) {
+        FeatureImpl.DuringAnalysisAccessImpl access = (FeatureImpl.DuringAnalysisAccessImpl) a;
         List<String> parserClasses = xmlParserClasses();
-        registerReflectionClasses((FeatureImpl.DuringAnalysisAccessImpl) access, parserClasses);
+        registerReflectionClasses(access, parserClasses);
         registerResources();
-        access.requireAnalysisIteration();
+    }
+
+    void registerConfig(Feature.DuringAnalysisAccess a, String className) {
+        FeatureImpl.DuringAnalysisAccessImpl access = (FeatureImpl.DuringAnalysisAccessImpl) a;
+        registerReflectionClasses(access, Collections.singletonList(className));
+        registerResources();
     }
 
     abstract List<String> xmlParserClasses();
@@ -54,8 +60,8 @@ public abstract class XMLParsersRegistration extends JNIRegistrationUtil {
 
     private static void registerReflectionClasses(FeatureImpl.DuringAnalysisAccessImpl access, List<String> parserClasses) {
         for (String className : parserClasses) {
-            RuntimeReflection.register(clazz(access, className));
-            RuntimeReflection.register(constructor(access, className));
+            JVMCIRuntimeReflection.register(type(access, className));
+            JVMCIRuntimeReflection.register(constructor(access, className));
         }
     }
 
@@ -91,6 +97,22 @@ public abstract class XMLParsersRegistration extends JNIRegistrationUtil {
         }
     }
 
+    static class SchemaDVFactoryClasses extends XMLParsersRegistration {
+
+        @Override
+        List<String> xmlParserClasses() {
+            return Collections.singletonList("com.sun.org.apache.xerces.internal.impl.dv.xs.SchemaDVFactoryImpl");
+        }
+    }
+
+    static class BuiltinSchemaGrammarClasses extends XMLParsersRegistration {
+
+        @Override
+        List<String> xmlParserClasses() {
+            return Collections.singletonList("com.sun.org.apache.xerces.internal.impl.dv.xs.ExtendedSchemaDVFactoryImpl");
+        }
+    }
+
     static class StAXParserClasses extends XMLParsersRegistration {
 
         @Override
@@ -109,19 +131,49 @@ public abstract class XMLParsersRegistration extends JNIRegistrationUtil {
             /*
              * To allow register new resource bundle classes during analysis phase
              */
-            ConfigurableClassInitialization classInitializationSupport = (ConfigurableClassInitialization) ImageSingletons.lookup(RuntimeClassInitializationSupport.class);
-            classInitializationSupport.setConfigurationSealed(false);
-
-            ResourcesRegistry resourcesRegistry = ImageSingletons.lookup(ResourcesRegistry.class);
-            resourcesRegistry.addResourceBundles("com.sun.org.apache.xml.internal.serializer.utils.SerializerMessages");
-            resourcesRegistry.addResources("com.sun.*.properties");
-
-            classInitializationSupport.setConfigurationSealed(true);
+            ClassInitializationSupport classInitializationSupport = ClassInitializationSupport.singleton();
+            classInitializationSupport.withUnsealedConfiguration(() -> {
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xml.internal.serializer.utils.SerializerMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xalan.internal.xsltc.compiler.util.ErrorMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xml.internal.serializer.Encodings");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xml.internal.serializer.HTMLEntities");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xml.internal.serializer.XMLEntities");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.xpath.regex.message");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.DOMMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.DatatypeMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.JAXPValidationMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.SAXMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.XIncludeMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.XMLMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.XMLSchemaMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.XMLSerializerMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xerces.internal.impl.msg.XPointerMessages");
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xalan.internal.res.XSLTInfo");
+            });
         }
 
         @Override
         List<String> xmlParserClasses() {
             return Collections.singletonList("com.sun.org.apache.xalan.internal.xsltc.trax.TransformerFactoryImpl");
+        }
+    }
+
+    static class XMLCryptoTransformServiceClassesAndResources extends XMLParsersRegistration {
+
+        @Override
+        void registerResources() {
+            /*
+             * To allow register new resource bundle classes during analysis phase
+             */
+            ClassInitializationSupport classInitializationSupport = ClassInitializationSupport.singleton();
+            classInitializationSupport.withUnsealedConfiguration(() -> {
+                ResourcesRegistry.singleton().addResourceBundles(AccessCondition.unconditional(), false, "com.sun.org.apache.xml.internal.security/resource/xmlsecurity");
+            });
+        }
+
+        @Override
+        List<String> xmlParserClasses() {
+            return Collections.emptyList();
         }
     }
 }

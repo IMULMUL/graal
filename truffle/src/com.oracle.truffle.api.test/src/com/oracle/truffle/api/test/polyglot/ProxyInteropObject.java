@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,10 @@
  */
 package com.oracle.truffle.api.test.polyglot;
 
-import com.oracle.truffle.api.TruffleLanguage;
+import java.math.BigInteger;
+import java.util.Objects;
+
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
@@ -80,6 +83,11 @@ public abstract class ProxyInteropObject implements TruffleObject {
     }
 
     @ExportMessage
+    protected boolean fitsInBigInteger() {
+        return false;
+    }
+
+    @ExportMessage
     protected boolean fitsInFloat() {
         return false;
     }
@@ -115,6 +123,11 @@ public abstract class ProxyInteropObject implements TruffleObject {
     }
 
     @ExportMessage
+    protected BigInteger asBigInteger() throws UnsupportedMessageException {
+        throw UnsupportedMessageException.create();
+    }
+
+    @ExportMessage
     protected int asInt() throws UnsupportedMessageException {
         throw UnsupportedMessageException.create();
     }
@@ -144,7 +157,7 @@ public abstract class ProxyInteropObject implements TruffleObject {
      * {@link ProxyLanguage} language.
      */
     @ExportMessage
-    protected boolean hasLanguage() {
+    protected boolean hasLanguageId() {
         return isScope(); // A scope must have a language associated
     }
 
@@ -154,9 +167,9 @@ public abstract class ProxyInteropObject implements TruffleObject {
      */
     @ExportMessage
     @SuppressWarnings("static-method")
-    protected Class<? extends TruffleLanguage<?>> getLanguage() throws UnsupportedMessageException {
-        if (hasLanguage()) {
-            return ProxyLanguage.class;
+    protected String getLanguageId() throws UnsupportedMessageException {
+        if (hasLanguageId()) {
+            return ProxyLanguage.ID;
         } else {
             throw UnsupportedMessageException.create();
         }
@@ -367,9 +380,10 @@ public abstract class ProxyInteropObject implements TruffleObject {
     }
 
     @ExportMessage
+    @TruffleBoundary
     protected Object toDisplayString(boolean allowSideEffects) {
         if (allowSideEffects) {
-            return ProxyLanguage.getCurrentLanguage().toString(ProxyLanguage.getCurrentContext(), this);
+            return Objects.toString(this);
         } else {
             return getClass().getTypeName() + "@" + Integer.toHexString(System.identityHashCode(this));
         }

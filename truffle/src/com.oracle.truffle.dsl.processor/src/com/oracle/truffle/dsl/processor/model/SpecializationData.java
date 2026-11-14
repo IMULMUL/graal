@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,30 +43,34 @@ package com.oracle.truffle.dsl.processor.model;
 import java.lang.ref.Reference;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeMirror;
 
 import com.oracle.truffle.dsl.processor.ProcessorContext;
+import com.oracle.truffle.dsl.processor.bytecode.parser.BytecodeDSLParser;
 import com.oracle.truffle.dsl.processor.expression.DSLExpression;
 import com.oracle.truffle.dsl.processor.expression.DSLExpression.AbstractDSLExpressionVisitor;
 import com.oracle.truffle.dsl.processor.expression.DSLExpression.Call;
+import com.oracle.truffle.dsl.processor.expression.DSLExpression.Variable;
+import com.oracle.truffle.dsl.processor.generator.FlatNodeGenFactory;
 import com.oracle.truffle.dsl.processor.java.ElementUtils;
+import com.oracle.truffle.dsl.processor.parser.NodeParser;
+import com.oracle.truffle.dsl.processor.parser.SpecializationGroup.TypeGuard;
 
 public final class SpecializationData extends TemplateMethod {
 
     public enum SpecializationKind {
-        UNINITIALIZED,
         SPECIALIZED,
-        POLYMORPHIC,
         FALLBACK
     }
 
@@ -77,21 +81,29 @@ public final class SpecializationData extends TemplateMethod {
     private final List<GuardExpression> guards = new ArrayList<>();
     private List<CacheExpression> caches = Collections.emptyList();
     private List<AssumptionExpression> assumptionExpressions = Collections.emptyList();
-    private final Set<SpecializationData> replaces = new LinkedHashSet<>();
-    private final Set<String> replacesNames = new LinkedHashSet<>();
-    private final Set<SpecializationData> excludedBy = new LinkedHashSet<>();
+    private Set<SpecializationData> replaces;
+    private Set<String> replacesNames;
+    private Set<SpecializationData> replacedBy;
     private String insertBeforeName;
     private SpecializationData insertBefore;
     private boolean replaced;
     private boolean reachable;
     private boolean reachesFallback;
+    private int unroll;
+    private int unrollIndex = -1;
     private int index;
     private DSLExpression limitExpression;
     private SpecializationData uncachedSpecialization;
     private final boolean reportPolymorphism;
     private final boolean reportMegamorphism;
 
+    private boolean excludeForUncached;
+
+    private Double localActivationProbability;
+
     private boolean aotReachable;
+
+    private final List<SpecializationData> boxingOverloads = new ArrayList<>();
 
     public SpecializationData(NodeData node, TemplateMethod template, SpecializationKind kind, List<SpecializationThrowsData> exceptions, boolean hasUnexpectedResultRewrite,
                     boolean reportPolymorphism, boolean reportMegamorphism) {
@@ -105,22 +117,207 @@ public final class SpecializationData extends TemplateMethod {
         this.reportMegamorphism = reportMegamorphism;
     }
 
+    public SpecializationData(NodeData node, TemplateMethod template, SpecializationKind kind) {
+        this(node, template, kind, new ArrayList<>(), false, true, false);
+    }
+
     public SpecializationData copy() {
         SpecializationData copy = new SpecializationData(node, this, kind, new ArrayList<>(exceptions), hasUnexpectedResultRewrite, reportPolymorphism, reportMegamorphism);
-        copy.guards.addAll(guards);
-        copy.caches = new ArrayList<>(caches);
+
+        copy.guards.clear();
+        for (GuardExpression guard : guards) {
+            copy.guards.add(guard.copy(copy));
+        }
+
+        copy.caches = new ArrayList<>(caches.size());
+        for (CacheExpression cache : caches) {
+            copy.caches.add(cache.copy());
+        }
+
         copy.assumptionExpressions = new ArrayList<>(assumptionExpressions);
+        if (replacesNames != null) {
+            copy.replacesNames = new LinkedHashSet<>();
+            copy.replacesNames.addAll(replacesNames);
+        }
+
         copy.replaced = replaced;
-        copy.replaces.addAll(replaces);
-        copy.replacesNames.addAll(replacesNames);
-        copy.excludedBy.addAll(excludedBy);
+
+        if (replaces != null) {
+            copy.replaces = new LinkedHashSet<>();
+            copy.replaces.addAll(replaces);
+        }
+        if (replacedBy != null) {
+            copy.replacedBy = new LinkedHashSet<>();
+            copy.replacedBy.addAll(replacedBy);
+        }
         copy.insertBeforeName = insertBeforeName;
         copy.reachable = reachable;
         copy.reachesFallback = reachesFallback;
         copy.index = index;
         copy.limitExpression = limitExpression;
         copy.aotReachable = aotReachable;
+        copy.unroll = unroll;
+        copy.uncachedSpecialization = uncachedSpecialization;
         return copy;
+    }
+
+    public void setExcludeForUncached(Boolean value) {
+        this.excludeForUncached = value;
+    }
+
+    public boolean isExcludeForUncached() {
+        return excludeForUncached;
+    }
+
+    public List<TypeGuard> getImplicitTypeGuards() {
+        TypeSystemData typeSystem = getNode().getTypeSystem();
+        if (typeSystem.getImplicitCasts().isEmpty()) {
+            return List.of();
+        }
+        int signatureIndex = 0;
+        List<TypeGuard> implicitTypeChecks = new ArrayList<>();
+        for (Parameter p : getSignatureParameters()) {
+            if (typeSystem.hasImplicitSourceTypes(p.getType())) {
+                implicitTypeChecks.add(new TypeGuard(typeSystem, p.getType(), signatureIndex));
+            }
+            signatureIndex++;
+        }
+        return implicitTypeChecks;
+    }
+
+    public boolean isImplicitTypeGuard(TypeGuard typeGuard) {
+        return getNode().getTypeSystem().hasImplicitSourceTypes(typeGuard.getType());
+    }
+
+    public boolean isNodeReceiverVariable(VariableElement var) {
+        if (getNode().isGenerateInline()) {
+            Parameter p = findByVariable(var);
+            if (p != null && p.getSpecification().isSignature()) {
+                NodeExecutionData execution = p.getSpecification().getExecution();
+                if (execution.getIndex() == FlatNodeGenFactory.INLINED_NODE_INDEX) {
+                    return true;
+                }
+            }
+        }
+
+        String simpleString = var.getSimpleName().toString();
+        return (simpleString.equals(NodeParser.SYMBOL_THIS) || simpleString.equals(NodeParser.SYMBOL_NODE)) && ElementUtils.typeEquals(var.asType(), types.Node);
+    }
+
+    public boolean isNodeReceiverBoundInAnyExpression() {
+        for (GuardExpression guard : getGuards()) {
+            if (isNodeReceiverBound(guard.getExpression())) {
+                return true;
+            }
+        }
+        for (CacheExpression cache : getCaches()) {
+            if (isNodeReceiverBound(cache.getDefaultExpression())) {
+                return true;
+            }
+        }
+        for (AssumptionExpression assumption : getAssumptionExpressions()) {
+            if (isNodeReceiverBound(assumption.getExpression())) {
+                return true;
+            }
+        }
+        DSLExpression limit = getLimitExpression();
+        if (limit != null && isNodeReceiverBound(limit)) {
+            return true;
+        }
+        return false;
+    }
+
+    public boolean isNodeReceiverBound(DSLExpression expression) {
+        for (Variable variable : expression.findBoundVariables()) {
+            if (isNodeReceiverVariable(variable.getResolvedVariable())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isUncachedSpecialization() {
+        // do not initialize unroll for uncached specializations
+        if (getReplaces() != null) {
+            for (SpecializationData replace : getReplaces()) {
+                if (replace.getUncachedSpecialization() == this) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public void setUnrollIndex(int unrollIndex) {
+        this.unrollIndex = unrollIndex;
+    }
+
+    public int getUnrollIndex() {
+        return unrollIndex;
+    }
+
+    public void setUnroll(int unroll) {
+        this.unroll = unroll;
+    }
+
+    public boolean hasUnroll() {
+        return unroll > 0;
+    }
+
+    public boolean isUnrolled() {
+        return hasUnroll() && unrollIndex != -1;
+    }
+
+    public int getUnroll() {
+        return unroll;
+    }
+
+    /**
+     * Returns true if an expression can always be folded to a constant during PE. Method calls are
+     * natural boundaries as we cannot look into them at annotation processing time. The passed
+     * expression must be resolved.
+     */
+    public boolean isCompilationFinalExpression(DSLExpression expression) {
+        if (!(expression instanceof Variable)) {
+            // fast-path check
+            return false;
+        }
+
+        if (expression.resolveConstant() != null) {
+            return true;
+        }
+
+        /*
+         * Check whether the expression is of form a.b.c with final or compilation final values.
+         */
+        DSLExpression current = expression;
+        while (current != null) {
+            if (!(current instanceof Variable)) {
+                return false;
+            }
+
+            Variable variable = (Variable) current;
+            // if not a final field
+            if (!variable.isCompilationFinalField()) {
+                Parameter boundParameter = findByVariable(variable.getResolvedVariable());
+                // and not a bound parameter
+                if (boundParameter == null) {
+                    // it cannot be compilation final
+                    return false;
+                }
+            }
+
+            current = variable.getReceiver();
+        }
+
+        // do a more thorough analysis of whether a dynamic parameter is bound, possibly indirectly
+        // e.g. through @Bind.
+        if (isDynamicParameterBound(expression, true)) {
+            // dynamic parameters cannot be known to be PE final (they might be though).
+            return false;
+        }
+
+        return true;
     }
 
     public boolean isPrepareForAOT() {
@@ -137,6 +334,19 @@ public final class SpecializationData extends TemplateMethod {
 
     public SpecializationData getUncachedSpecialization() {
         return uncachedSpecialization;
+    }
+
+    public boolean hasFrameParameter() {
+        /*
+         * Frames are optional DSL parameters and therefore are not part of the signature parameter
+         * list.
+         */
+        for (Parameter p : getParameters()) {
+            if (ElementUtils.typeEquals(p.getType(), types.VirtualFrame) || ElementUtils.typeEquals(p.getType(), types.Frame)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public boolean needsVirtualFrame() {
@@ -227,6 +437,7 @@ public final class SpecializationData extends TemplateMethod {
         this.reachesFallback = reachesFallback;
     }
 
+    /** == !@ReportPolymorphism.Exclude. */
     public boolean isReportPolymorphism() {
         return reportPolymorphism;
     }
@@ -237,6 +448,15 @@ public final class SpecializationData extends TemplateMethod {
 
     public boolean isReachesFallback() {
         return reachesFallback;
+    }
+
+    public boolean isAnyGuardBoundWithCache() {
+        for (GuardExpression guard : guards) {
+            if (isGuardBoundWithCache(guard)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public boolean isGuardBoundWithCache(GuardExpression guardExpression) {
@@ -250,17 +470,17 @@ public final class SpecializationData extends TemplateMethod {
         return false;
     }
 
-    public Set<CacheExpression> getBoundCaches(DSLExpression guardExpression, boolean transitiveCached) {
-        return getBoundCachesImpl(new HashSet<>(), guardExpression, transitiveCached);
+    public Set<CacheExpression> getBoundCaches(DSLExpression expression, boolean transitiveCached) {
+        return getBoundCachesImpl(new LinkedHashSet<>(), expression, transitiveCached);
     }
 
-    private Set<CacheExpression> getBoundCachesImpl(Set<DSLExpression> visitedExpressions, DSLExpression guardExpression, boolean transitiveCached) {
+    private Set<CacheExpression> getBoundCachesImpl(Set<DSLExpression> visitedExpressions, DSLExpression expression, boolean transitiveCached) {
         List<CacheExpression> resolvedCaches = getCaches();
         if (resolvedCaches.isEmpty()) {
             return Collections.emptySet();
         }
-        visitedExpressions.add(guardExpression);
-        Set<VariableElement> boundVars = guardExpression.findBoundVariableElements();
+        visitedExpressions.add(expression);
+        Set<VariableElement> boundVars = expression.findBoundVariableElements();
         Set<CacheExpression> foundCaches = new LinkedHashSet<>();
         for (CacheExpression cache : resolvedCaches) {
             VariableElement cacheVar = cache.getParameter().getVariableElement();
@@ -310,19 +530,64 @@ public final class SpecializationData extends TemplateMethod {
         }
     }
 
-    public boolean isOnlyLanguageReferencesBound(DSLExpression expression) {
-        boolean onlyLanguageReferences = true;
-        Set<CacheExpression> boundCaches = getBoundCaches(expression, false);
-        for (CacheExpression bound : boundCaches) {
-            if (!bound.isCachedLanguage()) {
-                onlyLanguageReferences = false;
-                break;
-            }
+    public enum Idempotence {
+
+        IDEMPOTENT,
+
+        NON_IDEMPOTENT,
+
+        UNKNOWN
+
+    }
+
+    public Idempotence getIdempotence(DSLExpression expression) {
+        if (isDynamicParameterBound(expression, true)) {
+            return Idempotence.NON_IDEMPOTENT;
         }
-        return onlyLanguageReferences && expression.findBoundVariableElements().size() == boundCaches.size();
+
+        IdempotentenceVisitor visitor = new IdempotentenceVisitor();
+        expression.accept(visitor);
+        return visitor.current;
+    }
+
+    public Set<ExecutableElement> getBoundMethods(DSLExpression expression) {
+        var foundMethods = new LinkedHashSet<ExecutableElement>();
+        expression.accept(new AbstractDSLExpressionVisitor() {
+            @Override
+            public void visitCall(Call n) {
+                foundMethods.add(n.getResolvedMethod());
+            }
+
+            @Override
+            public void visitVariable(Variable n) {
+                VariableElement var = n.getResolvedVariable();
+                if (n.getReceiver() == null) {
+                    Parameter p = findByVariable(var);
+                    if (p != null) {
+                        CacheExpression cache = findCache(p);
+                        if (cache != null && cache.isAlwaysInitialized() && !cache.isWeakReferenceGet()) {
+                            foundMethods.addAll(getBoundMethods(cache.getDefaultExpression()));
+                        }
+                    }
+                }
+            }
+        });
+        return foundMethods;
     }
 
     public boolean isDynamicParameterBound(DSLExpression expression, boolean transitive) {
+        if (expression == null) {
+            return false;
+        }
+        if ((node.isBindBytecodeNode() && expression.isSymbolBound(ProcessorContext.getInstance().getTypes().BytecodeNode, BytecodeDSLParser.SYMBOL_BYTECODE_NODE)) ||
+                        (node.isBindBytecodeIndex() && expression.isSymbolBound(ProcessorContext.getInstance().getType(int.class), BytecodeDSLParser.SYMBOL_BYTECODE_INDEX))) {
+            /*
+             * Ordinary AST callers supply enabled execution metadata on every execute invocation,
+             * so it is dynamic like an evaluated argument. Operation nodes leave these flags
+             * disabled and retain the Bytecode DSL's existing PE-constant binding behavior.
+             */
+            return true;
+        }
         Set<VariableElement> boundVariables = expression.findBoundVariableElements();
         for (Parameter parameter : getDynamicParameters()) {
             if (boundVariables.contains(parameter.getVariableElement())) {
@@ -346,9 +611,6 @@ public final class SpecializationData extends TemplateMethod {
                     if (isDynamicParameterBound(cache.getDefaultExpression(), true)) {
                         return true;
                     }
-                }
-                if ((cache.isCachedContext() || cache.isCachedLanguage()) && !cache.isReference()) {
-                    return true;
                 }
             }
         }
@@ -393,16 +655,24 @@ public final class SpecializationData extends TemplateMethod {
         return replacesNames;
     }
 
-    public SpecializationData(NodeData node, TemplateMethod template, SpecializationKind kind) {
-        this(node, template, kind, new ArrayList<SpecializationThrowsData>(), false, true, false);
+    public void setReplacesNames(Set<String> replacesNames) {
+        this.replacesNames = replacesNames;
     }
 
     public Set<SpecializationData> getReplaces() {
         return replaces;
     }
 
-    public Set<SpecializationData> getExcludedBy() {
-        return excludedBy;
+    public void setReplaces(Set<SpecializationData> replaces) {
+        this.replaces = replaces;
+    }
+
+    public Set<SpecializationData> getReplacedBy() {
+        return replacedBy;
+    }
+
+    public void setReplacedBy(Set<SpecializationData> replacedBy) {
+        this.replacedBy = replacedBy;
     }
 
     public void setReachable(boolean reachable) {
@@ -421,10 +691,6 @@ public final class SpecializationData extends TemplateMethod {
         return replaced;
     }
 
-    public boolean isPolymorphic() {
-        return kind == SpecializationKind.POLYMORPHIC;
-    }
-
     @Override
     protected List<MessageContainer> findChildContainers() {
         List<MessageContainer> sinks = new ArrayList<>();
@@ -440,58 +706,109 @@ public final class SpecializationData extends TemplateMethod {
         if (assumptionExpressions != null) {
             sinks.addAll(assumptionExpressions);
         }
+        sinks.addAll(getBoxingOverloads());
         return sinks;
     }
 
-    public boolean needsRewrite(ProcessorContext context) {
-        if (!getExceptions().isEmpty()) {
-            return true;
-        }
-        if (!getGuards().isEmpty()) {
-            return true;
-        }
+    /**
+     * Returns <code>true</code> if this specialization needs lazy initialization of cached fields.
+     */
+    boolean needsSpecialize() {
         if (!getAssumptionExpressions().isEmpty()) {
             return true;
         }
 
         if (!getCaches().isEmpty()) {
             for (CacheExpression cache : getCaches()) {
-                if (cache.isEagerInitialize()) {
-                    continue;
+                if (cache.isAlwaysInitialized()) {
+                    continue; // @Bind
                 }
-                if (!cache.isAlwaysInitialized() || cache.isCachedContext() || cache.isCachedLanguage()) {
+                if (cache.getInlinedNode() != null) {
+                    continue; // @Cached but inlined so no init state needed
+                }
+                return true;
+            }
+        }
+
+        if (hasMultipleInstances()) {
+            // guard needs initialization
+            return true;
+        }
+
+        List<TypeGuard> implicitTypeGuards = getImplicitTypeGuards();
+        if (!implicitTypeGuards.isEmpty()) {
+            for (TypeGuard guard : implicitTypeGuards) {
+                if (isImplicitTypeGuardUsed(guard)) {
                     return true;
                 }
             }
         }
 
-        int signatureIndex = 0;
-        for (Parameter parameter : getSignatureParameters()) {
-            for (ExecutableTypeData executableType : node.getExecutableTypes()) {
-                List<TypeMirror> evaluatedParameters = executableType.getEvaluatedParameters();
-                if (signatureIndex < evaluatedParameters.size()) {
-                    TypeMirror evaluatedParameterType = evaluatedParameters.get(signatureIndex);
-                    if (ElementUtils.needsCastTo(evaluatedParameterType, parameter.getType())) {
-                        return true;
-                    }
+        return FlatNodeGenFactory.useSpecializationClass(this);
+    }
+
+    boolean needsState() {
+        if (!getAssumptionExpressions().isEmpty()) {
+            return true;
+        }
+
+        if (!getCaches().isEmpty()) {
+            for (CacheExpression cache : getCaches()) {
+                if (cache.isAlwaysInitialized()) {
+                    continue; // @Bind
                 }
+                return true;
             }
+        }
 
-            NodeChildData child = parameter.getSpecification().getExecution().getChild();
-            if (child != null) {
+        if (hasMultipleInstances()) {
+            // guard needs initialization
+            return true;
+        }
 
-                ExecutableTypeData type = child.findExecutableType(parameter.getType());
-                if (type == null) {
-                    type = child.findAnyGenericExecutableType(context);
-                }
-                if (type.hasUnexpectedValue()) {
+        List<TypeGuard> implicitTypeGuards = getImplicitTypeGuards();
+        if (!implicitTypeGuards.isEmpty()) {
+            for (TypeGuard guard : implicitTypeGuards) {
+                if (isImplicitTypeGuardUsed(guard)) {
                     return true;
                 }
-                if (ElementUtils.needsCastTo(type.getReturnType(), parameter.getType())) {
-                    return true;
-                }
             }
-            signatureIndex++;
+        }
+
+        return FlatNodeGenFactory.useSpecializationClass(this);
+    }
+
+    public boolean isImplicitTypeGuardUsed(TypeGuard guard, ExecutableTypeData inExecutable) {
+        if (!isImplicitTypeGuard(guard)) {
+            return false;
+        }
+        int signatureIndex = guard.getSignatureIndex();
+        List<Parameter> specializationSignature = getSignatureParameters();
+        if (signatureIndex >= specializationSignature.size()) {
+            return false;
+        }
+
+        TypeMirror specializationType = specializationSignature.get(signatureIndex).getType();
+        if (!ElementUtils.typeEquals(guard.getType(), specializationType)) {
+            return false;
+        }
+
+        List<TypeMirror> parameters = inExecutable.getSignatureParameters();
+        if (signatureIndex >= parameters.size()) {
+            return true;
+        }
+        TypeMirror evaluatedParameter = parameters.get(signatureIndex);
+        if (ElementUtils.typeEquals(evaluatedParameter, specializationType)) {
+            return false;
+        }
+        return true;
+    }
+
+    public boolean isImplicitTypeGuardUsed(TypeGuard guard) {
+        for (ExecutableTypeData executable : node.getExecutableTypes()) {
+            if (isImplicitTypeGuardUsed(guard, executable)) {
+                return true;
+            }
         }
         return false;
     }
@@ -534,7 +851,7 @@ public final class SpecializationData extends TemplateMethod {
         if (getMethod() == null) {
             return -1;
         }
-        return index - 1;
+        return index;
     }
 
     public NodeData getNode() {
@@ -549,10 +866,6 @@ public final class SpecializationData extends TemplateMethod {
         return kind == SpecializationKind.FALLBACK;
     }
 
-    public boolean isUninitialized() {
-        return kind == SpecializationKind.UNINITIALIZED;
-    }
-
     public List<SpecializationThrowsData> getExceptions() {
         return exceptions;
     }
@@ -565,19 +878,22 @@ public final class SpecializationData extends TemplateMethod {
         return guards;
     }
 
-    public SpecializationData findNextSpecialization() {
-        List<SpecializationData> specializations = node.getSpecializations();
-        for (int i = 0; i < specializations.size() - 1; i++) {
-            if (specializations.get(i) == this) {
-                return specializations.get(i + 1);
-            }
-        }
-        return null;
+    public void setLocalActivationProbability(double activationProbability) {
+        this.localActivationProbability = activationProbability;
+    }
+
+    public double getLocalActivationProbability() {
+        return localActivationProbability;
+    }
+
+    public double getActivationProbability() {
+        return getNode().getActivationProbability() * localActivationProbability;
     }
 
     @Override
     public String toString() {
-        return String.format("%s [id = %s, method = %s, guards = %s, signature = %s]", getClass().getSimpleName(), getId(), getMethod(), getGuards(), getDynamicTypes());
+        return String.format("%s [nodeId =%s, id = %s, method = %s, guards = %s, signature = %s]", getClass().getSimpleName(), getNode().getNodeId(), getId(), getMethod(), getGuards(),
+                        getDynamicTypes());
     }
 
     public boolean isFrameUsedByGuard() {
@@ -589,9 +905,14 @@ public final class SpecializationData extends TemplateMethod {
                 }
             }
             for (CacheExpression cache : getCaches()) {
-                if (cache.getDefaultExpression().findBoundVariableElements().contains(frame.getVariableElement())) {
+                if (cache.getDefaultExpression() != null && cache.getDefaultExpression().findBoundVariableElements().contains(frame.getVariableElement())) {
                     return true;
                 }
+            }
+        }
+        for (CacheExpression cache : getCaches()) {
+            if (cache.isRequiresFrame()) {
+                return true;
             }
         }
         return false;
@@ -617,23 +938,44 @@ public final class SpecializationData extends TemplateMethod {
         return getMaximumNumberOfInstances() > 1;
     }
 
-    public boolean isExpressionBindsCache(DSLExpression expression, CacheExpression cache) {
-        for (CacheExpression otherCache : getBoundCaches(expression, true)) {
-            if (otherCache == cache) {
-                return true;
+    /**
+     * Returns <code>true</code> if this specialization binds the node, else <code>false</code>.
+     */
+    public boolean isNodeBound() {
+        if (node.isGenerateInline()) {
+            /*
+             * For inlined nodes we need pass down the inlineTarget Node even for shared nodes using
+             * the first specialization parameter.
+             */
+            for (Parameter p : getSignatureParameters()) {
+                return p.isDeclared();
             }
+            return false;
+        } else {
+            /*
+             * For exported message we need to use @Bind("$node") always even for any inlined cache
+             * as the "this" receiver refers to the library receiver.
+             *
+             * For regular cached nodes @Bind("this") must be used if a specialization data class is
+             * in use. If all inlined caches are shared we can use this and avoid the warning.
+             */
+            for (CacheExpression cache : getCaches()) {
+                if (cache.isBind() && isNodeReceiverBound(cache.getDefaultExpression())) {
+                    return true;
+                }
+            }
+            return false;
         }
-        return false;
     }
 
-    public boolean isGuardBindsCache() {
+    public boolean isGuardBindsExclusiveCache() {
         if (!getCaches().isEmpty() && !getGuards().isEmpty()) {
             for (GuardExpression guard : getGuards()) {
                 if (guard.hasErrors()) {
                     continue;
                 }
                 if (isDynamicParameterBound(guard.getExpression(), true)) {
-                    if (isCacheParameterBound(guard)) {
+                    if (isExclusiveCacheParameterBound(guard)) {
                         return true;
                     }
                 }
@@ -642,13 +984,21 @@ public final class SpecializationData extends TemplateMethod {
         return false;
     }
 
-    private boolean isCacheParameterBound(GuardExpression guard) {
+    private boolean isExclusiveCacheParameterBound(GuardExpression guard) {
         for (CacheExpression cache : getBoundCaches(guard.getExpression(), false)) {
             if (cache.isAlwaysInitialized()) {
                 continue;
             } else if (!guard.isLibraryAcceptsGuard() && cache.isCachedLibrary()) {
                 continue;
             } else if (guard.isWeakReferenceGuard() && cache.isWeakReference()) {
+                continue;
+            } else if (cache.getSharedGroup() != null || cache.getDisabledSharingGroup() != null) {
+                /*
+                 * If a cache was shared, but sharing was disabled automatically then we need to
+                 * keep treating the cache as shared in order to avoid triggering changes in the
+                 * number of specialization instances. These changes could cause follow-up errors,
+                 * for example with a Fallback specialization following after this specialization.
+                 */
                 continue;
             }
             return true;
@@ -657,7 +1007,7 @@ public final class SpecializationData extends TemplateMethod {
     }
 
     public boolean isConstantLimit() {
-        if (isGuardBindsCache()) {
+        if (isGuardBindsExclusiveCache()) {
             DSLExpression expression = getLimitExpression();
             if (expression == null) {
                 return true;
@@ -674,7 +1024,8 @@ public final class SpecializationData extends TemplateMethod {
     }
 
     public int getMaximumNumberOfInstances() {
-        if (isGuardBindsCache()) {
+        if (isGuardBindsExclusiveCache()) {
+
             DSLExpression expression = getLimitExpression();
             if (expression == null) {
                 return 3; // default limit
@@ -701,7 +1052,7 @@ public final class SpecializationData extends TemplateMethod {
             return true;
         }
 
-        if (prev.isGuardBindsCache()) {
+        if (prev.isGuardBindsExclusiveCache()) {
             // may fallthrough due to limit
             return true;
         }
@@ -746,6 +1097,11 @@ public final class SpecializationData extends TemplateMethod {
         Iterator<GuardExpression> currentGuards = getGuards().iterator();
         while (prevGuards.hasNext()) {
             GuardExpression prevGuard = prevGuards.next();
+            if (prev.isGuardBoundWithCache(prevGuard)) {
+                // if a guard with cache is bound the next specialization is always reachable
+                return true;
+            }
+
             GuardExpression currentGuard = currentGuards.hasNext() ? currentGuards.next() : null;
             if (currentGuard == null || !currentGuard.implies(prevGuard)) {
                 return true;
@@ -762,6 +1118,185 @@ public final class SpecializationData extends TemplateMethod {
             }
         }
         return null;
+    }
+
+    private final class IdempotentenceVisitor extends AbstractDSLExpressionVisitor {
+
+        Idempotence current = Idempotence.IDEMPOTENT;
+
+        @Override
+        public void visitCall(Call n) {
+            if (current == Idempotence.NON_IDEMPOTENT) {
+                // if one method is known to be non-idempotent all of them are
+                return;
+            }
+
+            Idempotence idempotent = ElementUtils.getIdempotent(n.getResolvedMethod());
+            if (idempotent == Idempotence.UNKNOWN || idempotent == Idempotence.NON_IDEMPOTENT) {
+                current = idempotent;
+            }
+        }
+
+        @Override
+        public void visitVariable(Variable n) {
+            if (current == Idempotence.NON_IDEMPOTENT) {
+                // if one method is known to be non-idempotent all of them are
+                return;
+            }
+
+            VariableElement var = n.getResolvedVariable();
+            if (n.getReceiver() == null) {
+                /*
+                 * Directly bound variable that is not dynamic. The DSL ensures such reads are not
+                 * side-effecting in the fast-path. They can be treated as effectively final field
+                 * reads.
+                 */
+                Parameter p = findByVariable(var);
+                if (p != null) {
+                    CacheExpression cache = findCache(p);
+                    if (cache != null && cache.isAlwaysInitialized() && !cache.isWeakReferenceGet()) {
+                        /*
+                         * Bind variables may cause side-effects themselves. Weak reference gets
+                         * are checked separately by a synthetic non-idempotent guard.
+                         */
+                        Idempotence cacheIdempotent = getIdempotence(cache.getDefaultExpression());
+                        switch (cacheIdempotent) {
+                            case IDEMPOTENT:
+                                break;
+                            case NON_IDEMPOTENT:
+                            case UNKNOWN:
+                                current = cacheIdempotent;
+                                break;
+                            default:
+                                throw new AssertionError();
+                        }
+                    }
+                }
+            } else {
+                if (!var.getModifiers().contains(Modifier.FINAL)) {
+                    /*
+                     * If we see a non-final read an expression is sensitive to side-effects.
+                     */
+                    current = Idempotence.NON_IDEMPOTENT;
+                }
+            }
+        }
+    }
+
+    public boolean isBoxingOverloadable(SpecializationData other) {
+        if (!ElementUtils.isPrimitive(other.getReturnType().getType()) && !ElementUtils.isVoid(other.getReturnType().getType())) {
+            return false;
+        }
+
+        List<Parameter> signature = getSignatureParameters();
+        List<Parameter> otherSignature = other.getSignatureParameters();
+        if (signature.size() != otherSignature.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < signature.size(); i++) {
+            Parameter parameter = signature.get(i);
+            Parameter otherParameter = otherSignature.get(i);
+            if (!ElementUtils.typeEquals(parameter.getType(), otherParameter.getType())) {
+                return false;
+            }
+        }
+        if (!Objects.equals(getLimitExpression(), other.getLimitExpression())) {
+            return false;
+        }
+        if (!hasSameGuards(other)) {
+            return false;
+        }
+        if (!hasSameCaches(other)) {
+            return false;
+        }
+        if (!hasSameAssumptions(other)) {
+            return false;
+        }
+        return true;
+    }
+
+    public boolean hasSameGuards(SpecializationData other) {
+        if (this.guards.size() != other.guards.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < guards.size(); i++) {
+            GuardExpression guard = guards.get(i);
+            GuardExpression otherGuard = other.guards.get(i);
+            if (!guard.getExpression().equals(otherGuard.getExpression())) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public boolean hasSameCaches(SpecializationData other) {
+        if (this.caches.size() != other.caches.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < caches.size(); i++) {
+            CacheExpression cache = caches.get(i);
+            CacheExpression otherCache = other.caches.get(i);
+            if (!cache.isSameCache(otherCache)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public boolean hasSameAssumptions(SpecializationData other) {
+        if (this.assumptionExpressions.size() != other.assumptionExpressions.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < assumptionExpressions.size(); i++) {
+            AssumptionExpression assumption = assumptionExpressions.get(i);
+            AssumptionExpression otherAssumptions = other.assumptionExpressions.get(i);
+            if (!assumption.getExpression().equals(otherAssumptions.getExpression())) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public List<SpecializationData> getBoxingOverloads() {
+        return boxingOverloads;
+    }
+
+    public SpecializationData lookupBoxingOverload(ExecutableTypeData type) {
+        if (!type.hasUnexpectedValue()) {
+            return null;
+        }
+        for (SpecializationData specialization : getBoxingOverloads()) {
+            if (ElementUtils.typeEquals(specialization.getReturnType().getType(), type.getReturnType())) {
+                return specialization;
+            }
+        }
+        return null;
+    }
+
+    public TypeMirror lookupBoxingOverloadReturnType(ExecutableTypeData type) {
+        SpecializationData specializationData = lookupBoxingOverload(type);
+        if (specializationData == null) {
+            return getReturnType().getType();
+        } else {
+            return specializationData.getReturnType().getType();
+        }
+
+    }
+
+    public boolean isStatic() {
+        ExecutableElement e = getMethod();
+        if (e != null) {
+            return e.getModifiers().contains(Modifier.STATIC);
+        } else {
+            return true;
+        }
     }
 
 }

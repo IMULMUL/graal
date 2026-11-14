@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,28 +24,41 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
 
-import java.lang.annotation.Annotation;
-import java.util.Arrays;
-
+import com.oracle.svm.guest.staging.jdk.InternalVMMethod;
+import com.oracle.svm.util.GuestAnnotationAccess;
 import org.graalvm.word.WordBase;
 
-import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
 import com.oracle.graal.pointsto.infrastructure.WrappedJavaType;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.hub.DynamicHub;
-import com.oracle.svm.core.meta.SharedType;
+import com.oracle.svm.core.hub.DynamicHubProvider;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.jvmci.shared.meta.SharedType;
+import com.oracle.svm.core.graal.meta.TypeCheckInfoProvider.TypeCheckInfo;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.util.OriginalClassProvider;
 
+import jdk.graal.compiler.debug.Assertions;
 import jdk.vm.ci.meta.Assumptions.AssumptionResult;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import jdk.vm.ci.meta.ResolvedJavaRecordComponent;
 import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.UnresolvedJavaType;
 
-public abstract class HostedType implements SharedType, WrappedJavaType, Comparable<HostedType>, OriginalClassProvider {
+public abstract class HostedType extends HostedElement implements SharedType, DynamicHubProvider, WrappedJavaType, OriginalClassProvider {
+
+    public static final int INVALID_TYPECHECK_ID = -1;
+
+    public static final HostedType[] EMPTY_ARRAY = new HostedType[0];
 
     protected final HostedUniverse universe;
     protected final AnalysisType wrapped;
@@ -56,16 +69,26 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     private final HostedClass superClass;
     private final HostedInterface[] interfaces;
 
-    private HostedType enclosingType;
     protected HostedArrayClass arrayType;
+
+    /**
+     * Sentinel marker for the uninitialized state of {@link #permittedSubclasses}. Indicates that
+     * the permitted subclasses (for sealed types) has not yet been computed. Distinguishes this
+     * state from both a computed {@code null} (not sealed) and a computed list (which may be
+     * empty).
+     */
+    private static final List<? extends HostedType> PERMITTED_SUBCLASSES_UNINITIALIZED = new ArrayList<>();
+    private List<? extends HostedType> permittedSubclasses = PERMITTED_SUBCLASSES_UNINITIALIZED;
     protected HostedType[] subTypes;
     protected HostedField[] staticFields;
 
-    protected HostedMethod[] vtable;
-
+    boolean loadedFromPriorLayer;
     protected int typeID;
-    protected HostedType uniqueConcreteImplementation;
     protected HostedMethod[] allDeclaredMethods;
+
+    // region closed-world only fields
+
+    protected HostedMethod[] closedTypeWorldVTable;
 
     /**
      * Start of type check range check. See {@link DynamicHub}.typeCheckStart
@@ -87,31 +110,93 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     /**
      * Array used within type checks. See {@link DynamicHub}.typeCheckSlots
      */
-    protected short[] typeCheckSlots;
+    protected short[] closedTypeWorldTypeCheckSlots;
+
+    // endregion closed-world only fields
+
+    // region open-world only fields
+
+    protected HostedType[] typeCheckInterfaceOrder;
+    /**
+     * Flattened array of all dispatch tables methods installed in the hub for this type.
+     */
+    protected HostedMethod[] openTypeWorldDispatchTables;
+    /**
+     * The dispatch table metadata used by Crema: for interfaces, the i-table prototype; for
+     * abstract types, the vtable; for other types, the dispatch table (v- & i-tables).
+     */
+    protected HostedMethod[] cremaOpenTypeWorldDispatchTables;
+    /**
+     * Used for tracking original call targets contained within the dispatch table. This is in
+     * contrast with {@link #openTypeWorldDispatchTables}, which contains the resolved methods for
+     * each of the targets for this given type. In other words,
+     *
+     * <code> openTypeWorldDispatchTables[i] = resolveMethod(openTypeWorldDispatchTableSlotTargets[i], [HostedType]) </code>
+     */
+    protected HostedMethod[] openTypeWorldDispatchTableSlotTargets;
+    protected int[] itableStartingOffsets;
 
     /**
-     * A more precise subtype that can replace this type as the declared type of values. Null if
-     * this type is never instantiated and does not have any instantiated subtype, i.e., if no value
-     * of this type can ever exist. Equal to this type if this type is instantiated, i.e, this type
-     * cannot be strengthened.
+     * Instance class depth. Due to single-inheritance a parent class will be at the same depth in
+     * all subtypes. For interface types we set this to a negative value.
      */
-    protected HostedType strengthenStampType;
+    protected int typeIDDepth;
 
-    private final boolean isCloneable;
+    /*
+     * Since we store interfaces within the openTypeWorldTypeCheckSlots, we must know both the
+     * number of class and interface types to ensure we read from the correct locations.
+     */
 
-    public HostedType(HostedUniverse universe, AnalysisType wrapped, JavaKind kind, JavaKind storageKind, HostedClass superClass, HostedInterface[] interfaces, boolean isCloneable) {
+    protected int numClassTypes;
+
+    protected int numInterfaceTypes;
+
+    protected int[] openTypeWorldTypeCheckSlots;
+
+    protected int interfaceID;
+
+    // endregion open-world only fields
+
+    public static final Object UNINITIALIZED = new Object();
+
+    /**
+     * The unique implementor of this type that can replace it in stamps as an exact type.
+     * <p>
+     * A {@code null} value means there is no unique implementor that can replace this type. The
+     * field is set to this type itself if it has no instantiated subtypes to enable its usage as an
+     * exact type, e.g., in places where the original stamp was non-exact.
+     * <p>
+     * In open-world analysis the field is set to {@code null} for non-leaf types since we have to
+     * assume that there may be some instantiated subtypes that we haven't seen yet.
+     */
+    protected Object uniqueConcreteImplementation = UNINITIALIZED;
+
+    /**
+     * A more precise subtype that can replace this type as the declared type of values.
+     * <p>
+     * A {@code null} value means that this type is never instantiated and does not have any
+     * instantiated subtype, i.e., no value of this type can ever exist and the code using this type
+     * is unreachable. It is set to this type if this type is itself instantiated or has more than
+     * one instantiated direct subtype, i.e, this type cannot be strengthened.
+     * <p>
+     * In open-world analysis the field is set to this type itself for non-leaf types since we have
+     * to assume that there may be some instantiated subtypes that we haven't seen yet.
+     */
+    protected Object strengthenStampType = UNINITIALIZED;
+
+    public HostedType(HostedUniverse universe, AnalysisType wrapped, JavaKind kind, JavaKind storageKind, HostedClass superClass, HostedInterface[] interfaces) {
         this.universe = universe;
         this.wrapped = wrapped;
         this.kind = kind;
         this.storageKind = storageKind;
         this.superClass = superClass;
         this.interfaces = interfaces;
-        this.typeID = -1;
-        this.isCloneable = isCloneable;
+        this.typeID = INVALID_TYPECHECK_ID;
     }
 
     public HostedType getStrengthenStampType() {
-        return strengthenStampType;
+        VMError.guarantee(strengthenStampType != UNINITIALIZED, "The strengthenStampType field not initialized for %s", this);
+        return (HostedType) strengthenStampType;
     }
 
     public HostedType[] getSubTypes() {
@@ -119,53 +204,147 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
         return subTypes;
     }
 
-    public HostedMethod[] getVTable() {
-        assert vtable != null;
-        return vtable;
+    protected HostedMethod[] getClosedTypeWorldVTable() {
+        assert closedTypeWorldVTable != null;
+        return closedTypeWorldVTable;
     }
 
+    public HostedMethod[] getOpenTypeWorldDispatchTables() {
+        assert openTypeWorldDispatchTables != null;
+        return openTypeWorldDispatchTables;
+    }
+
+    public HostedMethod[] getCremaOpenTypeWorldDispatchTables() {
+        assert cremaOpenTypeWorldDispatchTables != null : this;
+        return cremaOpenTypeWorldDispatchTables;
+    }
+
+    public HostedMethod[] getOpenTypeWorldDispatchTableSlotTargets() {
+        assert openTypeWorldDispatchTableSlotTargets != null;
+        return openTypeWorldDispatchTableSlotTargets;
+    }
+
+    public HostedMethod[] getVTable() {
+        return SubstrateOptions.useClosedTypeWorldHubLayout() ? getClosedTypeWorldVTable() : getOpenTypeWorldDispatchTables();
+    }
+
+    public HostedMethod[] getInterpreterDispatchTable() {
+        return RuntimeClassLoading.isSupported() ? getCremaOpenTypeWorldDispatchTables() : getVTable();
+    }
+
+    public int getInterpreterClassVTableLength() {
+        if (itableStartingOffsets != null && itableStartingOffsets.length > 0) {
+            return itableStartingOffsets[0];
+        }
+        /*
+         * i-table offsets are only initialized for open-world dispatch tables. Otherwise the
+         * interpreter dispatch table is just the class vtable, so its full length is correct.
+         */
+        assert SubstrateOptions.useClosedTypeWorldHubLayout() || itableStartingOffsets != null : this;
+        return getInterpreterDispatchTable().length;
+    }
+
+    @Override
     public int getTypeID() {
-        assert typeID != -1;
+        assert typeID != INVALID_TYPECHECK_ID;
         return typeID;
     }
 
     public void setTypeCheckRange(short typeCheckStart, short typeCheckRange) {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
         this.typeCheckStart = typeCheckStart;
         this.typeCheckRange = typeCheckRange;
     }
 
     public void setTypeCheckSlot(short typeCheckSlot) {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
         this.typeCheckSlot = typeCheckSlot;
     }
 
-    public void setTypeCheckSlots(short[] typeCheckSlots) {
-        this.typeCheckSlots = typeCheckSlots;
+    public void setClosedTypeWorldTypeCheckSlots(short[] closedTypeWorldTypeCheckSlots) {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
+        this.closedTypeWorldTypeCheckSlots = closedTypeWorldTypeCheckSlots;
     }
 
     public short getTypeCheckStart() {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
         return typeCheckStart;
     }
 
+    @Override
+    public TypeCheckInfo getTypeCheckInfo() {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
+        return new TypeCheckInfo(typeCheckStart, typeCheckRange, typeCheckSlot);
+    }
+
     public short getTypeCheckRange() {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
         return typeCheckRange;
     }
 
     public short getTypeCheckSlot() {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
         return typeCheckSlot;
     }
 
-    public short[] getTypeCheckSlots() {
-        assert typeCheckSlots != null;
-        return typeCheckSlots;
+    public short[] getClosedTypeWorldTypeCheckSlots() {
+        assert SubstrateOptions.useClosedTypeWorldHubLayout();
+        assert closedTypeWorldTypeCheckSlots != null;
+        return closedTypeWorldTypeCheckSlots;
     }
 
-    /**
-     * Returns true if this type is part of the word type hierarchy, i.e, implements
-     * {@link WordBase}.
-     */
+    public void setTypeIDDepth(int typeIDDepth) {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        this.typeIDDepth = typeIDDepth;
+    }
+
+    public void setNumClassTypes(int numClassTypes) {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        this.numClassTypes = numClassTypes;
+    }
+
+    public void setNumInterfaceTypes(int numInterfaceTypes) {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        this.numInterfaceTypes = numInterfaceTypes;
+    }
+
+    public void setOpenTypeWorldTypeCheckSlots(int[] openTypeWorldTypeCheckSlots) {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        this.openTypeWorldTypeCheckSlots = openTypeWorldTypeCheckSlots;
+    }
+
+    public int getTypeIDDepth() {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        return typeIDDepth;
+    }
+
+    public int getNumClassTypes() {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        return numClassTypes;
+    }
+
+    public int getNumInterfaceTypes() {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        return numInterfaceTypes;
+    }
+
+    public int[] getOpenTypeWorldTypeCheckSlots() {
+        assert !SubstrateOptions.useClosedTypeWorldHubLayout();
+        assert openTypeWorldTypeCheckSlots != null : this;
+        return openTypeWorldTypeCheckSlots;
+    }
+
+    @Override
+    public int getInterfaceID() {
+        return interfaceID;
+    }
+
+    @Override
     public boolean isWordType() {
         /* Word types have the kind Object, but a primitive storageKind. */
-        return kind != storageKind;
+        boolean wordType = kind != storageKind;
+        assert !wordType || kind.isObject() : Assertions.errorMessage("Only words are expected to have a discrepancy between java kind and storage kind", this);
+        return wordType;
     }
 
     /**
@@ -177,8 +356,10 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
         return allDeclaredMethods;
     }
 
-    public HostedType getUniqueConcreteImplementation() {
-        return uniqueConcreteImplementation;
+    public void loadTypeAndInterfaceID(int newTypeID, int newInterfaceID) {
+        this.typeID = newTypeID;
+        this.interfaceID = newInterfaceID;
+        this.loadedFromPriorLayer = true;
     }
 
     @Override
@@ -198,6 +379,21 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     @Override
     public final String getName() {
         return wrapped.getName();
+    }
+
+    @Override
+    public String toClassName() {
+        return wrapped.toClassName();
+    }
+
+    @Override
+    public String toJavaName() {
+        return wrapped.toJavaName();
+    }
+
+    @Override
+    public String toJavaName(boolean qualified) {
+        return wrapped.toJavaName(qualified);
     }
 
     @Override
@@ -221,6 +417,11 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     }
 
     @Override
+    public ResolvedJavaType lookupType(UnresolvedJavaType unresolvedJavaType, boolean resolve) {
+        return universe.lookup(wrapped.lookupType(unresolvedJavaType, resolve));
+    }
+
+    @Override
     public final boolean hasFinalizer() {
         /* We just ignore finalizers. */
         return false;
@@ -234,7 +435,13 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
 
     @Override
     public final boolean isInitialized() {
-        return wrapped.isInitialized();
+        /*
+         * Note that we do not delegate to wrapped.isInitialized here: when a class initializer is
+         * simulated at image build time, then AnalysisType.isInitialized() returns false but
+         * DynamicHub.isInitialized returns true. We want to treat such classes as initialized
+         * during AOT compilation.
+         */
+        return getHub().isInitialized();
     }
 
     @Override
@@ -245,6 +452,23 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     @Override
     public final HostedArrayClass getArrayClass() {
         return arrayType;
+    }
+
+    @Override
+    public boolean isHidden() {
+        return wrapped.isHidden();
+    }
+
+    @Override
+    public List<? extends HostedType> getPermittedSubclasses() {
+        if (isPrimitive() || isArray()) {
+            return null;
+        }
+        if (permittedSubclasses == PERMITTED_SUBCLASSES_UNINITIALIZED) {
+            List<? extends AnalysisType> aPermittedSubclasses = wrapped.getPermittedSubclasses();
+            permittedSubclasses = aPermittedSubclasses == null ? null : aPermittedSubclasses.stream().map(universe::lookup).collect(Collectors.toUnmodifiableList());
+        }
+        return permittedSubclasses;
     }
 
     public HostedType getArrayClass(int dimension) {
@@ -296,7 +520,8 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
 
     @Override
     public HostedType getSingleImplementor() {
-        return uniqueConcreteImplementation;
+        VMError.guarantee(uniqueConcreteImplementation != UNINITIALIZED, "The uniqueConcreteImplementation field not initialized for %s", this);
+        return (HostedType) uniqueConcreteImplementation;
     }
 
     @Override
@@ -305,54 +530,30 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     }
 
     @Override
-    public final ResolvedJavaType findLeastCommonAncestor(ResolvedJavaType otherType) {
+    public final HostedType findLeastCommonAncestor(ResolvedJavaType otherType) {
         return universe.lookup(wrapped.findLeastCommonAncestor(((HostedType) otherType).wrapped));
     }
 
     @Override
-    public ResolvedJavaMethod resolveConcreteMethod(ResolvedJavaMethod m, ResolvedJavaType ct) {
+    public ResolvedJavaMethod resolveConcreteMethod(ResolvedJavaMethod m, ResolvedJavaType callerType) {
         HostedMethod method = (HostedMethod) m;
-        HostedType callerType = (HostedType) ct;
 
-        if (isWordType()) {
+        AnalysisMethod aResult = wrapped.resolveConcreteMethod(method.wrapped);
+        HostedMethod hResult;
+        if (aResult == null) {
+            hResult = null;
+        } else if (!aResult.isImplementationInvoked() && !isWordType()) {
             /*
-             * We do not keep any method information on word types on our own, so ask the hosting VM
-             * for the answer.
+             * Filter out methods that are not seen as invoked by the static analysis, e.g., because
+             * the declaring type is not instantiated. Word types are an exception, because methods
+             * of word types are never marked as invoked (they are always intrinsified).
              */
-            return wrappedResolveMethod(method, callerType);
+            hResult = null;
+        } else {
+            hResult = universe.lookup(aResult);
         }
 
-        /* Use the same algorithm that is also used for SubstrateType during runtime compilation. */
-        ResolvedJavaMethod found = SharedType.super.resolveConcreteMethod(method, callerType);
-        /* Check that our algorithm returns the same result as the hosting VM. */
-
-        /*
-         * For abstract classes, our result can be different than the result from HotSpot. It is
-         * unclear what concrete method resolution on an abstract class means.
-         */
-        assert isAbstract() || (found == null || checkWrappedResolveMethod(method, found, callerType));
-
-        return found;
-    }
-
-    private boolean checkWrappedResolveMethod(HostedMethod method, ResolvedJavaMethod found, HostedType callerType) {
-        /*
-         * The static analysis can determine that the resolved wrapped method is not reachable, case
-         * in which wrappedResolveMethod returns null.
-         */
-        ResolvedJavaMethod wrappedMethod = wrappedResolveMethod(method, callerType);
-        return wrappedMethod == null || found.equals(wrappedMethod);
-    }
-
-    private ResolvedJavaMethod wrappedResolveMethod(HostedMethod method, HostedType callerType) {
-        AnalysisMethod orig = wrapped.resolveConcreteMethod(method.wrapped, callerType.wrapped);
-        ResolvedJavaMethod result = orig == null ? null : universe.lookup(orig);
-
-        if (result != null && !isWordType() && !Arrays.asList(method.getImplementations()).contains(result)) {
-            /* Our static analysis found out that this method is not reachable. */
-            result = null;
-        }
-        return result;
+        return hResult;
     }
 
     @Override
@@ -362,7 +563,6 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
 
     @Override
     public final boolean isInstance(JavaConstant obj) {
-        assert universe.lookup(obj) == obj : "constant should not have analysis-universe dependent value";
         return wrapped.isInstance(obj);
     }
 
@@ -372,28 +572,13 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return wrapped.getAnnotations();
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return wrapped.getDeclaredAnnotations();
-    }
-
-    @Override
-    public final <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return wrapped.getAnnotation(annotationClass);
-    }
-
-    @Override
     public String getSourceFileName() {
         return wrapped.getSourceFileName();
     }
 
     @Override
     public String toString() {
-        return "HostedType<" + toJavaName(true) + "   " + wrapped.toString() + ">";
+        return "HostedType<" + toJavaName(false) + " -> " + wrapped.toString() + ">";
     }
 
     @Override
@@ -408,17 +593,48 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
 
     @Override
     public HostedType getEnclosingType() {
-        return enclosingType;
+        return universe.lookup(wrapped.getEnclosingType());
     }
 
     @Override
-    public HostedMethod[] getDeclaredConstructors() {
-        return universe.lookup(wrapped.getDeclaredConstructors());
+    public HostedMethod getEnclosingMethod() {
+        return universe.lookup(wrapped.getEnclosingMethod());
     }
 
     @Override
-    public HostedMethod[] getDeclaredMethods() {
-        return universe.lookup(wrapped.getDeclaredMethods());
+    public ResolvedJavaType[] getDeclaredTypes() {
+        ResolvedJavaType[] declaredTypes = wrapped.getDeclaredTypes();
+        for (int i = 0; i < declaredTypes.length; i++) {
+            declaredTypes[i] = universe.lookup(declaredTypes[i]);
+        }
+        return declaredTypes;
+    }
+
+    @Override
+    public ResolvedJavaMethod[] getDeclaredConstructors() {
+        return getDeclaredConstructors(true);
+    }
+
+    @Override
+    public List<? extends ResolvedJavaRecordComponent> getRecordComponents() {
+        return wrapped.getRecordComponents();
+    }
+
+    @Override
+    public HostedMethod[] getDeclaredConstructors(boolean forceLink) {
+        VMError.guarantee(forceLink == false, "only use getDeclaredConstructors without forcing to link, because linking can throw LinkageError");
+        return universe.lookup(wrapped.getDeclaredConstructors(forceLink));
+    }
+
+    @Override
+    public ResolvedJavaMethod[] getDeclaredMethods() {
+        return getDeclaredMethods(true);
+    }
+
+    @Override
+    public HostedMethod[] getDeclaredMethods(boolean forceLink) {
+        VMError.guarantee(forceLink == false, "only use getDeclaredMethods without forcing to link, because linking can throw LinkageError");
+        return universe.lookup(wrapped.getDeclaredMethods(forceLink));
     }
 
     @Override
@@ -441,6 +657,11 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
     }
 
     @Override
+    public boolean isRecord() {
+        return wrapped.isRecord();
+    }
+
+    @Override
     public boolean hasDefaultMethods() {
         return wrapped.hasDefaultMethods();
     }
@@ -452,52 +673,32 @@ public abstract class HostedType implements SharedType, WrappedJavaType, Compara
 
     @Override
     public boolean isCloneableWithAllocation() {
-        return isCloneable;
+        return wrapped.isCloneableWithAllocation();
     }
 
     @Override
-    public ResolvedJavaType getHostClass() {
-        return universe.lookup(wrapped.getHostClass());
+    public ResolvedJavaType unwrapTowardsOriginalType() {
+        return wrapped;
     }
 
-    public void setEnclosingType(HostedType enclosingType) {
-        this.enclosingType = enclosingType;
-    }
-
-    @Override
     public Class<?> getJavaClass() {
-        return OriginalClassProvider.getJavaClass(universe.getSnippetReflection(), wrapped);
+        return OriginalClassProvider.getJavaClass(this);
     }
 
     @Override
-    public int compareTo(HostedType other) {
-        if (this.equals(other)) {
-            return 0;
+    public AssumptionResult<ResolvedJavaMethod> findUniqueConcreteMethod(ResolvedJavaMethod m) {
+        if (m.canBeStaticallyBound() || universe.hostVM().isClosedTypeWorld()) {
+            return SharedType.super.findUniqueConcreteMethod(m);
         }
-        if (this.getClass().equals(other.getClass())) {
-            return compareToEqualClass(other);
-        }
-        int result = this.ordinal() - other.ordinal();
-        assert result != 0 : "Types not distinguishable: " + this + ", " + other;
-        return result;
+        /*
+         * With an open type world analysis we cannot make assumptions for methods that cannot be
+         * trivially statically bound.
+         */
+        return null;
     }
 
-    int compareToEqualClass(HostedType other) {
-        assert getClass().equals(other.getClass());
-        return getName().compareTo(other.getName());
-    }
-
-    private int ordinal() {
-        if (isInterface()) {
-            return 4;
-        } else if (isArray()) {
-            return 3;
-        } else if (isInstanceClass()) {
-            return 2;
-        } else if (getJavaKind() != JavaKind.Object) {
-            return 1;
-        } else {
-            throw shouldNotReachHere();
-        }
+    @Override
+    public boolean isInternalVMMethods() {
+        return GuestAnnotationAccess.isAnnotationPresent(this, InternalVMMethod.class);
     }
 }

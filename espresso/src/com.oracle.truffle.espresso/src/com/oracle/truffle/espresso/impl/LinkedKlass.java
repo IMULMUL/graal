@@ -22,16 +22,21 @@
  */
 package com.oracle.truffle.espresso.impl;
 
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_CONTAINS_UNHIDDEN_FIELDS;
 import static com.oracle.truffle.espresso.classfile.Constants.ACC_FINALIZER;
 
 import java.lang.reflect.Modifier;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.espresso.classfile.ConstantPool;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
-import com.oracle.truffle.espresso.runtime.Attribute;
+import com.oracle.truffle.api.staticobject.StaticShape;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.ParserConstantPool;
+import com.oracle.truffle.espresso.classfile.ParserKlass;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject.StaticObjectFactory;
 
 // Structural shareable klass (superklass in superinterfaces resolved and linked)
 // contains shape, field locations.
@@ -47,17 +52,30 @@ public final class LinkedKlass {
     @CompilationFinal(dimensions = 1) //
     private final LinkedKlass[] interfaces;
 
-    @CompilationFinal(dimensions = 1) //
-    private final LinkedMethod[] methods;
-
     private final boolean hasFinalizer;
 
-    private final LinkedKlassFieldLayout fieldLayout;
+    private final StaticShape<StaticObjectFactory> instanceShape;
+    private final StaticShape<StaticObjectFactory> staticShape;
 
-    public LinkedKlass(ParserKlass parserKlass, LinkedKlass superKlass, LinkedKlass[] interfaces) {
+    // instance fields declared in the corresponding LinkedKlass (includes hidden fields)
+    @CompilationFinal(dimensions = 1) //
+    final LinkedField[] instanceFields;
+    // static fields declared in the corresponding LinkedKlass (no hidden fields)
+    @CompilationFinal(dimensions = 1) //
+    final LinkedField[] staticFields;
+
+    final int fieldTableLength;
+
+    private LinkedKlass(ParserKlass parserKlass, LinkedKlass superKlass, LinkedKlass[] interfaces, StaticShape<StaticObjectFactory> instanceShape,
+                    StaticShape<StaticObjectFactory> staticShape, LinkedField[] instanceFields, LinkedField[] staticFields, int fieldTableLength) {
         this.parserKlass = parserKlass;
         this.superKlass = superKlass;
         this.interfaces = interfaces;
+        this.instanceShape = instanceShape;
+        this.staticShape = staticShape;
+        this.instanceFields = instanceFields;
+        this.staticFields = staticFields;
+        this.fieldTableLength = fieldTableLength;
 
         // Streams are forbidden in Espresso.
         // assert Arrays.stream(interfaces).allMatch(i -> Modifier.isInterface(i.getFlags()));
@@ -66,45 +84,38 @@ public final class LinkedKlass {
         // Super interfaces are not checked for finalizers; a default .finalize method will be
         // resolved to Object.finalize, making the finalizer not observable.
         this.hasFinalizer = ((parserKlass.getFlags() & ACC_FINALIZER) != 0) || (superKlass != null && (superKlass.getFlags() & ACC_FINALIZER) != 0);
-        assert !this.hasFinalizer || !Type.java_lang_Object.equals(parserKlass.getType()) : "java.lang.Object cannot be marked as finalizable";
-
-        final int methodCount = parserKlass.getMethods().length;
-        LinkedMethod[] linkedMethods = new LinkedMethod[methodCount];
-
-        for (int i = 0; i < methodCount; ++i) {
-            ParserMethod parserMethod = parserKlass.getMethods()[i];
-            // TODO(peterssen): Methods with custom constant pool should spawned here, but not
-            // supported.
-            linkedMethods[i] = new LinkedMethod(parserMethod);
-        }
-
-        this.methods = linkedMethods;
-
-        fieldLayout = LinkedKlassFieldLayout.create(parserKlass, superKlass);
+        assert !this.hasFinalizer || !Types.java_lang_Object.equals(parserKlass.getType()) : "java.lang.Object cannot be marked as finalizable";
     }
 
-    public int getObjectFieldsCount() {
-        return fieldLayout.objectFields;
+    public static LinkedKlass create(EspressoLanguage language, ParserKlass parserKlass, LinkedKlass superKlass, LinkedKlass[] interfaces) {
+        LinkedKlassFieldLayout fieldLayout = new LinkedKlassFieldLayout(language, parserKlass, superKlass);
+        return new LinkedKlass(
+                        parserKlass,
+                        superKlass,
+                        interfaces,
+                        fieldLayout.instanceShape,
+                        fieldLayout.staticShape,
+                        fieldLayout.instanceFields,
+                        fieldLayout.staticFields,
+                        fieldLayout.fieldTableLength);
     }
 
-    public int getInstancePrimitiveToAlloc() {
-        return fieldLayout.instanceToAlloc;
-    }
-
-    public int getPrimitiveInstanceFieldLastOffset() {
-        return fieldLayout.primInstanceLastOffset;
-    }
-
-    public int getStaticObjectFieldsCount() {
-        return fieldLayout.staticObjectFields;
-    }
-
-    public int getStaticPrimitiveToAlloc() {
-        return fieldLayout.staticToAlloc;
-    }
-
-    public int getPrimitiveStaticFieldLastOffset() {
-        return fieldLayout.primStaticLastOffset;
+    public static LinkedKlass redefine(ParserKlass parserKlass, LinkedKlass superKlass, LinkedKlass[] interfaces, LinkedKlass redefinedKlass) {
+        // On class redefinition we need to re-use the old shape.
+        // If we don't do it, shape checks on field accesses fail because `Field` instances in
+        // `ObjectKlass.fieldTable` hold references to the old shape, which does not match the shape
+        // of the new object instances.
+        // We work around this by means of an extension mechanism where all shapes contain
+        // one extra element
+        return new LinkedKlass(
+                        parserKlass,
+                        superKlass,
+                        interfaces,
+                        redefinedKlass.instanceShape,
+                        redefinedKlass.staticShape,
+                        redefinedKlass.instanceFields,
+                        redefinedKlass.staticFields,
+                        redefinedKlass.fieldTableLength);
     }
 
     int getFlags() {
@@ -112,15 +123,17 @@ public final class LinkedKlass {
         if (hasFinalizer) {
             flags |= ACC_FINALIZER;
         }
+        for (LinkedField lkField : instanceFields) {
+            if (!lkField.isHidden()) {
+                flags |= ACC_CONTAINS_UNHIDDEN_FIELDS;
+                break;
+            }
+        }
         return flags;
     }
 
-    ConstantPool getConstantPool() {
+    ParserConstantPool getConstantPool() {
         return parserKlass.getConstantPool();
-    }
-
-    Attribute getAttribute(Symbol<Name> name) {
-        return parserKlass.getAttribute(name);
     }
 
     Symbol<Type> getType() {
@@ -131,7 +144,7 @@ public final class LinkedKlass {
         return parserKlass.getName();
     }
 
-    ParserKlass getParserKlass() {
+    public ParserKlass getParserKlass() {
         return parserKlass;
     }
 
@@ -151,23 +164,24 @@ public final class LinkedKlass {
         return getConstantPool().getMinorVersion();
     }
 
-    LinkedMethod[] getLinkedMethods() {
-        return methods;
-    }
-
     LinkedField[] getInstanceFields() {
-        return fieldLayout.instanceFields;
+        return instanceFields;
     }
 
     LinkedField[] getStaticFields() {
-        return fieldLayout.staticFields;
+        return staticFields;
     }
 
     int getFieldTableLength() {
-        return fieldLayout.fieldTableLength;
+        return fieldTableLength;
     }
 
-    int[][] getLeftoverHoles() {
-        return fieldLayout.leftoverHoles;
+    public StaticShape<StaticObjectFactory> getShape(boolean isStatic) {
+        return isStatic ? staticShape : instanceShape;
+    }
+
+    @Override
+    public String toString() {
+        return "LinkedKlass<" + getType() + ">";
     }
 }

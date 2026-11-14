@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+# Copyright (c) 2016, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -28,15 +28,18 @@
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 import os
+import tempfile
+from argparse import ArgumentParser
 
 import mx
+import mx_util
 import mx_sulong
 
 _suite = mx.suite('sulong')
 
 COPYRIGHT_HEADER_BSD = """\
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2026, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -72,7 +75,7 @@ COPYRIGHT_HEADER_BSD = """\
 
 COPYRIGHT_HEADER_BSD_HASH = """\
 #
-# Copyright (c) 2020, 2021, Oracle and/or its affiliates.
+# Copyright (c) 2020, 2026, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -106,7 +109,7 @@ COPYRIGHT_HEADER_BSD_HASH = """\
 @mx.command(_suite.name, 'create-asm-parser')
 def create_asm_parser(args=None, out=None):
     """create the inline assembly parser using antlr"""
-    mx.suite("truffle").extensions.create_parser("com.oracle.truffle.llvm.asm.amd64", "com.oracle.truffle.llvm.asm.amd64", "InlineAssembly", COPYRIGHT_HEADER_BSD, args, out)
+    mx.suite("truffle").extensions.create_parser("com.oracle.truffle.llvm.asm.amd64", "com.oracle.truffle.llvm.asm.amd64", "InlineAssembly", args=args, out=out, shaded=True)
 
 
 @mx.command(_suite.name, 'create-debugexpr-parser')
@@ -115,7 +118,7 @@ def create_debugexpr_parser(args=None, out=None):
     mx.suite("truffle").extensions.create_parser(grammar_project="com.oracle.truffle.llvm.runtime",
                                                  grammar_package="com.oracle.truffle.llvm.runtime.debug.debugexpr.parser.antlr",
                                                  grammar_name="DebugExpression",
-                                                 copyright_template=COPYRIGHT_HEADER_BSD, args=args, out=out)
+                                                 args=args, out=out, shaded=True)
 
 
 @mx.command(_suite.name, 'create-parsers')
@@ -125,45 +128,44 @@ def create_parsers(args=None, out=None):
     create_debugexpr_parser(args, out)
 
 
-def _write_llvm_config_java(constants, file_comment=None):
-    package_name = "com.oracle.truffle.llvm.toolchain.config"
-    project_name = package_name
+def _write_llvm_config_java(project_name, constants, file_comment=None):
+    package_name = project_name
     class_name = "LLVMConfig"
     source_gen_dir = mx.dependency(project_name).source_dirs()[0]
     rel_file = package_name.split(".") + [class_name + ".java"]
     src_file = os.path.join(source_gen_dir, *rel_file)
-    mx.ensure_dir_exists(os.path.dirname(src_file))
-    with open(src_file, "w") as fp:
-        mx.log("Generating {}".format(src_file))
-        fp.write(COPYRIGHT_HEADER_BSD.format("package {package};".format(package=package_name)))
+    mx_util.ensure_dir_exists(os.path.dirname(src_file))
+    with open(src_file, "w", encoding='utf-8') as fp:
+        mx.log(f"Generating {src_file}")
+        fp.write(COPYRIGHT_HEADER_BSD.format(f"package {package_name};"))
         if file_comment:
-            fp.write("\n/**\n * {}\n */\n".format(file_comment))
-        fp.write("public abstract class {class_name} {{\n".format(class_name=class_name))
-        fp.write("\n    private {class_name}() {{}}\n\n".format(class_name=class_name))
+            fp.write(f"\n/**\n * {file_comment}\n */\n")
+        fp.write(f"public abstract class {class_name} {{\n")
+        fp.write(f"\n    private {class_name}() {{}}\n\n")
         for const_name, value, description in constants:
-            fp.write("    /** {} */\n".format(description))
+            fp.write(f"    /** {description} */\n")
             if isinstance(value, int):
-                fp.write("    public static final int {} = {};\n".format(const_name, value))
+                fp.write(f"    public static final int {const_name} = {value};\n")
             else:
-                fp.write("    public static final String {} = \"{}\";\n".format(const_name, value))
+                fp.write(f"    public static final String {const_name} = \"{value}\";\n")
         fp.write("}\n")
 
 
 def _write_llvm_config_mx(constants, file_comment=None):
     file_name = "mx_sulong_llvm_config.py"
     src_file = os.path.join(_suite.mxDir, file_name)
-    mx.ensure_dir_exists(os.path.dirname(src_file))
-    with open(src_file, "w") as fp:
-        mx.log("Generating {}".format(src_file))
+    mx_util.ensure_dir_exists(os.path.dirname(src_file))
+    with open(src_file, "w", encoding='utf-8') as fp:
+        mx.log(f"Generating {src_file}")
         fp.write(COPYRIGHT_HEADER_BSD_HASH)
         if file_comment:
-            fp.write("\n# {}\n\n".format(file_comment))
+            fp.write(f"\n# {file_comment}\n\n")
         for const_name, value, description in constants:
-            fp.write("# {}\n".format(description))
+            fp.write(f"# {description}\n")
             if isinstance(value, int):
-                fp.write("{} = {}\n".format(const_name, value))
+                fp.write(f"{const_name} = {value}\n")
             else:
-                fp.write("{} = \"{}\"\n".format(const_name, value))
+                fp.write(f"{const_name} = \"{value}\"\n")
 
 
 GENERATE_LLVM_CONFIG = "generate-llvm-config"
@@ -191,13 +193,44 @@ def generate_llvm_config(args=None, **kwargs):
     constants.append(("VERSION_MINOR", int(minor_version), "Minor version of the LLVM API."))
     constants.append(("VERSION_PATCH", int(patch_version), "Patch version of the LLVM API."))
 
-    file_comment = "GENERATED BY 'mx {}'. DO NOT MODIFY.".format(GENERATE_LLVM_CONFIG)
+    file_comment = f"GENERATED BY 'mx {GENERATE_LLVM_CONFIG}'. DO NOT MODIFY."
 
-    _write_llvm_config_java(constants, file_comment)
+    _write_llvm_config_java("com.oracle.truffle.llvm.runtime", constants, file_comment)
+    _write_llvm_config_java("com.oracle.truffle.llvm.toolchain.launchers", constants, file_comment)
     _write_llvm_config_mx(constants, file_comment)
 
 
 @mx.command(_suite.name, "create-generated-sources", usage_msg="# recreate generated source files (parsers, config files)")
 def create_generated_sources(args=None, out=None):
-    create_parsers(args, out=out)
-    generate_llvm_config(args, out=out)
+    parser = ArgumentParser(prog='mx create-generated-sources', description='recreate generated source files (parsers, config files)')
+    parser.add_argument('--check', action='store_true', help='check for differences, fail if anything changed')
+    parsed_args, args = parser.parse_known_args(args)
+
+    witness_name = None
+    if parsed_args.check:
+        witness_fd, witness_name = tempfile.mkstemp()
+        os.close(witness_fd)
+        with open(witness_name, 'w', encoding='utf-8') as witness:
+            mx.run(['git', 'diff', '--', _suite.dir], out=witness)
+
+    try:
+        create_parsers(args, out=out)
+        generate_llvm_config(args, out=out)
+
+        if parsed_args.check:
+            with tempfile.NamedTemporaryFile() as f2:
+                mx.run(['git', 'diff', '--', _suite.dir], out=f2)
+                with open(witness_name, encoding='utf-8') as before, open(f2.name, encoding='utf-8') as after:
+                    while True:
+                        line_before = before.readline()
+                        line_after = after.readline()
+                        if line_before != line_after:
+                            mx.run(['git', 'diff', '--', _suite.dir])
+                            if os.path.getsize(witness_name) > 0:
+                                mx.warn("There were changes before so the diff above might be misleading (e.g., create-generated-sources might have reverted some changes)")
+                            mx.abort('Generating sources changed some files. See diff above')
+                        if line_before == '' or line_after == '':
+                            break
+    finally:
+        if witness_name and os.path.exists(witness_name):
+            os.unlink(witness_name)

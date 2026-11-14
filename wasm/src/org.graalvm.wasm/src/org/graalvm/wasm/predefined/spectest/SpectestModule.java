@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,36 +41,42 @@
 
 package org.graalvm.wasm.predefined.spectest;
 
-import org.graalvm.wasm.ReferenceTypes;
-import org.graalvm.wasm.WasmContext;
-import org.graalvm.wasm.WasmInstance;
-import org.graalvm.wasm.WasmLanguage;
-import org.graalvm.wasm.WasmModule;
-import org.graalvm.wasm.constants.GlobalModifier;
-import org.graalvm.wasm.predefined.BuiltinModule;
-
 import static org.graalvm.wasm.WasmType.F32_TYPE;
 import static org.graalvm.wasm.WasmType.F64_TYPE;
 import static org.graalvm.wasm.WasmType.I32_TYPE;
 import static org.graalvm.wasm.WasmType.I64_TYPE;
 
+import org.graalvm.wasm.WasmContext;
+import org.graalvm.wasm.WasmLanguage;
+import org.graalvm.wasm.WasmModule;
+import org.graalvm.wasm.WasmType;
+import org.graalvm.wasm.constants.Mutability;
+import org.graalvm.wasm.predefined.BuiltinModule;
+
 public class SpectestModule extends BuiltinModule {
+
     @Override
-    protected WasmInstance createInstance(WasmLanguage language, WasmContext context, String name) {
-        WasmInstance module = new WasmInstance(context, new WasmModule(name, null));
-        defineFunction(module, "print", types(), types(), new PrintNode(language, module));
-        defineFunction(module, "print_i32", types(I32_TYPE), types(), new PrintNode(language, module));
-        defineFunction(module, "print_i64", types(I64_TYPE), types(), new PrintNode(language, module));
-        defineFunction(module, "print_f32", types(F32_TYPE), types(), new PrintNode(language, module));
-        defineFunction(module, "print_f64", types(F64_TYPE), types(), new PrintNode(language, module));
-        defineFunction(module, "print_i32_f32", types(I32_TYPE, F32_TYPE), types(), new PrintNode(language, module));
-        defineFunction(module, "print_f64_f64", types(F64_TYPE, F64_TYPE), types(), new PrintNode(language, module));
-        defineGlobal(module, "global_i32", I32_TYPE, (byte) GlobalModifier.CONSTANT, 666);
-        defineGlobal(module, "global_i64", I64_TYPE, (byte) GlobalModifier.CONSTANT, 666L);
-        defineGlobal(module, "global_f32", F32_TYPE, (byte) GlobalModifier.CONSTANT, Float.floatToRawIntBits(666.0f));
-        defineGlobal(module, "global_f64", F64_TYPE, (byte) GlobalModifier.CONSTANT, Double.doubleToRawLongBits(666.0));
-        defineTable(module, "table", 10, 20, ReferenceTypes.FUNCREF);
-        defineMemory(module, "memory", 1, 2);
+    protected WasmModule createModule(WasmLanguage language, WasmContext context, String name) {
+        WasmModule module = WasmModule.createBuiltin(language, name);
+        defineFunction(context, module, "print", types(), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_i32", types(I32_TYPE), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_i64", types(I64_TYPE), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_f32", types(F32_TYPE), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_f64", types(F64_TYPE), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_i32_f32", types(I32_TYPE, F32_TYPE), types(), new PrintNode(language, module));
+        defineFunction(context, module, "print_f64_f64", types(F64_TYPE, F64_TYPE), types(), new PrintNode(language, module));
+        defineGlobal(module, "global_i32", I32_TYPE, Mutability.CONSTANT, 666);
+        defineGlobal(module, "global_i64", I64_TYPE, Mutability.CONSTANT, 666L);
+        defineGlobal(module, "global_f32", F32_TYPE, Mutability.CONSTANT, 666.6f);
+        defineGlobal(module, "global_f64", F64_TYPE, Mutability.CONSTANT, 666.6);
+        defineTable(context, module, "table", 10, 20, false, WasmType.FUNCREF_TYPE);
+        if (context.getContextOptions().supportMemory64()) {
+            defineTable(context, module, "table64", 10, 20, true, WasmType.FUNCREF_TYPE);
+        }
+        defineMemory(context, module, "memory", 1, 2, false, false);
+        if (context.getContextOptions().supportThreads() && context.getContextOptions().useUnsafeMemory()) {
+            defineMemory(context, module, "shared_memory", 1, 2, false, true);
+        }
         return module;
     }
 }

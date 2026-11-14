@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,33 +24,34 @@
  */
 package com.oracle.svm.hosted.jdk;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
 
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.hosted.RuntimeJNIAccess;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.hub.registry.ClassRegistries;
 import com.oracle.svm.core.jdk.JNIRegistrationUtil;
-import com.oracle.svm.core.jdk.PlatformNativeLibrarySupport;
-import com.oracle.svm.core.jni.JNIRuntimeAccess;
 import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.util.dynamicaccess.JVMCIRuntimeJNIAccess;
+
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
  * Registration of classes, methods, and fields accessed via JNI by C code of the JDK.
  */
 @Platforms(InternalPlatform.PLATFORM_JNI.class)
-@AutomaticFeature
-class JNIRegistrationJava extends JNIRegistrationUtil implements Feature {
+@AutomaticallyRegisteredFeature
+class JNIRegistrationJava extends JNIRegistrationUtil implements InternalFeature {
 
     private static final Consumer<DuringAnalysisAccess> CORESERVICES_LINKER = (duringAnalysisAccess -> {
         FeatureImpl.DuringAnalysisAccessImpl accessImpl = (FeatureImpl.DuringAnalysisAccessImpl) duringAnalysisAccess;
-        accessImpl.getNativeLibraries().addDynamicNonJniLibrary("-framework CoreServices");
+        accessImpl.getNativeLibraries().addDynamicLibrary("-framework CoreServices");
     });
 
     @Override
@@ -66,96 +67,91 @@ class JNIRegistrationJava extends JNIRegistrationUtil implements Feature {
                         "java.lang.NoSuchFieldError", "java.lang.NoSuchMethodError", "java.lang.UnsatisfiedLinkError", "java.lang.StringIndexOutOfBoundsException",
                         "java.lang.InstantiationException", "java.lang.UnsupportedOperationException",
                         "java.io.IOException", "java.io.FileNotFoundException", "java.io.SyncFailedException", "java.io.InterruptedIOException",
-                        "java.util.zip.DataFormatException");
-        JNIRuntimeAccess.register(constructor(a, "java.io.FileNotFoundException", String.class, String.class));
+                        "java.util.zip.DataFormatException", "java.lang.IndexOutOfBoundsException");
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.io.FileNotFoundException", String.class, String.class));
 
         /* Unconditional Integer and Boolean JNI registration (cheap) */
-        JNIRuntimeAccess.register(clazz(a, "java.lang.Integer"));
-        JNIRuntimeAccess.register(constructor(a, "java.lang.Integer", int.class));
-        JNIRuntimeAccess.register(fields(a, "java.lang.Integer", "value"));
-        JNIRuntimeAccess.register(clazz(a, "java.lang.Boolean"));
-        JNIRuntimeAccess.register(constructor(a, "java.lang.Boolean", boolean.class));
-        JNIRuntimeAccess.register(fields(a, "java.lang.Boolean", "value"));
-        JNIRuntimeAccess.register(method(a, "java.lang.Boolean", "getBoolean", String.class));
+        JVMCIRuntimeJNIAccess.register(type(a, "java.lang.Integer"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.lang.Integer", int.class));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.lang.Integer", "value"));
+        JVMCIRuntimeJNIAccess.register(type(a, "java.lang.Boolean"));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.lang.Boolean", boolean.class));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.lang.Boolean", "value"));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.lang.Boolean", "getBoolean", String.class));
 
         /*
          * Core JDK elements accessed from many places all around the JDK. They can be registered
          * unconditionally.
          */
 
-        JNIRuntimeAccess.register(java.io.FileDescriptor.class);
-        JNIRuntimeAccess.register(fields(a, "java.io.FileDescriptor", "fd"));
+        RuntimeJNIAccess.register(java.io.FileDescriptor.class);
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.FileDescriptor", "fd"));
         if (isWindows()) {
-            JNIRuntimeAccess.register(fields(a, "java.io.FileDescriptor", "handle"));
+            JVMCIRuntimeJNIAccess.register(fields(a, "java.io.FileDescriptor", "handle"));
         }
-        if (JavaVersionUtil.JAVA_SPEC >= 11) {
-            JNIRuntimeAccess.register(fields(a, "java.io.FileDescriptor", "append"));
-        }
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.FileDescriptor", "append"));
 
         /* Used by FileOutputStream.initIDs, which is called unconditionally during startup. */
-        JNIRuntimeAccess.register(fields(a, "java.io.FileOutputStream", "fd"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.FileOutputStream", "fd"));
         /* Used by FileInputStream.initIDs, which is called unconditionally during startup. */
-        JNIRuntimeAccess.register(fields(a, "java.io.FileInputStream", "fd"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.FileInputStream", "fd"));
         /* Used by UnixFileSystem/WinNTFileSystem.initIDs, called unconditionally during startup. */
-        JNIRuntimeAccess.register(java.io.File.class);
-        JNIRuntimeAccess.register(fields(a, "java.io.File", "path"));
+        RuntimeJNIAccess.register(java.io.File.class);
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.File", "path"));
 
         // TODO classify the remaining registrations
 
-        JNIRuntimeAccess.register(byte[].class); /* used by ProcessEnvironment.environ() */
+        /* used by ProcessEnvironment.environ() */
+        RuntimeJNIAccess.register(byte[].class);
 
-        JNIRuntimeAccess.register(java.lang.String.class);
-        JNIRuntimeAccess.register(java.lang.System.class);
-        JNIRuntimeAccess.register(method(a, "java.lang.System", "getProperty", String.class));
-        JNIRuntimeAccess.register(java.nio.charset.Charset.class);
-        JNIRuntimeAccess.register(method(a, "java.nio.charset.Charset", "isSupported", String.class));
-        JNIRuntimeAccess.register(constructor(a, "java.lang.String", byte[].class, String.class));
-        JNIRuntimeAccess.register(method(a, "java.lang.String", "getBytes", String.class));
-        JNIRuntimeAccess.register(method(a, "java.lang.String", "getBytes"));
-        JNIRuntimeAccess.register(method(a, "java.lang.String", "concat", String.class));
-        if (JavaVersionUtil.JAVA_SPEC >= 11) {
-            JNIRuntimeAccess.register(fields(a, "java.lang.String", "coder", "value"));
+        RuntimeJNIAccess.register(String.class);
+        RuntimeJNIAccess.register(System.class);
+        JVMCIRuntimeJNIAccess.register(method(a, "java.lang.System", "getProperty", String.class));
+        RuntimeJNIAccess.register(java.nio.charset.Charset.class);
+        if (ClassRegistries.respectClassLoader()) {
+            // initIDs in NativeLibraries.c needs the following symbols to be available via JNI
+            Class<?> nativeLibraryImpl = a.findClassByName("jdk.internal.loader.NativeLibraries$NativeLibraryImpl");
+            RuntimeJNIAccess.register(nativeLibraryImpl);
+            JVMCIRuntimeJNIAccess.register(fields(a, "jdk.internal.loader.NativeLibraries$NativeLibraryImpl", "handle", "jniVersion"));
         }
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.lang.String", byte[].class));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.lang.String", "getBytes"));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.nio.charset.Charset", "forName", String.class));
+        JVMCIRuntimeJNIAccess.register(constructor(a, "java.lang.String", byte[].class, java.nio.charset.Charset.class));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.lang.String", "getBytes", java.nio.charset.Charset.class));
+        JVMCIRuntimeJNIAccess.register(method(a, "java.lang.String", "concat", String.class));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.lang.String", "coder", "value"));
 
         a.registerReachabilityHandler(JNIRegistrationJava::registerRandomAccessFileInitIDs, method(a, "java.io.RandomAccessFile", "initIDs"));
-        if (isWindows()) {
-            /* Resolve calls to sun_security_provider_NativeSeedGenerator* as built-in. */
-            PlatformNativeLibrarySupport.singleton().addBuiltinPkgNativePrefix("sun_security_provider_NativeSeedGenerator");
-        }
         if (isDarwin()) {
-            List<Method> darwinMethods = Arrays.asList(
-                            method(a, "apple.security.KeychainStore", "_scanKeychain"),
+            List<ResolvedJavaMethod> darwinMethods = Arrays.asList(
+                            method(a, "apple.security.KeychainStore", "_scanKeychain", String.class), // JDK-8320362
                             method(a, "apple.security.KeychainStore", "_releaseKeychainItemRef", long.class),
                             method(a, "apple.security.KeychainStore", "_addItemToKeychain", String.class, boolean.class, byte[].class, char[].class),
                             method(a, "apple.security.KeychainStore", "_removeItemFromKeychain", long.class),
                             method(a, "apple.security.KeychainStore", "_getEncodedKeyData", long.class, char[].class));
-            if (JavaVersionUtil.JAVA_SPEC >= 11) {
-                /*
-                 * JNI method implementations depending on CoreService are present in the following
-                 * jdk classes sun.nio.fs.MacOXFileSystemProvider (9+),
-                 * sun.net.spi.DefaultProxySelector (9+)
-                 */
-                ArrayList<Method> methods = new ArrayList<>(darwinMethods);
-                methods.addAll(Arrays.asList(method(a, "sun.nio.fs.MacOSXFileSystemProvider", "getFileTypeDetector"),
-                                method(a, "sun.net.spi.DefaultProxySelector", "getSystemProxies", String.class, String.class),
-                                method(a, "sun.net.spi.DefaultProxySelector", "init")));
+            /*
+             * JNI method implementations depending on CoreService are present in the following jdk
+             * classes sun.nio.fs.MacOXFileSystemProvider (9+), sun.net.spi.DefaultProxySelector
+             * (9+)
+             */
+            ArrayList<ResolvedJavaMethod> methods = new ArrayList<>(darwinMethods);
+            methods.addAll(Arrays.asList(method(a, "sun.nio.fs.MacOSXFileSystemProvider", "getFileTypeDetector"),
+                            method(a, "sun.net.spi.DefaultProxySelector", "getSystemProxies", String.class, String.class),
+                            method(a, "sun.net.spi.DefaultProxySelector", "init")));
 
-                a.registerReachabilityHandler(CORESERVICES_LINKER, methods.toArray(new Object[]{}));
-            } else {
-                a.registerReachabilityHandler(CORESERVICES_LINKER, darwinMethods.toArray(new Object[]{}));
-            }
+            a.registerReachabilityHandler(CORESERVICES_LINKER, methods.toArray(new Object[]{}));
+
         }
 
-        if (JavaVersionUtil.JAVA_SPEC >= 11) {
-            a.registerReachabilityHandler(JNIRegistrationJava::registerProcessHandleImplInfoInitIDs, method(a, "java.lang.ProcessHandleImpl$Info", "initIDs"));
-        }
+        a.registerReachabilityHandler(JNIRegistrationJava::registerProcessHandleImplInfoInitIDs, method(a, "java.lang.ProcessHandleImpl$Info", "initIDs"));
     }
 
     private static void registerProcessHandleImplInfoInitIDs(DuringAnalysisAccess a) {
-        JNIRuntimeAccess.register(fields(a, "java.lang.ProcessHandleImpl$Info", "command", "commandLine", "arguments", "startTime", "totalTime", "user"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.lang.ProcessHandleImpl$Info", "command", "commandLine", "arguments", "startTime", "totalTime", "user"));
     }
 
     private static void registerRandomAccessFileInitIDs(DuringAnalysisAccess a) {
-        JNIRuntimeAccess.register(fields(a, "java.io.RandomAccessFile", "fd"));
+        JVMCIRuntimeJNIAccess.register(fields(a, "java.io.RandomAccessFile", "fd"));
     }
 }

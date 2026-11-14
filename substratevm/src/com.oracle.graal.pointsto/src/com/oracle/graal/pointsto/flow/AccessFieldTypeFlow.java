@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,10 +24,8 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import org.graalvm.compiler.nodes.java.AccessFieldNode;
-
-import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.meta.PointsToAnalysisField;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 import jdk.vm.ci.code.BytecodePosition;
@@ -36,12 +34,12 @@ import jdk.vm.ci.code.BytecodePosition;
 public abstract class AccessFieldTypeFlow extends TypeFlow<BytecodePosition> {
 
     /** The field that this flow stores into or loads from. */
-    protected final AnalysisField field;
+    protected final PointsToAnalysisField field;
 
-    protected AccessFieldTypeFlow(AccessFieldNode node) {
+    protected AccessFieldTypeFlow(BytecodePosition accessLocation, PointsToAnalysisField field) {
         /* The declared type of a field access node is the field declared type. */
-        super(node.getNodeSourcePosition(), ((AnalysisField) node.field()).getType());
-        this.field = (AnalysisField) node.field();
+        super(accessLocation, dropUncheckedInterfaceBound(field.getType()));
+        this.field = field;
     }
 
     protected AccessFieldTypeFlow(AccessFieldTypeFlow original, MethodFlowsGraph methodFlows) {
@@ -49,24 +47,17 @@ public abstract class AccessFieldTypeFlow extends TypeFlow<BytecodePosition> {
         this.field = original.field;
     }
 
-    public AnalysisField field() {
+    public PointsToAnalysisField field() {
         return field;
-    }
-
-    @Override
-    public final boolean addState(BigBang bb, TypeState add) {
-        /* Only a clone should be updated */
-        assert this.isClone();
-        return super.addState(bb, add);
     }
 
     /**
      * When the type flow constraints are relaxed the object state can contain types that are not
      * part of the field's declaring class hierarchy. We filter those out.
      */
-    protected TypeState filterObjectState(BigBang bb, TypeState objectState) {
+    protected TypeState filterObjectState(PointsToAnalysis bb, TypeState objectState) {
         if (bb.analysisPolicy().relaxTypeFlowConstraints()) {
-            return TypeState.forIntersection(bb, objectState, field.getDeclaringClass().getTypeFlow(bb, true).getState());
+            return TypeState.forIntersection(bb, objectState, field.getDeclaringClass().getAssignableTypes(true));
         }
         return objectState;
     }

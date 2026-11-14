@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,26 @@
  */
 package com.oracle.svm.graal.meta;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
-import com.oracle.svm.core.code.CodeInfo;
+import org.graalvm.nativeimage.c.function.CodePointer;
+import org.graalvm.nativeimage.c.type.CTypeConversion;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoTable;
+import com.oracle.svm.guest.staging.core.code.UntetheredCodeInfo;
 import com.oracle.svm.core.deopt.SubstrateInstalledCode;
 import com.oracle.svm.core.deopt.SubstrateSpeculationLog;
 import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
 import com.oracle.svm.core.thread.VMOperation;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.vm.ci.code.InstalledCode;
+import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -60,10 +69,28 @@ public class SubstrateInstalledCodeImpl extends InstalledCode implements Substra
     }
 
     @Override
-    public void setAddress(long address, ResolvedJavaMethod method) {
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public long getAddress() {
+        return address;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public long getEntryPoint() {
+        return entryPoint;
+    }
+
+    @Override
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isAlive() {
+        return this.address != 0L;
+    }
+
+    @Override
+    public void setAddress(long address, long entryPoint, ResolvedJavaMethod method) {
         assert VMOperation.isInProgressAtSafepoint();
         this.address = address;
-        this.entryPoint = address;
+        this.entryPoint = entryPoint;
     }
 
     @Override
@@ -84,9 +111,9 @@ public class SubstrateInstalledCodeImpl extends InstalledCode implements Substra
      * {@link #getEntryPoint()}), and the invocation of the entry point that was read.
      */
     @Override
-    public void invalidateWithoutDeoptimization() {
+    public void makeNonEntrant() {
         assert VMOperation.isInProgressAtSafepoint();
-        throw VMError.unimplemented();
+        throw VMError.unimplemented("cannot make non-entrant");
     }
 
     @Override
@@ -95,13 +122,62 @@ public class SubstrateInstalledCodeImpl extends InstalledCode implements Substra
     }
 
     @Override
-    public long getStart() {
-        throw shouldNotReachHere("No implementation in Substrate VM");
+    public void setCompilationId(CompilationIdentifier id) {
     }
 
     @Override
+    public void reprofile() {
+        // Not used for encoded graph based runtime compilation
+    }
+
+    @Override
+    public void recordDeoptimization(DeoptimizationReason reason) {
+        // Encoded-graph runtime compilation keeps speculation feedback in its speculation log.
+        // It does not expose per-reason deoptimization counters through ProfilingInfo.
+    }
+
+    /**
+     * This method is used by the compiler debugging feature
+     * {@code jdk.graal.PrintCompilation=true}.
+     */
+    @Override
+    public long getStart() {
+        return getAddress();
+    }
+
+    /**
+     * This method is used by the compiler debugging feature {@code jdk.graal.Dump=CodeInstall} to
+     * dump a code at the point of code installation.
+     */
+    @Override
     public byte[] getCode() {
-        throw shouldNotReachHere("No implementation in Substrate VM");
+        return getCode(Word.pointer(entryPoint));
+    }
+
+    @Uninterruptible(reason = "Accesses code info.")
+    public static byte[] getCode(CodePointer entryPointAddress) {
+        UntetheredCodeInfo untetheredCodeInfo = CodeInfoTable.lookupCodeInfo(entryPointAddress);
+        if (untetheredCodeInfo.isNull()) {
+            return null;
+        }
+        Object tether = CodeInfoAccess.acquireTether(untetheredCodeInfo);
+        try {
+            CodeInfo codeInfo = CodeInfoAccess.convert(untetheredCodeInfo, tether);
+            return copyCode0(codeInfo);
+        } finally {
+            CodeInfoAccess.releaseTether(untetheredCodeInfo, tether);
+        }
+    }
+
+    @Uninterruptible(reason = "Wrap the now safe call to code info.", calleeMustBe = false)
+    private static byte[] copyCode0(CodeInfo codeInfo) {
+        return copyCode(CodeInfoAccess.getCodeStart(codeInfo), (int) CodeInfoAccess.getCodeSize(codeInfo).rawValue());
+    }
+
+    private static byte[] copyCode(CodePointer codeStart, int codeSize) {
+        byte[] code = new byte[codeSize];
+        CTypeConversion.asByteBuffer(codeStart, codeSize).get(code);
+        return code;
     }
 
     @Override

@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.hosted.c;
 
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.shared.util.VMError.shouldNotReachHere;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,15 +38,16 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.c.libc.LibCBase;
+import com.oracle.svm.shared.util.SubstrateUtil;
 import com.oracle.svm.core.util.InterruptImageBuilding;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
+import com.oracle.svm.hosted.DeadlockWatchdog;
 import com.oracle.svm.hosted.c.codegen.CCompilerInvoker;
 import com.oracle.svm.hosted.c.codegen.QueryCodeWriter;
 import com.oracle.svm.hosted.c.info.InfoTreeBuilder;
 import com.oracle.svm.hosted.c.info.NativeCodeInfo;
+import com.oracle.svm.hosted.c.libc.HostedLibCBase;
 import com.oracle.svm.hosted.c.query.QueryResultParser;
 import com.oracle.svm.hosted.c.query.RawStructureLayoutPlanner;
 import com.oracle.svm.hosted.c.query.SizeAndSignednessVerifier;
@@ -86,20 +87,19 @@ public class CAnnotationProcessor {
     public NativeCodeInfo process(CAnnotationProcessorCache cache) {
         InfoTreeBuilder constructor = new InfoTreeBuilder(nativeLibs, codeCtx);
         codeInfo = constructor.construct();
-        if (nativeLibs.getErrors().size() > 0) {
+        if (!nativeLibs.getErrors().isEmpty()) {
             return codeInfo;
         }
-        if (CAnnotationProcessorCache.Options.UseCAPCache.getValue()) {
-            /* If using a CAP cache, short cut the whole building/compile/execute query. */
-            cache.get(nativeLibs, codeInfo);
-        } else {
+
+        boolean cached = CAnnotationProcessorCache.Options.UseCAPCache.getValue() && cache.get(nativeLibs, codeInfo);
+        if (!cached) {
             /*
              * Generate C source file (the "Query") that will produce the information needed (e.g.,
              * size of struct/union and offsets to their fields, value of enum/macros etc.).
              */
             writer = new QueryCodeWriter(queryCodeDirectory);
             Path queryFile = writer.write(codeInfo);
-            if (nativeLibs.getErrors().size() > 0) {
+            if (!nativeLibs.getErrors().isEmpty()) {
                 return codeInfo;
             }
             assert Files.exists(queryFile);
@@ -108,19 +108,19 @@ public class CAnnotationProcessor {
                 // Only output query code and exit
                 return codeInfo;
             }
-
             Path binary = compileQueryCode(queryFile);
-            if (nativeLibs.getErrors().size() > 0) {
+            DeadlockWatchdog.singleton().recordActivity();
+            if (!nativeLibs.getErrors().isEmpty()) {
                 return codeInfo;
             }
 
             makeQuery(cache, binary.toString());
-            if (nativeLibs.getErrors().size() > 0) {
+            if (!nativeLibs.getErrors().isEmpty()) {
                 return codeInfo;
             }
         }
-        RawStructureLayoutPlanner.plan(nativeLibs, codeInfo);
 
+        RawStructureLayoutPlanner.plan(nativeLibs, codeInfo);
         SizeAndSignednessVerifier.verify(nativeLibs, codeInfo);
         return codeInfo;
     }
@@ -138,7 +138,10 @@ public class CAnnotationProcessor {
             }
             printingProcess.waitFor();
         } catch (IOException ex) {
-            throw shouldNotReachHere(ex);
+            throw shouldNotReachHere(
+                            "Unable to run '" + binaryName +
+                                            "' to compute offsets in C data structures. Is it possible that your antivirus software interferes and puts the resulting file into quarantine?",
+                            ex);
         } catch (InterruptedException e) {
             throw new InterruptImageBuilding();
         } finally {
@@ -156,10 +159,9 @@ public class CAnnotationProcessor {
         }
         String fileName = fileNamePath.toString();
         Path binary = tempDirectory.resolve(compilerInvoker.asExecutableName(fileName.substring(0, fileName.lastIndexOf("."))));
-        ArrayList<String> options = new ArrayList<>();
-        options.addAll(codeCtx.getDirectives().getOptions());
+        ArrayList<String> options = new ArrayList<>(codeCtx.getDirectives().getOptions());
         if (Platform.includedIn(Platform.LINUX.class)) {
-            options.addAll(LibCBase.singleton().getAdditionalQueryCodeCompilerOptions());
+            options.addAll(HostedLibCBase.singleton().getAdditionalQueryCodeCompilerOptions());
         }
         compilerInvoker.compileAndParseError(SubstrateOptions.StrictQueryCodeCompilation.getValue(), options, queryFile, binary, this::reportCompilerError);
         return binary;
@@ -184,7 +186,7 @@ public class CAnnotationProcessor {
                         elements.add(writer.getElementForLineNumber(lineNumber));
                         elements.add("C file contents around line " + lineNumber + ":");
                         for (int i = Math.max(lineNumber - 1, 1); i <= lineNumber + 1; i++) {
-                            elements.add(queryFile.toString() + ":" + i + ": " + writer.getLine(i));
+                            elements.add(queryFile + ":" + i + ": " + writer.getLine(i));
                         }
                     } catch (NumberFormatException ex) {
                         /* Ignore if not a valid number. */

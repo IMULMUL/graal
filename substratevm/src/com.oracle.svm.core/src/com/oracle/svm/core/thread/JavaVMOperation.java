@@ -24,15 +24,19 @@
  */
 package com.oracle.svm.core.thread;
 
-import org.graalvm.nativeimage.IsolateThread;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.SubstrateUtil.Thunk;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.util.VMError;
+import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.IsolateThread;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.core.SubstrateOptions.ConcealedOptions;
+import com.oracle.svm.guest.staging.core.heap.RestrictHeapAccess;
+import com.oracle.svm.core.heap.VMOperationInfo;
 import com.oracle.svm.core.jdk.SplittableRandomAccessors;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * The abstract base class for all VM operations that are allocated on the Java heap. Allocating the
@@ -45,15 +49,15 @@ import com.oracle.svm.core.jdk.SplittableRandomAccessors;
  * executed multiple times. However, extra care must be taken as each VM operation object can only
  * be in the VM operation queue once. Therefore, it must be guaranteed that the VM operation is
  * executed before it is enqueued again. Otherwise, this could result in various race conditions,
- * especially if {@linkplain SubstrateOptions#UseDedicatedVMOperationThread} is enabled.
+ * especially if {@linkplain ConcealedOptions#UseDedicatedVMOperationThread} is enabled.
  */
-public abstract class JavaVMOperation extends VMOperation implements VMOperationControl.JavaAllocationFreeQueue.Element<JavaVMOperation> {
+public abstract class JavaVMOperation extends VMOperation {
     protected IsolateThread queuingThread;
     private JavaVMOperation next;
     private volatile boolean finished;
 
-    protected JavaVMOperation(String name, SystemEffect systemEffect) {
-        super(name, systemEffect);
+    protected JavaVMOperation(VMOperationInfo info) {
+        super(info);
         /*
          * Calling SplittableRandomAccessors#getDefaultGen() here to prevent
          * SplittableRandomAccessors#initialize synchronized method call inside VMOperation lock,
@@ -63,12 +67,10 @@ public abstract class JavaVMOperation extends VMOperation implements VMOperation
         VMError.guarantee(!SubstrateUtil.HOSTED, "must not be created at image build time");
     }
 
-    @Override
     public JavaVMOperation getNext() {
         return next;
     }
 
-    @Override
     public void setNext(JavaVMOperation value) {
         next = value;
     }
@@ -83,20 +85,21 @@ public abstract class JavaVMOperation extends VMOperation implements VMOperation
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected void setQueuingThread(NativeVMOperationData data, IsolateThread thread) {
-        queuingThread = thread;
-    }
-
-    @Override
     protected boolean isFinished(NativeVMOperationData data) {
         return finished;
     }
 
     @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    protected void setFinished(NativeVMOperationData data, boolean value) {
-        finished = value;
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    protected void markAsQueued(NativeVMOperationData data) {
+        finished = false;
+        queuingThread = CurrentIsolate.getCurrentThread();
+    }
+
+    @Override
+    protected void markAsFinished(NativeVMOperationData data) {
+        queuingThread = Word.nullPointer();
+        finished = true;
     }
 
     @Override
@@ -108,38 +111,11 @@ public abstract class JavaVMOperation extends VMOperation implements VMOperation
         return true;
     }
 
-    /** Convenience method for thunks that can be run by allocating a VMOperation. */
-    public static void enqueueBlockingSafepoint(String name, Thunk thunk) {
-        ThunkOperation vmOperation = new ThunkOperation(name, SystemEffect.SAFEPOINT, thunk);
-        vmOperation.enqueue();
-    }
-
-    /** Convenience method for thunks that can be run by allocating a VMOperation. */
-    public static void enqueueBlockingNoSafepoint(String name, Thunk thunk) {
-        ThunkOperation vmOperation = new ThunkOperation(name, SystemEffect.NONE, thunk);
-        vmOperation.enqueue();
-    }
-
     @Override
     public final void operate(NativeVMOperationData data) {
         operate();
     }
 
-    @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, overridesCallers = true, reason = "Whitelisted because some operations may allocate.")
+    @RestrictHeapAccess(access = RestrictHeapAccess.Access.UNRESTRICTED, reason = "Whitelisted because some operations may allocate.")
     protected abstract void operate();
-
-    /** A VMOperation that executes a thunk. */
-    public static class ThunkOperation extends JavaVMOperation {
-        private Thunk thunk;
-
-        ThunkOperation(String name, SystemEffect systemEffect, Thunk thunk) {
-            super(name, systemEffect);
-            this.thunk = thunk;
-        }
-
-        @Override
-        public void operate() {
-            thunk.invoke();
-        }
-    }
 }

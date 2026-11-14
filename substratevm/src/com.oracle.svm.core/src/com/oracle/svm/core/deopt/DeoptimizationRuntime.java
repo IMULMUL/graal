@@ -24,37 +24,43 @@
  */
 package com.oracle.svm.core.deopt;
 
+import static jdk.graal.compiler.core.common.spi.ForeignCallDescriptor.CallSideEffect.NO_SIDE_EFFECT;
+
 import java.util.Objects;
 
-import org.graalvm.compiler.graph.NodeSourcePosition;
+import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.LocationIdentity;
 import org.graalvm.word.Pointer;
 
-import com.oracle.svm.core.annotate.NeverInline;
+import com.oracle.svm.core.FrameAccess;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.DeoptimizationSourcePositionDecoder;
-import com.oracle.svm.core.log.Log;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.guest.staging.log.Log;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
 import com.oracle.svm.core.snippets.SnippetRuntime;
 import com.oracle.svm.core.snippets.SnippetRuntime.SubstrateForeignCallDescriptor;
-import com.oracle.svm.core.snippets.SubstrateForeignCallTarget;
-import com.oracle.svm.core.stack.StackOverflowCheck;
+import com.oracle.svm.guest.staging.snippets.SubstrateForeignCallTarget;
+import com.oracle.svm.guest.staging.core.stack.StackOverflowCheck;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.SpeculationLog.SpeculationReason;
 
 public class DeoptimizationRuntime {
 
-    public static final SubstrateForeignCallDescriptor DEOPTIMIZE = SnippetRuntime.findForeignCall(DeoptimizationRuntime.class, "deoptimize", true, LocationIdentity.any());
+    public static final SubstrateForeignCallDescriptor DEOPTIMIZE = SnippetRuntime.findForeignCall(DeoptimizationRuntime.class, "deoptimize", NO_SIDE_EFFECT, LocationIdentity.any());
 
     /** Foreign call: {@link #DEOPTIMIZE}. */
     @SubstrateForeignCallTarget(stubCallingConvention = true)
     @NeverInline("Access of caller frame")
     private static void deoptimize(long actionAndReason, SpeculationReason speculation) {
         /*
-         * In cases where we doeptimize because of a StackOverflowError, we do not immediately want
+         * In cases where we deoptimize because of a StackOverflowError, we do not immediately want
          * to create and throw another StackOverflowError. Therefore, we enable the yellow zone. The
          * actual deoptimization operation is a VMOperation and would enable the yellow zone anyway.
          */
@@ -63,14 +69,19 @@ public class DeoptimizationRuntime {
 
             Pointer sp = KnownIntrinsics.readCallerStackPointer();
             DeoptimizationAction action = Deoptimizer.decodeDeoptAction(actionAndReason);
+            DeoptimizationReason reason = Deoptimizer.decodeDeoptReason(actionAndReason);
 
             if (Deoptimizer.Options.TraceDeoptimization.getValue()) {
                 CodePointer ip = KnownIntrinsics.readReturnAddress();
+                if (Deoptimizer.checkLazyDeoptimized(ip)) {
+                    ip = Deoptimizer.readLazyDeoptOriginalReturnAddress(CurrentIsolate.getCurrentThread(), sp);
+                }
                 traceDeoptimization(actionAndReason, speculation, action, sp, ip);
             }
 
             if (action.doesInvalidateCompilation()) {
-                Deoptimizer.invalidateMethodOfFrame(sp, speculation);
+                boolean reprofile = (action == DeoptimizationAction.InvalidateReprofile);
+                Deoptimizer.invalidateMethodOfFrame(CurrentIsolate.getCurrentThread(), sp, speculation, reason, reprofile);
             } else {
                 Deoptimizer.deoptimizeFrame(sp, false, speculation);
             }
@@ -79,6 +90,12 @@ public class DeoptimizationRuntime {
                 Log.log().string("]").newline();
             }
 
+        } catch (Throwable t) {
+            /*
+             * If an error was thrown during this deoptimization stage we likely will be in an
+             * inconsistent state from which execution cannot proceed.
+             */
+            throw VMError.shouldNotReachHere(t);
         } finally {
             StackOverflowCheck.singleton().protectYellowZone();
         }
@@ -92,6 +109,8 @@ public class DeoptimizationRuntime {
             log.string("    name: ").string(installedCode.getName()).newline();
         }
         log.string("    sp: ").hex(sp).string("  ip: ").hex(ip).newline();
+        CodePointer deoptIp = FrameAccess.singleton().readReturnAddress(CurrentIsolate.getCurrentThread(), sp);
+        log.string("    callerIp(callerRet)=deoptingFrame: ").hex(deoptIp).newline();
 
         DeoptimizationReason reason = Deoptimizer.decodeDeoptReason(actionAndReason);
         log.string("    reason: ").string(reason.toString()).string("  action: ").string(action.toString()).newline();
@@ -100,8 +119,13 @@ public class DeoptimizationRuntime {
         log.string("    debugId: ").signed(debugId).string("  speculation: ").string(Objects.toString(speculation)).newline();
 
         NodeSourcePosition sourcePosition = DeoptimizationSourcePositionDecoder.decode(debugId, ip);
-        if (sourcePosition != null) {
-            log.string("    stack trace that triggered deoptimization:").newline();
+        if (sourcePosition == null || !SubstrateOptions.IncludeNodeSourcePositions.getValue()) {
+            log.string("    To see the stack trace that triggered deoptimization, build the native image with -H:+IncludeNodeSourcePositions and run with --engine.NodeSourcePositions");
+            log.newline();
+        } else {
+            log.string("    stack trace that triggered deoptimization " +
+                            "{BEWARE: this is based on node source positions which does not necessarily reflect the actual source root compilation unit and BCI}:")
+                            .newline();
             NodeSourcePosition cur = sourcePosition;
             while (cur != null) {
                 log.string("        at ");

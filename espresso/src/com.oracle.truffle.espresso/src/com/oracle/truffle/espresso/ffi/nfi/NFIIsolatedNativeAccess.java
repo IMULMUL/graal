@@ -22,19 +22,16 @@
  */
 package com.oracle.truffle.espresso.ffi.nfi;
 
+import static com.oracle.truffle.espresso.ffi.memory.NativeMemory.MemoryAllocationException;
+
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Objects;
 
-import com.oracle.truffle.espresso.ffi.Buffer;
-import com.oracle.truffle.espresso.ffi.NativeAccess;
-import com.oracle.truffle.espresso.ffi.NativeType;
-import com.oracle.truffle.espresso.ffi.TruffleByteBuffer;
-import org.graalvm.home.HomeFinder;
-
-import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -45,12 +42,22 @@ import com.oracle.truffle.api.interop.UnsupportedTypeException;
 import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
-import com.oracle.truffle.api.profiles.BranchProfile;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
 import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.ffi.NativeAccess;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
+import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.Pointer;
+import com.oracle.truffle.espresso.ffi.RawPointer;
+import com.oracle.truffle.espresso.ffi.TruffleByteBuffer;
+import com.oracle.truffle.espresso.ffi.memory.NativeMemory;
+import com.oracle.truffle.espresso.ffi.memory.UnsafeNativeMemory;
 import com.oracle.truffle.espresso.impl.EmptyKeysArray;
 import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.meta.Meta;
+import com.oracle.truffle.espresso.runtime.EspressoContext;
+import com.oracle.truffle.espresso.substitutions.Collect;
 
 /**
  * Isolated native linking namespace based on glibc's dlmopen.
@@ -69,7 +76,7 @@ import com.oracle.truffle.espresso.meta.EspressoError;
  * workaround.
  * </ul>
  */
-final class NFIIsolatedNativeAccess extends NFINativeAccess {
+public final class NFIIsolatedNativeAccess extends NFINativeAccess {
 
     private final @Pointer TruffleObject edenLibrary;
     private final @Pointer TruffleObject malloc;
@@ -80,10 +87,9 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
     private final DefaultLibrary defaultLibrary;
 
     NFIIsolatedNativeAccess(TruffleLanguage.Env env) {
-        super(env);
+        super(env, new IsolatedUnsafeNativeMemory());
         // libeden.so must be the first library loaded in the isolated namespace.
-        Path espressoHome = HomeFinder.getInstance().getLanguageHomes().get(EspressoLanguage.ID);
-        Path espressoLibraryPath = espressoHome.resolve("lib");
+        Path espressoLibraryPath = EspressoLanguage.getEspressoLibs(env);
         this.edenLibrary = loadLibrary(Collections.singletonList(espressoLibraryPath), "eden", true);
         this.malloc = lookupAndBindSymbol(edenLibrary, "malloc", NativeSignature.create(NativeType.POINTER, NativeType.LONG));
         this.realloc = lookupAndBindSymbol(edenLibrary, "realloc", NativeSignature.create(NativeType.POINTER, NativeType.POINTER, NativeType.LONG));
@@ -95,24 +101,26 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
          * because is based on calling dlsym located outside the isolated namespace. libeden.so,
          * loaded inside the isolated namespace provides a dlsym shim inside the namespace.
          */
-        this.defaultLibrary = new DefaultLibrary(this.dlsym, rtldDefault());
+        ((IsolatedUnsafeNativeMemory) nativeMemory).init(this);
+        this.defaultLibrary = new DefaultLibrary(this.dlsym, rtldDefault(), nativeMemory());
+
     }
 
     private TruffleObject rtldDefault() {
         TruffleObject edenRtldDefault = lookupAndBindSymbol(edenLibrary, "eden_RTLD_DEFAULT", NativeSignature.create(NativeType.POINTER));
         try {
-            TruffleObject result = (TruffleObject) InteropLibrary.getUncached().execute(edenRtldDefault);
-            assert InteropLibrary.getUncached().isPointer(result);
+            TruffleObject result = (TruffleObject) UNCACHED_INTEROP.execute(edenRtldDefault);
+            assert UNCACHED_INTEROP.isPointer(result);
             return result;
         } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
         }
     }
 
     @Override
-    public @Pointer TruffleObject loadLibrary(Path libraryPath) {
-        CompilerAsserts.neverPartOfCompilation();
-        String nfiSource = String.format("load(RTLD_LAZY|ISOLATED_NAMESPACE) '%s'", libraryPath);
+    protected @Pointer TruffleObject loadLibrary0(Path libraryPath) {
+        String nfiSource = String.format("load(RTLD_LAZY|RTLD_LOCAL|ISOLATED_NAMESPACE) '%s'", libraryPath);
         return loadLibraryHelper(nfiSource);
     }
 
@@ -126,10 +134,12 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
 
         final @Pointer TruffleObject dlsym;
         final @Pointer TruffleObject rtldDefault;
+        final NativeMemory nativeMemory;
 
-        DefaultLibrary(@Pointer TruffleObject dlsym, @Pointer TruffleObject rtldDefault) {
+        DefaultLibrary(@Pointer TruffleObject dlsym, @Pointer TruffleObject rtldDefault, NativeMemory nativeMemory) {
             this.dlsym = Objects.requireNonNull(dlsym);
             this.rtldDefault = Objects.requireNonNull(rtldDefault);
+            this.nativeMemory = nativeMemory;
         }
 
         @ExportMessage
@@ -151,17 +161,33 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
         Object readMember(String member,
                         @CachedLibrary("this.dlsym") InteropLibrary interop,
                         @CachedLibrary(limit = "2") InteropLibrary isNullInterop,
-                        @Cached BranchProfile error) throws UnknownIdentifierException {
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile error,
+                        @Cached InlinedBranchProfile oome) throws UnknownIdentifierException {
+            TruffleByteBuffer buffer = null;
             try {
-                Object result = interop.execute(dlsym, this.rtldDefault, TruffleByteBuffer.allocateDirectStringUTF8(member));
+                // prepare interop call by creating the string buffer
+                try {
+                    buffer = TruffleByteBuffer.allocateDirectStringUTF8(member, nativeMemory);
+                } catch (MemoryAllocationException e) {
+                    oome.enter(node);
+                    EspressoContext context = EspressoContext.get(node);
+                    Meta meta = context.getMeta();
+                    throw meta.throwExceptionWithMessage(meta.java_lang_OutOfMemoryError, e.getMessage(), context);
+                }
+                Object result = interop.execute(dlsym, this.rtldDefault, buffer);
                 if (isNullInterop.isNull(result)) {
-                    error.enter();
+                    error.enter(node);
                     throw UnknownIdentifierException.create(member);
                 }
                 return result;
             } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-                CompilerDirectives.transferToInterpreter();
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 throw EspressoError.shouldNotReachHere(e);
+            } finally {
+                if (buffer != null) {
+                    buffer.close();
+                }
             }
         }
 
@@ -173,74 +199,88 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
     }
 
     @Override
-    public @Buffer TruffleObject allocateMemory(long size) {
-        if (size < 0) {
-            throw new IllegalArgumentException("negative buffer length: " + size);
-        }
-        try {
-            @Pointer
-            TruffleObject address = (TruffleObject) uncachedInterop.execute(malloc, size);
-            if (InteropLibrary.getUncached().isNull(address)) {
-                // malloc returned NULL
-                return null;
-            }
-            return TruffleByteBuffer.wrap(address, Math.toIntExact(size));
-        } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            throw EspressoError.shouldNotReachHere(e);
-        }
-    }
-
-    @Override
-    public void freeMemory(@Pointer TruffleObject buffer) {
-        assert InteropLibrary.getUncached().isPointer(buffer);
-        try {
-            uncachedInterop.execute(free, buffer);
-        } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            throw EspressoError.shouldNotReachHere(e);
-        }
-    }
-
-    @Override
-    public @Buffer TruffleObject reallocateMemory(@Pointer TruffleObject buffer, long newSize) {
-        if (newSize < 0) {
-            throw new IllegalArgumentException("negative buffer length: " + newSize);
-        }
-        assert InteropLibrary.getUncached().isPointer(buffer);
-        try {
-            @Pointer
-            TruffleObject address = (TruffleObject) uncachedInterop.execute(realloc, buffer, newSize);
-            if (InteropLibrary.getUncached().isNull(address)) {
-                // realloc returned NULL
-                return null;
-            }
-            return TruffleByteBuffer.wrap(address, Math.toIntExact(newSize));
-        } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            throw EspressoError.shouldNotReachHere(e);
-        }
-    }
-
-    @Override
     public void prepareThread() {
         try {
-            uncachedInterop.execute(ctypeInit);
+            UNCACHED_INTEROP.execute(ctypeInit);
         } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreter();
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
         }
     }
 
+    @Collect(NativeAccess.class)
     public static final class Provider implements NativeAccess.Provider {
+
+        public static final String ID = "nfi-dlmopen";
+
         @Override
         public String id() {
-            return "nfi-dlmopen";
+            return ID;
         }
 
         @Override
         public NativeAccess create(TruffleLanguage.Env env) {
             return new NFIIsolatedNativeAccess(env);
+        }
+    }
+
+    private static final class IsolatedUnsafeNativeMemory extends UnsafeNativeMemory {
+        /*
+         * This can not be final since it would leak the "this" reference before the class is
+         * initialized.
+         */
+        @CompilationFinal private NFIIsolatedNativeAccess nfiIsolatedNativeAccess;
+
+        public void init(NFIIsolatedNativeAccess nativeAccess) {
+            assert this.nfiIsolatedNativeAccess == null;
+            this.nfiIsolatedNativeAccess = nativeAccess;
+        }
+
+        @Override
+        public long allocateMemory(long bytes) {
+            long size = bytes == 0 ? 1 : bytes;
+            try {
+                @Pointer
+                TruffleObject address = (TruffleObject) UNCACHED_INTEROP.execute(nfiIsolatedNativeAccess.malloc, size);
+                if (UNCACHED_INTEROP.isNull(address)) {
+                    // malloc returned NULL
+                    return 0L;
+                }
+                return UNCACHED_INTEROP.asPointer(address);
+            } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere(e);
+            }
+        }
+
+        @Override
+        public void freeMemory(long address) {
+            if (address == 0) {
+                return;
+            }
+            try {
+                UNCACHED_INTEROP.execute(nfiIsolatedNativeAccess.free, RawPointer.create(address));
+            } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere(e);
+            }
+        }
+
+        @Override
+        public long reallocateMemory(long address, long newSize) {
+            long size = newSize == 0 ? 1 : newSize;
+            try {
+                @Pointer
+                TruffleObject newAddress = (TruffleObject) UNCACHED_INTEROP.execute(nfiIsolatedNativeAccess.realloc, address, size);
+                if (UNCACHED_INTEROP.isNull(address)) {
+                    // realloc returned NULL
+                    return 0L;
+                }
+                return UNCACHED_INTEROP.asPointer(newAddress);
+            } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere(e);
+            }
         }
     }
 }

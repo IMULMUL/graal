@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,7 +45,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -65,15 +64,21 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-public class SLExceptionTest {
+public class SLExceptionTest extends AbstractSLTest {
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
 
     private Context ctx;
 
     @Before
     public void setUp() {
-        this.ctx = Context.create("sl");
+        this.ctx = newContextBuilder().build();
     }
 
     @After
@@ -272,7 +277,7 @@ public class SLExceptionTest {
         assertEquals(info, "host", frame.getLanguage().getId());
         assertEquals(info, "Host", frame.getLanguage().getName());
         assertEquals(info, className + "." + methodName, frame.getRootName());
-        assertNull(info, frame.getSourceLocation());
+        assertNotNull(info, frame.getSourceLocation());
         assertNotNull(frame.toString());
 
         StackTraceElement hostFrame = frame.toHostFrame();
@@ -328,7 +333,7 @@ public class SLExceptionTest {
 
     @Test
     public void testGuestOverHostPropagation() {
-        Context context = Context.newBuilder("sl").allowAllAccess(true).build();
+        Context context = newContextBuilder().allowAllAccess(true).build();
         String code = "" +
                         "function other(x) {" +
                         "   return invalidFunction();" +

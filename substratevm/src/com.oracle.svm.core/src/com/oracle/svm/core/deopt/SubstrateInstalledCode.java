@@ -24,11 +24,14 @@
  */
 package com.oracle.svm.core.deopt;
 
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.RuntimeCodeCache;
+import com.oracle.svm.shared.Uninterruptible;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
 import jdk.vm.ci.code.InstalledCode;
+import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -47,9 +50,11 @@ public interface SubstrateInstalledCode {
     String getName();
 
     /** The entry point address of this code if {@linkplain #isValid valid}, or 0 otherwise. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     long getEntryPoint();
 
     /** The address of this code if {@linkplain #isAlive alive}, or 0 otherwise. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     long getAddress();
 
     /**
@@ -64,11 +69,12 @@ public interface SubstrateInstalledCode {
 
     /**
      * Called during code installation: initialize this instance with the given address where its
-     * instructions are, and the method it was compiled from. Afterwards, {@link #getAddress()} and
-     * {@link #getEntryPoint()} return the given address, and {@link #isValid()} and
-     * {@link #isAlive()} return {@code true}.
+     * instructions are, and the method it was compiled from. The entry point sets the address of
+     * the first instruction to be executed. Afterwards, {@link #getAddress()} returns the given
+     * address, and {@link #isAlive()} returns {@code true}. Also {@link #getEntryPoint()} returns
+     * the given address, and {@link #isValid()} returns true.
      */
-    void setAddress(long address, ResolvedJavaMethod method);
+    void setAddress(long address, long entryPoint, ResolvedJavaMethod method);
 
     /**
      * This method is called during code uninstallation. Consider {@link #invalidate()} instead.
@@ -87,7 +93,20 @@ public interface SubstrateInstalledCode {
      */
     void invalidate();
 
+    /**
+     * Indicates whether the code associated with this method should be subject to profiling again
+     * after invalidation.
+     */
+    void reprofile();
+
+    /**
+     * Records the reason for a deoptimization that invalidated this installed code, if this
+     * installed-code implementation exposes deoptimization counts through profiling metadata.
+     */
+    void recordDeoptimization(DeoptimizationReason reason);
+
     /** Whether the code represented by this object exists and could have live invocations. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     boolean isAlive();
 
     /**
@@ -95,9 +114,15 @@ public interface SubstrateInstalledCode {
      * {@link #isValid()} returns {@code false}, {@link #isAlive()} returns {@code true}, and
      * {@link #getEntryPoint()} returns 0.
      */
-    void invalidateWithoutDeoptimization();
+    void makeNonEntrant();
 
     SubstrateSpeculationLog getSpeculationLog();
+
+    /**
+     * Sets the identifier of the compilation that resulted in this code, which can be used to
+     * provide additional information in {@link #getName()}.
+     */
+    void setCompilationId(CompilationIdentifier id);
 
     /**
      * Provides access to a {@link SubstrateInstalledCode}.

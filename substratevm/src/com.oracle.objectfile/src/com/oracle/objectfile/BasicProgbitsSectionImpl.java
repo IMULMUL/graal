@@ -29,14 +29,13 @@ import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import com.oracle.objectfile.ObjectFile.Element;
 import com.oracle.objectfile.ObjectFile.ProgbitsSectionImpl;
 import com.oracle.objectfile.ObjectFile.RelocatableSectionImpl;
 import com.oracle.objectfile.ObjectFile.RelocationKind;
-import com.oracle.objectfile.ObjectFile.RelocationRecord;
 import com.oracle.objectfile.ObjectFile.Section;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * This represents the core of a progbits/regular section, in any object file format. By default it
@@ -67,7 +66,7 @@ public class BasicProgbitsSectionImpl extends BasicElementImpl implements Progbi
     }
 
     @Override
-    public Set<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
+    public EconomicSet<BuildDependency> getDependencies(Map<Element, LayoutDecisionMap> decisions) {
         // we can get away with minimal dependencies, because we have no
         // content-> size dependency by default
         return ObjectFile.minimalDependencies(decisions, getElement());
@@ -114,21 +113,20 @@ public class BasicProgbitsSectionImpl extends BasicElementImpl implements Progbi
     }
 
     @Override
-    public RelocationRecord markRelocationSite(int offset, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend) {
-        return ((RelocatableSectionImpl) getElement()).markRelocationSite(offset, ByteBuffer.wrap(getContent()).order(getOwner().getByteOrder()), k, symbolName, useImplicitAddend,
-                        explicitAddend);
+    public void markRelocationSite(int offset, RelocationKind k, String symbolName, long addend) {
+        ((RelocatableSectionImpl) getElement()).markRelocationSite(offset, ByteBuffer.wrap(getContent()).order(getOwner().getByteOrder()), k, symbolName,
+                        addend);
     }
 
     @Override
-    public final RelocationRecord markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend) {
+    public final void markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, long addend) {
         assert getContent() == null || bb.array() == getContent();
-        return ((RelocatableSectionImpl) getElement()).markRelocationSite(offset, bb, k, symbolName, useImplicitAddend, explicitAddend);
+        ((RelocatableSectionImpl) getElement()).markRelocationSite(offset, bb, k, symbolName, addend);
     }
 
     @Override
-    public Element getOrCreateRelocationElement(boolean useImplicitAddend) {
-        // FIXME: This looks suspicious: turning an Element back into an Impl?
-        return ((RelocatableSectionImpl) getElement()).getOrCreateRelocationElement(useImplicitAddend);
+    public Element getOrCreateRelocationElement(long addend) {
+        return ((RelocatableSectionImpl) getElement()).getOrCreateRelocationElement(addend);
     }
 
     @Override

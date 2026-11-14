@@ -31,22 +31,19 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.stream.Collectors;
-
-import org.graalvm.compiler.code.CompilationResult;
-import org.graalvm.compiler.core.common.NumUtil;
-import org.graalvm.compiler.debug.GraalError;
 
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.objectfile.SectionName;
-import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.SubstrateTarget;
 import com.oracle.svm.core.graal.llvm.LLVMGenerator;
 import com.oracle.svm.core.graal.llvm.LLVMNativeImageCodeCache.StackMapDumper;
 import com.oracle.svm.core.heap.SubstrateReferenceMap;
+import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.shadowed.org.bytedeco.javacpp.BytePointer;
 import com.oracle.svm.shadowed.org.bytedeco.javacpp.Pointer;
 import com.oracle.svm.shadowed.org.bytedeco.llvm.LLVM.LLVMMemoryBufferRef;
@@ -55,6 +52,9 @@ import com.oracle.svm.shadowed.org.bytedeco.llvm.LLVM.LLVMSectionIteratorRef;
 import com.oracle.svm.shadowed.org.bytedeco.llvm.LLVM.LLVMSymbolIteratorRef;
 import com.oracle.svm.shadowed.org.bytedeco.llvm.global.LLVM;
 
+import jdk.graal.compiler.code.CompilationResult;
+import jdk.graal.compiler.core.common.NumUtil;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.vm.ci.code.DebugInfo;
 import jdk.vm.ci.code.ReferenceMap;
 import jdk.vm.ci.code.site.Call;
@@ -72,7 +72,7 @@ public class LLVMObjectFileReader {
 
     @FunctionalInterface
     private interface SectionReader<Result> {
-        Result apply(LLVMSectionIteratorRef sectionIterator);
+        Result apply(LLVMSectionIteratorRef sectionIterator, LLVMSectionIteratorRef relocationsSectionIterator);
     }
 
     @FunctionalInterface
@@ -80,7 +80,7 @@ public class LLVMObjectFileReader {
         Symbol apply(LLVMSymbolIteratorRef symbolIterator, LLVMSectionIteratorRef sectionIterator);
     }
 
-    private static class LLVMSectionInfo<Section, Symbol> {
+    private static final class LLVMSectionInfo<Section, Symbol> {
         private Section sectionInfo;
         private List<Symbol> symbolInfo = new ArrayList<>();
     }
@@ -98,12 +98,13 @@ public class LLVMObjectFileReader {
         LLVMObjectFileRef objectFile = LLVM.LLVMCreateObjectFile(buffer);
 
         LLVMSectionIteratorRef sectionIterator;
+        LLVMSectionIteratorRef relocationsSectionIterator = LLVM.LLVMGetSections(objectFile);
         LLVMSectionInfo<SectionInfo, SymbolInfo> result = new LLVMSectionInfo<>();
         for (sectionIterator = LLVM.LLVMGetSections(objectFile); LLVM.LLVMIsSectionIteratorAtEnd(objectFile, sectionIterator) == FALSE; LLVM.LLVMMoveToNextSection(sectionIterator)) {
             BytePointer sectionNamePointer = LLVM.LLVMGetSectionName(sectionIterator);
             String currentSectionName = (sectionNamePointer != null) ? sectionNamePointer.getString() : "";
             if (currentSectionName.startsWith(sectionName.getFormatDependentName(ObjectFile.getNativeFormat()))) {
-                result.sectionInfo = sectionReader.apply(sectionIterator);
+                result.sectionInfo = sectionReader.apply(sectionIterator, relocationsSectionIterator);
 
                 if (symbolReader != null) {
                     LLVMSymbolIteratorRef symbolIterator;
@@ -116,9 +117,11 @@ public class LLVMObjectFileReader {
                 }
                 break;
             }
+            LLVM.LLVMMoveToNextSection(relocationsSectionIterator);
         }
 
         LLVM.LLVMDisposeSectionIterator(sectionIterator);
+        LLVM.LLVMDisposeSectionIterator(relocationsSectionIterator);
         LLVM.LLVMDisposeObjectFile(objectFile);
 
         return result;
@@ -139,7 +142,7 @@ public class LLVMObjectFileReader {
         return new LLVMTextSectionInfo(sectionInfo);
     }
 
-    private Long parseTextSection(LLVMSectionIteratorRef sectionIterator) {
+    private Long parseTextSection(LLVMSectionIteratorRef sectionIterator, @SuppressWarnings("unused") LLVMSectionIteratorRef relocationsSectionIterator) {
         return LLVM.LLVMGetSectionSize(sectionIterator);
     }
 
@@ -155,17 +158,19 @@ public class LLVMObjectFileReader {
         return sectionInfo.sectionInfo;
     }
 
-    private LLVMStackMapInfo readStackMapSection(LLVMSectionIteratorRef sectionIterator) {
+    private LLVMStackMapInfo readStackMapSection(LLVMSectionIteratorRef sectionIterator, LLVMSectionIteratorRef relocationsSectionIterator) {
         Pointer stackMap = LLVM.LLVMGetSectionContents(sectionIterator).limit(LLVM.LLVMGetSectionSize(sectionIterator));
-        return new LLVMStackMapInfo(stackMap.asByteBuffer());
+        LLVM.LLVMMoveToNextSection(relocationsSectionIterator);
+        return new LLVMStackMapInfo(stackMap.asByteBuffer(), relocationsSectionIterator);
     }
 
     public void readStackMap(LLVMStackMapInfo info, CompilationResult compilation, ResolvedJavaMethod method, int id) {
-        String methodSymbolName = SYMBOL_PREFIX + SubstrateUtil.uniqueShortName(method);
+        String methodSymbolName = SYMBOL_PREFIX + ((HostedMethod) method).getUniqueShortName();
 
         long startPatchpointID = compilation.getInfopoints().stream().filter(ip -> ip.reason == InfopointReason.METHOD_START).findFirst()
-                        .orElseThrow(() -> new GraalError("no method start infopoint: " + methodSymbolName)).pcOffset;
-        int totalFrameSize = NumUtil.safeToInt(info.getFunctionStackSize(startPatchpointID) + LLVMTargetSpecific.get().getCallFrameSeparation());
+                        .orElseThrow(() -> new GraalError("No method start infopoint: " + methodSymbolName)).pcOffset;
+        long frameSize = info.getFunctionStackSize(startPatchpointID) + LLVMTargetSpecific.get().getCallFrameSeparation();
+        int totalFrameSize = NumUtil.safeToInt(frameSize == 0 ? SubstrateTarget.singleton().stackAlignment : frameSize);
         compilation.setTotalFrameSize(totalFrameSize);
         stackMapDumper.startDumpingFunction(methodSymbolName, id, totalFrameSize);
 
@@ -173,11 +178,15 @@ public class LLVMObjectFileReader {
         for (Infopoint infopoint : compilation.getInfopoints()) {
             if (infopoint instanceof Call) {
                 Call call = (Call) infopoint;
+                Integer referenceMapSourcePatchpointId = LLVMGenerator.getJavaFrameAnchorReferenceMapSource(compilation, call.pcOffset);
 
                 /* Optimizations might have duplicated some calls. */
                 for (int actualPcOffset : info.getPatchpointOffsets(call.pcOffset)) {
+                    int referenceMapPatchpointId = referenceMapSourcePatchpointId == null ? call.pcOffset : referenceMapSourcePatchpointId;
+                    /* JavaFrameAnchor IP stackmaps reuse the following Java call's statepoint map. */
+                    int referenceMapPcOffset = referenceMapSourcePatchpointId == null ? actualPcOffset : getReferenceMapPcOffset(info, referenceMapPatchpointId, actualPcOffset);
                     SubstrateReferenceMap referenceMap = new SubstrateReferenceMap();
-                    info.forEachStatepointOffset(call.pcOffset, actualPcOffset, referenceMap::markReferenceAtOffset);
+                    info.forEachStatepointOffset(referenceMapPatchpointId, referenceMapPcOffset, referenceMap::markReferenceAtOffset);
                     stackMapDumper.dumpCallSite(call, actualPcOffset, referenceMap);
                     newInfopoints.add(new Call(call.target, actualPcOffset, call.size, call.direct, copyWithReferenceMap(call.debugInfo, referenceMap)));
                 }
@@ -187,6 +196,24 @@ public class LLVMObjectFileReader {
 
         compilation.clearInfopoints();
         newInfopoints.forEach(compilation::addInfopoint);
+    }
+
+    private static int getReferenceMapPcOffset(LLVMStackMapInfo info, int referenceMapPatchpointId, int anchorPcOffset) {
+        int[] referenceMapPcOffsets = info.getPatchpointOffsets(referenceMapPatchpointId);
+        if (referenceMapPcOffsets.length == 0) {
+            throw new GraalError("Missing LLVM statepoint stack map record for JavaFrameAnchor reference map source: patchpointID=%s, anchorOffset=%s", referenceMapPatchpointId, anchorPcOffset);
+        }
+        Arrays.sort(referenceMapPcOffsets);
+        for (int referenceMapPcOffset : referenceMapPcOffsets) {
+            if (referenceMapPcOffset > anchorPcOffset) {
+                return referenceMapPcOffset;
+            }
+        }
+        if (referenceMapPcOffsets.length == 1) {
+            return referenceMapPcOffsets[0];
+        }
+        throw new GraalError("Could not match JavaFrameAnchor stack map to reference map source: patchpointID=%s, anchorOffset=%s, sourceOffsets=%s",
+                        referenceMapPatchpointId, anchorPcOffset, Arrays.toString(referenceMapPcOffsets));
     }
 
     private static DebugInfo copyWithReferenceMap(DebugInfo debugInfo, ReferenceMap referenceMap) {
@@ -204,15 +231,16 @@ public class LLVMObjectFileReader {
         private final long codeSize;
         private final Map<Integer, String> offsetToSymbol = new TreeMap<>();
         private final Map<String, Integer> symbolToOffset = new HashMap<>();
-        private final List<Integer> sortedMethodOffsets;
 
         private LLVMTextSectionInfo(LLVMSectionInfo<Long, SymbolOffset> sectionInfo) {
             this.codeSize = sectionInfo.sectionInfo;
             for (SymbolOffset symbolOffset : sectionInfo.symbolInfo) {
-                offsetToSymbol.put(symbolOffset.offset, symbolOffset.symbol);
-                symbolToOffset.put(symbolOffset.symbol, symbolOffset.offset);
+                int offset = symbolOffset.offset;
+                if (offset >= 0 && offset < codeSize && LLVMTargetSpecific.get().isSymbolValid(symbolOffset.symbol)) {
+                    offsetToSymbol.put(symbolOffset.offset, symbolOffset.symbol);
+                    symbolToOffset.put(symbolOffset.symbol, symbolOffset.offset);
+                }
             }
-            this.sortedMethodOffsets = computeSortedMethodOffsets();
         }
 
         public long getCodeSize() {
@@ -225,43 +253,6 @@ public class LLVMObjectFileReader {
 
         public int getOffset(String methodName) {
             return symbolToOffset.get(SYMBOL_PREFIX + methodName);
-        }
-
-        public int getNextOffset(int offset) {
-            return sortedMethodOffsets.get(sortedMethodOffsets.indexOf(offset) + 1);
-        }
-
-        @FunctionalInterface
-        public interface OffsetRangeConsumer {
-            void apply(int start, int end);
-        }
-
-        public void forEachOffsetRange(OffsetRangeConsumer consumer) {
-            for (int i = 0; i < sortedMethodOffsets.size() - 1; ++i) {
-                consumer.apply(sortedMethodOffsets.get(i), sortedMethodOffsets.get(i + 1));
-            }
-        }
-
-        private List<Integer> computeSortedMethodOffsets() {
-            List<Integer> sortedOffsets = offsetToSymbol.keySet().stream().distinct().sorted().collect(Collectors.toList());
-
-            /*
-             * Functions added by the LLVM backend have to be removed before computing function
-             * offsets, because as they are not linked to a function known to Native Image, keeping
-             * them would create gaps in the CodeInfoTable. Removing these offsets includes them as
-             * part of the previously defined function instead. Stack walking will never see an
-             * address belonging to one of these LLVM functions, as these are executing in native
-             * mode, so this will not cause incorrect queries at runtime.
-             */
-            symbolToOffset.forEach((symbol, offset) -> {
-                if (symbol.startsWith(SYMBOL_PREFIX + LLVMGenerator.JNI_WRAPPER_BASE_NAME)) {
-                    sortedOffsets.remove(offset);
-                }
-            });
-
-            sortedOffsets.add(NumUtil.safeToInt(codeSize));
-
-            return sortedOffsets;
         }
     }
 }

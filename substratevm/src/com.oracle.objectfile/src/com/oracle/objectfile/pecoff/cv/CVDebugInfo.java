@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2020, 2020, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,9 +26,16 @@
 
 package com.oracle.objectfile.pecoff.cv;
 
-import com.oracle.objectfile.debugentry.DebugInfoBase;
-
 import java.nio.ByteOrder;
+
+import jdk.vm.ci.code.Register;
+import jdk.vm.ci.amd64.AMD64;
+
+import com.oracle.objectfile.debugentry.DebugInfoBase;
+import com.oracle.objectfile.pecoff.PECoffMachine;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.GraalError;
 
 /**
  * CVDebugInfo is a container class for all the CodeView sections to be emitted in the object file.
@@ -36,13 +43,24 @@ import java.nio.ByteOrder;
  */
 public final class CVDebugInfo extends DebugInfoBase {
 
-    private CVSymbolSectionImpl cvSymbolSection;
-    private CVTypeSectionImpl cvTypeSection;
+    private final CVSymbolSectionImpl cvSymbolSection;
+    private final CVTypeSectionImpl cvTypeSection;
+    private DebugContext debugContext;
 
-    public CVDebugInfo(ByteOrder byteOrder) {
+    /* Register constants for Windows x86_64 */
+    /* See AMD64ReservedRegisters.java (which we can't import here). */
+    public static final Register HEAP_BASE_REGISTER = AMD64.r14;
+    public static final Register THREAD_REGISTER = AMD64.r15;
+    public static final int POINTER_LENGTH = 8;
+
+    public CVDebugInfo(PECoffMachine machine, ByteOrder byteOrder) {
         super(byteOrder);
         cvSymbolSection = new CVSymbolSectionImpl(this);
-        cvTypeSection = new CVTypeSectionImpl();
+        cvTypeSection = new CVTypeSectionImpl(this);
+        if (machine != PECoffMachine.X86_64) {
+            /* room for future aach64 port */
+            throw GraalError.shouldNotReachHere("Unsupported Windows architecture"); // ExcludeFromJacocoGeneratedReport
+        }
     }
 
     public CVSymbolSectionImpl getCVSymbolSection() {
@@ -53,4 +71,20 @@ public final class CVDebugInfo extends DebugInfoBase {
         return cvTypeSection;
     }
 
+    public static byte getHeapbaseRegister() {
+        return (byte) HEAP_BASE_REGISTER.number;
+    }
+
+    @SuppressWarnings("unused")
+    public static byte getThreadRegister() {
+        return (byte) THREAD_REGISTER.number;
+    }
+
+    public DebugContext getDebugContext() {
+        return debugContext;
+    }
+
+    void setDebugContext(DebugContext debugContext) {
+        this.debugContext = debugContext;
+    }
 }

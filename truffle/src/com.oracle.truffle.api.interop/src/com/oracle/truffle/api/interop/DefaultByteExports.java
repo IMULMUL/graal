@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,8 @@
  */
 package com.oracle.truffle.api.interop;
 
-import com.oracle.truffle.api.TruffleLanguage;
+import java.math.BigInteger;
+
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
@@ -76,6 +77,11 @@ final class DefaultByteExports {
     }
 
     @ExportMessage
+    static boolean fitsInBigInteger(Byte receiver) {
+        return true;
+    }
+
+    @ExportMessage
     static boolean fitsInFloat(Byte receiver) {
         return true;
     }
@@ -106,6 +112,12 @@ final class DefaultByteExports {
     }
 
     @ExportMessage
+    @TruffleBoundary
+    static BigInteger asBigInteger(Byte receiver) {
+        return BigInteger.valueOf(receiver);
+    }
+
+    @ExportMessage
     static float asFloat(Byte receiver) {
         return receiver;
     }
@@ -113,20 +125,6 @@ final class DefaultByteExports {
     @ExportMessage
     static double asDouble(Byte receiver) {
         return receiver;
-    }
-
-    /*
-     * We export these messages explicitly because the legacy default is very costly. Remove with
-     * the complicated legacy implementation in InteropLibrary.
-     */
-    @ExportMessage
-    static boolean hasLanguage(Byte receiver) {
-        return false;
-    }
-
-    @ExportMessage
-    static Class<? extends TruffleLanguage<?>> getLanguage(Byte receiver) throws UnsupportedMessageException {
-        throw UnsupportedMessageException.create();
     }
 
     @ExportMessage

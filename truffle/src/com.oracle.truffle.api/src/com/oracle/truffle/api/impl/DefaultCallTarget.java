@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,9 +42,11 @@ package com.oracle.truffle.api.impl;
 
 import static com.oracle.truffle.api.impl.DefaultTruffleRuntime.getRuntime;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 import com.oracle.truffle.api.RootCallTarget;
-import com.oracle.truffle.api.TruffleRuntime;
 import com.oracle.truffle.api.TruffleSafepoint;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.impl.DefaultTruffleRuntime.DefaultFrameInstance;
 import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
 import com.oracle.truffle.api.nodes.Node;
@@ -52,18 +54,23 @@ import com.oracle.truffle.api.nodes.RootNode;
 
 /**
  * This is an implementation-specific class. Do not use or instantiate it. Instead, use
- * {@link TruffleRuntime#createCallTarget(RootNode)} to create a {@link RootCallTarget}.
+ * {@link RootNode#getCallTarget()} to get the {@link RootCallTarget} of a root node.
  */
-public final class DefaultCallTarget implements RootCallTarget {
+final class DefaultCallTarget extends RuntimeCallTarget {
 
-    public static final String CALL_BOUNDARY_METHOD = "callDirectOrIndirect";
+    public static final String CALL_BOUNDARY_METHOD = "executeRootNode";
     private final RootNode rootNode;
     private volatile boolean initialized;
+    private volatile boolean loaded;
+
+    public final long id;
+
+    private static final AtomicLong ID_COUNTER = new AtomicLong(0);
 
     DefaultCallTarget(RootNode function) {
         this.rootNode = function;
         this.rootNode.adoptChildren();
-        DefaultRuntimeAccessor.NODES.setCallTarget(function, this);
+        this.id = ID_COUNTER.incrementAndGet();
     }
 
     @Override
@@ -71,36 +78,55 @@ public final class DefaultCallTarget implements RootCallTarget {
         return rootNode.toString();
     }
 
+    @Override
     public RootNode getRootNode() {
         return rootNode;
-    }
-
-    Object callDirectOrIndirect(final Node callNode, Object... args) {
-        if (!this.initialized) {
-            initialize();
-        }
-        final DefaultVirtualFrame frame = new DefaultVirtualFrame(rootNode.getFrameDescriptor(), args);
-        DefaultFrameInstance callerFrame = getRuntime().pushFrame(frame, this, callNode);
-        try {
-            return rootNode.execute(frame);
-        } catch (Throwable t) {
-            DefaultRuntimeAccessor.LANGUAGE.onThrowable(callNode, this, t, frame);
-            throw t;
-        } finally {
-            TruffleSafepoint.poll(rootNode);
-            getRuntime().popFrame(callerFrame);
-        }
     }
 
     @Override
     public Object call(Object... args) {
         // Use the encapsulating node as call site and clear it inside as we cross the call boundary
         EncapsulatingNodeReference encapsulating = EncapsulatingNodeReference.getCurrent();
-        Node parent = encapsulating.set(null);
+        Node location = encapsulating.set(null);
         try {
-            return callDirectOrIndirect(parent, args);
+            return executeRootNode(location, -1, args);
         } finally {
-            encapsulating.set(parent);
+            encapsulating.set(location);
+        }
+    }
+
+    @Override
+    public Object call(Node location, Object... args) {
+        return executeRootNode(location, -1, args);
+    }
+
+    @Override
+    public Object call(Node location, int bytecodeIndex, Object[] args) {
+        return executeRootNode(location, bytecodeIndex, args);
+    }
+
+    @Override
+    public Object callRoot(Node location, int bytecodeIndex, RootNode root, Object[] arguments) {
+        assert root == rootNode;
+        return executeRootNode(location, bytecodeIndex, arguments);
+    }
+
+    // The single guest-call stack marker shared by all call entry points.
+    private Object executeRootNode(Node location, int bytecodeIndex, Object[] args) {
+        if (!this.initialized) {
+            initialize();
+        }
+        final VirtualFrame frame = new FrameWithoutBoxing(rootNode.getFrameDescriptor(), args);
+        DefaultFrameInstance callerFrame = getRuntime().pushFrame(frame, this, location, bytecodeIndex);
+        try {
+            Object toRet = rootNode.execute(frame);
+            TruffleSafepoint.poll(rootNode);
+            return toRet;
+        } catch (Throwable t) {
+            DefaultRuntimeAccessor.LANGUAGE.addStackFrameInfo(location, this, t, frame, bytecodeIndex);
+            throw t;
+        } finally {
+            getRuntime().popFrame(callerFrame);
         }
     }
 
@@ -111,5 +137,13 @@ public final class DefaultCallTarget implements RootCallTarget {
                 this.initialized = true;
             }
         }
+    }
+
+    boolean isLoaded() {
+        return loaded;
+    }
+
+    void setLoaded() {
+        this.loaded = true;
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -70,11 +70,11 @@ public class MessageTest {
 
     @Test
     public void testM0Properties() throws ClassNotFoundException {
-        Message m0 = Message.resolve(MessageLibrary.class, "m0");
+        Message m0 = Message.resolveExact(MessageLibrary.class, "m0", Object.class, String.class, int.class);
         assertSame(MessageLibrary.class, m0.getLibraryClass());
         assertEquals(MessageLibrary.class.getName(), m0.getLibraryName());
         assertEquals(Arrays.asList(Object.class, String.class, int.class), m0.getParameterTypes());
-        assertEquals(MessageLibrary.class.getName() + ".m0", m0.getQualifiedName());
+        assertEquals(MessageLibrary.class.getName() + ".m0(Object,String,int)", m0.getQualifiedName());
         assertSame(Object.class, m0.getReceiverType());
         assertSame(String.class, m0.getReturnType());
         assertSame(m0.getSimpleName().intern(), m0.getSimpleName());
@@ -82,7 +82,7 @@ public class MessageTest {
         assertSame(Class.forName(MessageLibrary.class.getName()), m0.getLibraryClass());
         assertEquals("m0", m0.getSimpleName());
 
-        Message m1 = Message.resolve(MessageLibrary.class, "m1");
+        Message m1 = Message.resolveExact(MessageLibrary.class, "m1", Object.class);
         assertNotEquals(m0.hashCode(), m1.hashCode());
         assertEquals(m0.hashCode(), m0.hashCode());
         assertTrue(m0.equals(m0));
@@ -97,16 +97,19 @@ public class MessageTest {
 
     @Test
     public void testResolve() {
-        assertSame(Message.resolve(MessageLibrary.class, "m0"), Message.resolve(MessageLibrary.class, "m0"));
+        assertSame(Message.resolveExact(MessageLibrary.class, "m0", Object.class, String.class, int.class),
+                        Message.resolveExact(MessageLibrary.class, "m0", Object.class, String.class, int.class));
 
-        assertNPE(() -> Message.resolve(MessageLibrary.class, null));
+        assertNPE(() -> Message.resolveExact(MessageLibrary.class, "m0", (Class<?>[]) null));
 
-        assertNPE(() -> Message.resolve((Class<? extends Library>) null, "m0"));
+        assertNPE(() -> Message.resolveExact(MessageLibrary.class, null));
 
-        assertIAE(() -> Message.resolve(DummyLibrary.class, "m0"),
+        assertNPE(() -> Message.resolveExact((Class<? extends Library>) null, "m0"));
+
+        assertIAE(() -> Message.resolveExact(DummyLibrary.class, "m0"),
                         String.format("Class '%s' is not a registered library. Truffle libraries must be annotated with @GenerateLibrary to be registered. Did the Truffle annotation processor run?",
                                         DummyLibrary.class.getName()));
-        assertIAE(() -> Message.resolve(MessageLibrary.class, "invalid"), "Unknown message 'invalid' for library 'com.oracle.truffle.api.library.test.MessageTest$MessageLibrary' specified.");
+        assertIAE(() -> Message.resolveExact(MessageLibrary.class, "invalid"), "Unknown message 'invalid' for library 'com.oracle.truffle.api.library.test.MessageTest$MessageLibrary' specified.");
     }
 
     static void assertNPE(Runnable r) {

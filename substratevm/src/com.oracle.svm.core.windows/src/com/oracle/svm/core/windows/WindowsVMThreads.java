@@ -24,34 +24,42 @@
  */
 package com.oracle.svm.core.windows;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.type.CCharPointer;
-import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.headers.LibC;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.core.windows.headers.LibC;
 import com.oracle.svm.core.windows.headers.Process;
 import com.oracle.svm.core.windows.headers.SynchAPI;
 import com.oracle.svm.core.windows.headers.WinBase;
+import com.oracle.svm.guest.staging.core.thread.OSThreadHandle;
+import com.oracle.svm.guest.staging.core.thread.OSThreadId;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+@AutomaticallyRegisteredImageSingleton(VMThreads.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public final class WindowsVMThreads extends VMThreads {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     @Override
     public OSThreadHandle getCurrentOSThreadHandle() {
-        WinBase.HANDLE pseudoThreadHandle = Process.GetCurrentThread();
-        WinBase.HANDLE pseudoProcessHandle = Process.GetCurrentProcess();
+        WinBase.HANDLE pseudoThreadHandle = Process.NoTransitions.GetCurrentThread();
+        WinBase.HANDLE pseudoProcessHandle = Process.NoTransitions.GetCurrentProcess();
 
         // convert the thread pseudo handle to a real handle using DuplicateHandle
         WinBase.LPHANDLE pointerToResult = StackValue.get(WinBase.LPHANDLE.class);
-        int status = WinBase.DuplicateHandle(pseudoProcessHandle, pseudoThreadHandle, pseudoProcessHandle, pointerToResult, Process.SYNCHRONIZE(), false, 0);
+        int desiredAccess = Process.SYNCHRONIZE() | Process.THREAD_QUERY_LIMITED_INFORMATION();
+        int status = WinBase.DuplicateHandle(pseudoProcessHandle, pseudoThreadHandle, pseudoProcessHandle, pointerToResult, desiredAccess, false, 0);
         VMError.guarantee(status != 0, "Duplicating thread handle failed.");
 
         // no need to cleanup anything as we only used pseudo-handles and stack values
@@ -61,10 +69,23 @@ public final class WindowsVMThreads extends VMThreads {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     @Override
     protected OSThreadId getCurrentOSThreadId() {
-        return WordFactory.unsigned(Process.GetCurrentThreadId());
+        return Word.unsigned(Process.NoTransitions.GetCurrentThreadId());
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.")
+    /**
+     * Each invocation of {@link #getCurrentOSThreadHandle()} returns a new handle, so only compare
+     * the thread id. Note that this is sufficient to detect all relevant problems because the
+     * thread handle keeps the thread object alive on Windows, i.e., the thread id can only be
+     * reused once the corresponding thread detaches from all isolates.
+     */
+    @Override
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public boolean verifyIsCurrentThread(IsolateThread thread) {
+        OSThreadId osThreadId = getCurrentOSThreadId();
+        return OSThreadIdTL.get(thread).equal(osThreadId);
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     @Override
     protected void joinNoTransition(OSThreadHandle osThreadHandle) {
         WinBase.HANDLE handle = (WinBase.HANDLE) osThreadHandle;
@@ -80,16 +101,15 @@ public final class WindowsVMThreads extends VMThreads {
         SynchAPI.NoTransitions.Sleep(milliseconds);
     }
 
-    /**
-     * Make sure the runtime is initialized for threading.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code. Too early for safepoints.")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     @Override
-    protected boolean initializeOnce() {
-        /*
-         * TODO: Check for failures here.
-         */
-        WindowsVMLockSupport.initialize();
+    public void yield() {
+        Process.NoTransitions.SwitchToThread();
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    @Override
+    public boolean supportsNativeYieldAndSleep() {
         return true;
     }
 
@@ -97,14 +117,5 @@ public final class WindowsVMThreads extends VMThreads {
     @Override
     public void failFatally(int code, CCharPointer message) {
         LibC.exit(code);
-    }
-}
-
-@AutomaticFeature
-@Platforms(Platform.WINDOWS.class)
-class WindowsVMThreadsFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(VMThreads.class, new WindowsVMThreads());
     }
 }

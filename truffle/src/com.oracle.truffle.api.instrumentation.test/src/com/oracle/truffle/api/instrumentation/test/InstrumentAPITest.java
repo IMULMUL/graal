@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,6 +47,7 @@ import org.junit.Test;
 
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest;
@@ -54,14 +55,20 @@ import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
 
 public class InstrumentAPITest extends AbstractPolyglotTest {
 
+    private static final InteropLibrary INTEROP = InteropLibrary.getFactory().getUncached();
+
+    public InstrumentAPITest() {
+        needsLanguageEnv = true;
+        needsInstrumentEnv = true;
+    }
+
     @Test
     public void testGetLanguageInfo() throws UnsupportedMessageException {
         setupEnv();
 
         Object hostObject = languageEnv.lookupHostSymbol(InstrumentAPITest.class.getName());
-        Class<? extends TruffleLanguage<?>> lang = INTEROP.getLanguage(hostObject);
-        LanguageInfo host = instrumentEnv.getLanguageInfo(lang);
-        assertEquals("host", host.getId());
+        String languageId = INTEROP.getLanguageId(hostObject);
+        assertEquals("host", languageId);
 
         assertFails(() -> instrumentEnv.getLanguageInfo(InvalidLanguageClass.class), IllegalArgumentException.class);
 

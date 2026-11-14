@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,33 +24,37 @@
  */
 package com.oracle.svm.core.stack;
 
-import static com.oracle.svm.core.util.VMError.unimplemented;
+import static com.oracle.svm.shared.util.VMError.intentionallyUnimplemented;
 
-import org.graalvm.compiler.word.Word;
 import org.graalvm.nativeimage.CurrentIsolate;
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoQueryResult;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.FrameInfoQueryResult;
 import com.oracle.svm.core.code.FrameInfoQueryResult.ValueInfo;
 import com.oracle.svm.core.code.FrameInfoQueryResult.ValueType;
 import com.oracle.svm.core.deopt.DeoptimizedFrame;
-import com.oracle.svm.core.deopt.DeoptimizedFrame.VirtualFrame;
 import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.core.deopt.VirtualFrame;
+import com.oracle.svm.jvmci.shared.meta.SharedMethod;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+import com.oracle.svm.shared.util.SubstrateUtil;
 
 import jdk.vm.ci.code.stack.InspectedFrame;
 import jdk.vm.ci.code.stack.InspectedFrameVisitor;
 import jdk.vm.ci.code.stack.StackIntrospection;
+import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.PrimitiveConstant;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.runtime.JVMCI;
 
@@ -73,7 +77,6 @@ public class SubstrateStackIntrospection implements StackIntrospection {
 
         /* Stack walking starts at the physical caller frame of this method. */
         Pointer startSP = KnownIntrinsics.readCallerStackPointer();
-
         PhysicalStackFrameVisitor<T> physicalFrameVisitor = new PhysicalStackFrameVisitor<>(initialMethods, matchingMethods, initialSkip, visitor);
         JavaStackWalker.walkCurrentThread(startSP, physicalFrameVisitor);
         return physicalFrameVisitor.result;
@@ -97,7 +100,17 @@ class PhysicalStackFrameVisitor<T> extends StackFrameVisitor {
     }
 
     @Override
-    public boolean visitFrame(Pointer sp, CodePointer ip, CodeInfo codeInfo, DeoptimizedFrame deoptimizedFrame) {
+    public boolean visitRegularFrame(Pointer sp, CodePointer ip, CodeInfo codeInfo) {
+        return visitFrame(sp, ip, codeInfo, null);
+    }
+
+    @Override
+    protected boolean visitDeoptimizedFrame(Pointer originalSP, CodePointer deoptStubIP, DeoptimizedFrame deoptimizedFrame) {
+        CodeInfo imageCodeInfo = CodeInfoTable.lookupImageCodeInfo(deoptStubIP);
+        return visitFrame(originalSP, deoptStubIP, imageCodeInfo, deoptimizedFrame);
+    }
+
+    private boolean visitFrame(Pointer sp, CodePointer ip, CodeInfo codeInfo, DeoptimizedFrame deoptimizedFrame) {
         VirtualFrame virtualFrame = null;
         CodeInfoQueryResult info = null;
         FrameInfoQueryResult deoptInfo = null;
@@ -106,7 +119,7 @@ class PhysicalStackFrameVisitor<T> extends StackFrameVisitor {
             virtualFrame = deoptimizedFrame.getTopFrame();
         } else {
             info = CodeInfoTable.lookupCodeInfoQueryResult(codeInfo, ip);
-            if (info == null || info.getFrameInfo() == null) {
+            if (info.getFrameInfo() == null) {
                 /*
                  * We do not have detailed information about this physical frame. It does not
                  * contain Java frames that we care about, so we can move on to the caller.
@@ -118,15 +131,15 @@ class PhysicalStackFrameVisitor<T> extends StackFrameVisitor {
 
         int virtualFrameIndex = 0;
         do {
-            int method;
+            CodePointer deoptAddress;
             if (virtualFrame != null) {
                 assert deoptInfo == null : "must have either deoptimized or non-deoptimized frame information, but not both";
-                method = virtualFrame.getFrameInfo().getDeoptMethodOffset();
+                deoptAddress = virtualFrame.getFrameInfo().getDeoptMethodAddress();
             } else {
-                method = deoptInfo.getDeoptMethodOffset();
+                deoptAddress = deoptInfo.getDeoptMethodAddress();
             }
 
-            if (matches(method, curMatchingMethods)) {
+            if (matchesDeoptAddress(deoptAddress, curMatchingMethods)) {
                 if (skip > 0) {
                     skip--;
                 } else {
@@ -158,15 +171,15 @@ class PhysicalStackFrameVisitor<T> extends StackFrameVisitor {
         } while (virtualFrame != null || deoptInfo != null);
 
         return true;
-
     }
 
-    private static boolean matches(int needle, ResolvedJavaMethod[] haystack) {
-        if (haystack == null) {
+    private static boolean matchesDeoptAddress(CodePointer ip, ResolvedJavaMethod[] methods) {
+        if (methods == null) {
             return true;
         }
-        for (ResolvedJavaMethod method : haystack) {
-            if (((SharedMethod) method).getDeoptOffsetInImage() == needle) {
+        for (ResolvedJavaMethod method : methods) {
+            CodeInfo codeInfo = CodeInfoTable.getImageCodeInfo((SharedMethod) method);
+            if (ip == CodeInfoAccess.absoluteIP(codeInfo, ((SharedMethod) method).getImageCodeDeoptOffset())) {
                 return true;
             }
         }
@@ -178,12 +191,14 @@ class SubstrateInspectedFrame implements InspectedFrame {
     private final Pointer sp;
     private final CodePointer ip;
     protected VirtualFrame virtualFrame;
-    private CodeInfoQueryResult codeInfo;
+    private final CodeInfoQueryResult codeInfo;
     private FrameInfoQueryResult frameInfo;
     private final int virtualFrameIndex;
 
-    private final JavaConstant[] locals;
+    private final int numLocals;
     private Deoptimizer deoptimizer;
+    private final int deoptMethodOffset;
+    private final long encodedBci;
 
     SubstrateInspectedFrame(Pointer sp, CodePointer ip, VirtualFrame virtualFrame, CodeInfoQueryResult codeInfo, FrameInfoQueryResult frameInfo, int virtualFrameIndex) {
         this.sp = sp;
@@ -196,19 +211,21 @@ class SubstrateInspectedFrame implements InspectedFrame {
             this.frameInfo = frameInfo;
         }
         this.virtualFrameIndex = virtualFrameIndex;
-        this.locals = new JavaConstant[this.frameInfo.getNumLocals()];
+        this.numLocals = this.frameInfo.getNumLocals();
+        this.deoptMethodOffset = this.frameInfo.getDeoptMethodOffset();
+        this.encodedBci = this.frameInfo.getEncodedBci();
     }
 
     private Deoptimizer getDeoptimizer() {
         assert virtualFrame == null;
         if (deoptimizer == null) {
-            deoptimizer = new Deoptimizer(sp, codeInfo, CurrentIsolate.getCurrentThread());
+            deoptimizer = new Deoptimizer(sp, codeInfo, CurrentIsolate.getCurrentThread(), CurrentIsolate.getCurrentThread());
         }
         return deoptimizer;
     }
 
     private void checkLocalIndex(int index) {
-        if (index < 0 || index >= frameInfo.getNumLocals()) {
+        if (index < 0 || index >= numLocals) {
             throw new IndexOutOfBoundsException();
         }
     }
@@ -217,26 +234,61 @@ class SubstrateInspectedFrame implements InspectedFrame {
     public Object getLocal(int index) {
         JavaConstant result = getLocalConstant(index);
         if (result.getJavaKind() != JavaKind.Object) {
-            throw new IllegalArgumentException("can only access Object local variables for now: " + result.getJavaKind());
+            throw new UnsupportedOperationException("Local " + index + " is " + result.getJavaKind() + ", not object");
         }
-        return KnownIntrinsics.convertUnknownValue(SubstrateObjectConstant.asObject(Object.class, result), Object.class);
+        return SubstrateObjectConstant.asObject(Object.class, result);
+    }
+
+    @Override
+    public int getLocalInt(int index) {
+        return requirePrimitive32Local(index);
+    }
+
+    @Override
+    public long getLocalLong(int index) {
+        return requirePrimitive64Local(index);
+    }
+
+    @Override
+    public float getLocalFloat(int index) {
+        return Float.intBitsToFloat(requirePrimitive32Local(index));
+    }
+
+    @Override
+    public double getLocalDouble(int index) {
+        return Double.longBitsToDouble(requirePrimitive64Local(index));
     }
 
     private JavaConstant getLocalConstant(int index) {
         checkDeoptimized();
         checkLocalIndex(index);
-        JavaConstant result;
         if (virtualFrame != null) {
-            result = virtualFrame.getConstant(index);
-            assert locals[index] == null || locals[index].equals(result) : "value before and after deoptimization must be equal";
-        } else {
-            result = locals[index];
-            if (result == null) {
-                result = getDeoptimizer().readLocalVariable(index, frameInfo);
-                locals[index] = result;
-            }
+            return virtualFrame.getConstant(index);
         }
-        return result;
+        return getDeoptimizer().getDeoptState().readLocalVariable(index, frameInfo);
+    }
+
+    /*
+     * Primitive access is storage-based. SVM may currently retain more precise kinds in frame
+     * metadata, but the shared contract only relies on whether 32-bit or 64-bit primitive storage
+     * is available.
+     */
+    private int requirePrimitive32Local(int index) {
+        JavaConstant result = getLocalConstant(index);
+        JavaKind kind = result.getJavaKind();
+        if (!(result instanceof PrimitiveConstant primitiveConstant) || kind == JavaKind.Illegal || kind == JavaKind.Long || kind == JavaKind.Double) {
+            throw new UnsupportedOperationException("Local " + index + " is " + kind + ", not 32-bit primitive storage");
+        }
+        return (int) primitiveConstant.getRawValue();
+    }
+
+    private long requirePrimitive64Local(int index) {
+        JavaConstant result = getLocalConstant(index);
+        JavaKind kind = result.getJavaKind();
+        if (!(result instanceof PrimitiveConstant primitiveConstant) || (kind != JavaKind.Long && kind != JavaKind.Double)) {
+            throw new UnsupportedOperationException("Local " + index + " is " + kind + ", not 64-bit primitive storage");
+        }
+        return primitiveConstant.getRawValue();
     }
 
     @Override
@@ -245,11 +297,7 @@ class SubstrateInspectedFrame implements InspectedFrame {
         checkLocalIndex(index);
         if (virtualFrame == null) {
             ValueInfo[] valueInfos = frameInfo.getValueInfos();
-            if (index >= valueInfos.length) {
-                return false;
-            } else if (valueInfos[index].getType() == ValueType.VirtualObject) {
-                return true;
-            }
+            return valueInfos != null && index < valueInfos.length && valueInfos[index].getType() == ValueType.VirtualObject;
         }
         return false;
     }
@@ -257,15 +305,107 @@ class SubstrateInspectedFrame implements InspectedFrame {
     @Override
     public boolean hasVirtualObjects() {
         checkDeoptimized();
-        if (virtualFrame == null) {
-            ValueInfo[] valueInfos = frameInfo.getValueInfos();
-            for (int i = 0; i < valueInfos.length; i++) {
-                if (valueInfos[i].getType() == ValueType.VirtualObject) {
+        return virtualFrame == null && hasVirtualObjects(frameInfo.getValueInfos());
+    }
+
+    private static boolean hasVirtualObjects(ValueInfo[] valueInfos) {
+        if (valueInfos != null) {
+            /*
+             * Frame value info is ordered as locals, expression stack, then locks. Virtual objects
+             * outside the local prefix still make the frame report virtual objects.
+             */
+            for (ValueInfo valueInfo : valueInfos) {
+                if (valueInfo.getType() == ValueType.VirtualObject) {
                     return true;
                 }
             }
         }
         return false;
+    }
+
+    private static FrameInfoQueryResult lookupFrameInfo(FrameInfoQueryResult topFrameInfo, int frameIndex) {
+        FrameInfoQueryResult cur = topFrameInfo;
+        for (int i = 0; i < frameIndex && cur != null; i++) {
+            cur = cur.getCaller();
+        }
+        return cur;
+    }
+
+    private VirtualFrame lookupVirtualFrame(DeoptimizedFrame deoptimizedFrame) {
+        /*
+         * Find the matching inlined frame, by skipping over the virtual frames that were already
+         * processed before deoptimization.
+         */
+        VirtualFrame cur = deoptimizedFrame.getTopFrame();
+        for (int i = 0; i < virtualFrameIndex && cur != null; i++) {
+            cur = cur.getCaller();
+        }
+        return cur;
+    }
+
+    private VirtualFrame lookupVirtualFrame() {
+        IsolateThread thread = CurrentIsolate.getCurrentThread();
+        DeoptimizedFrame deoptimizedFrame = Deoptimizer.checkEagerDeoptimized(thread, sp);
+        return deoptimizedFrame == null ? null : lookupVirtualFrame(deoptimizedFrame);
+    }
+
+    private LiveFrameLookupVisitor findLiveFrame(Pointer startSP) {
+        LiveFrameLookupVisitor visitor = new LiveFrameLookupVisitor();
+        JavaStackWalker.walkCurrentThread(startSP, visitor);
+        return visitor.found ? visitor : null;
+    }
+
+    private boolean matchesStackFrame(Pointer frameSP, CodePointer frameIP) {
+        /*
+         * The return address is part of the captured frame identity. If it changes, this handle may
+         * refer to a returned frame whose stack slot has been reused.
+         */
+        return frameSP.equal(sp) && frameIP.equal(ip);
+    }
+
+    private boolean matchesCapturedFrameInfo(FrameInfoQueryResult currentFrameInfo) {
+        return currentFrameInfo.getDeoptMethodOffset() == deoptMethodOffset &&
+                        currentFrameInfo.getEncodedBci() == encodedBci;
+    }
+
+    private final class LiveFrameLookupVisitor extends StackFrameVisitor {
+        boolean found;
+        boolean changed;
+
+        @Override
+        protected boolean visitRegularFrame(Pointer frameSP, CodePointer frameIP, CodeInfo currentCodeInfo) {
+            if (!frameSP.equal(sp)) {
+                return true;
+            }
+            found = true;
+            if (!matchesStackFrame(frameSP, frameIP)) {
+                changed = true;
+            } else {
+                codeInfo = CodeInfoTable.lookupCodeInfoQueryResult(currentCodeInfo, frameIP);
+                liveIP = frameIP;
+            }
+            return false;
+        }
+
+        @Override
+        protected boolean visitDeoptimizedFrame(Pointer originalSP, CodePointer deoptStubIP, DeoptimizedFrame currentDeoptimizedFrame) {
+            if (!originalSP.equal(sp)) {
+                return true;
+            }
+            found = true;
+            this.deoptimizedFrame = currentDeoptimizedFrame;
+            return false;
+        }
+
+        CodeInfoQueryResult codeInfo;
+        CodePointer liveIP;
+        DeoptimizedFrame deoptimizedFrame;
+    }
+
+    private void verifyLiveFrameInfo(FrameInfoQueryResult liveFrameInfo) {
+        if (liveFrameInfo == null || !matchesCapturedFrameInfo(liveFrameInfo)) {
+            throw new IllegalStateException("Stack frame changed");
+        }
     }
 
     private void checkDeoptimized() {
@@ -280,38 +420,64 @@ class SubstrateInspectedFrame implements InspectedFrame {
         }
     }
 
-    private VirtualFrame lookupVirtualFrame() {
-        DeoptimizedFrame deoptimizedFrame = Deoptimizer.checkDeoptimized(sp);
-        if (deoptimizedFrame != null) {
-            /*
-             * Find the matching inlined frame, by skipping over the virtual frames that were
-             * already processed before deoptimization.
-             */
-            VirtualFrame cur = deoptimizedFrame.getTopFrame();
-            for (int i = 0; i < virtualFrameIndex; i++) {
-                cur = cur.getCaller();
-            }
-            return cur;
-        } else {
-            return null;
-        }
-    }
-
     @Override
+    @NeverInline("Stack walking starts at the physical caller frame of this method.")
     public void materializeVirtualObjects(boolean invalidateCode) {
-        if (virtualFrame == null) {
-            DeoptimizedFrame deoptimizedFrame = getDeoptimizer().deoptSourceFrame(ip, false);
-            assert deoptimizedFrame == Deoptimizer.checkDeoptimized(sp);
+        /*
+         * Start at the Java caller of this mutator. A frame that has already returned must not be
+         * rediscovered by looking through stack storage reused by the mutator implementation.
+         */
+        Pointer startSP = KnownIntrinsics.readCallerStackPointer();
+        LiveFrameLookupVisitor liveFrame = findLiveFrame(startSP);
+        if (liveFrame == null) {
+            throw new IllegalStateException("Stack frame not found");
         }
+        if (liveFrame.changed) {
+            throw new IllegalStateException("Stack frame changed");
+        }
+        IsolateThread thread = CurrentIsolate.getCurrentThread();
+        if (liveFrame.deoptimizedFrame != null) {
+            VirtualFrame liveVirtualFrame = lookupVirtualFrame(liveFrame.deoptimizedFrame);
+            /*
+             * A regular frame handle records the source IP, while a handle captured after
+             * deoptimization records the deoptimization stub IP and is matched by VirtualFrame
+             * identity instead.
+             */
+            if (liveVirtualFrame == null ||
+                            (virtualFrame == null && !liveFrame.deoptimizedFrame.getSourcePC().equal(ip)) ||
+                            (virtualFrame != null && liveVirtualFrame != virtualFrame)) {
+                throw new IllegalStateException("Stack frame changed");
+            }
+            verifyLiveFrameInfo(liveVirtualFrame.getFrameInfo());
+            virtualFrame = liveVirtualFrame;
+        } else {
+            if (liveFrame.codeInfo == null || liveFrame.codeInfo.getFrameInfo() == null) {
+                throw new IllegalStateException("Stack frame not found");
+            }
+            FrameInfoQueryResult liveTopFrameInfo = liveFrame.codeInfo.getFrameInfo();
+            verifyLiveFrameInfo(lookupFrameInfo(liveTopFrameInfo, virtualFrameIndex));
+            if (!Deoptimizer.canEagerlyDeoptimize(liveTopFrameInfo, liveFrame.liveIP)) {
+                throw new IllegalStateException("Stack frame cannot be materialized");
+            }
+            Deoptimizer liveDeoptimizer = deoptimizer != null ? deoptimizer : new Deoptimizer(sp, liveFrame.codeInfo, thread, thread);
+            DeoptimizedFrame deoptimizedFrame = liveDeoptimizer.deoptimizeEagerly();
+            assert deoptimizedFrame == Deoptimizer.checkEagerDeoptimized(thread, sp);
+            virtualFrame = lookupVirtualFrame(deoptimizedFrame);
+        }
+        if (virtualFrame == null) {
+            throw new IllegalStateException("Stack frame not found");
+        }
+        frameInfo = virtualFrame.getFrameInfo();
+        deoptimizer = null;
 
         if (invalidateCode) {
             /*
-             * Note that we deoptimize the our frame before invalidating the method, with would also
+             * Note that we deoptimize our frame before invalidating the method, which would also
              * deoptimize our frame. But we would deoptimize it with new materialized objects, i.e.,
              * a virtual object that was accessed via a local variable before would now have a
              * different value.
              */
-            Deoptimizer.invalidateMethodOfFrame(sp, null);
+            Deoptimizer.invalidateMethodOfFrame(thread, sp, null, DeoptimizationReason.None, false);
         }
 
         /* We must be deoptimized now. */
@@ -325,27 +491,26 @@ class SubstrateInspectedFrame implements InspectedFrame {
         return frameInfo.getBci();
     }
 
-    @Override
     public ResolvedJavaMethod getMethod() {
         /*
          * Substrate VM currently does not store a mapping from deoptimization information back to
          * ResolvedJavaMethod.
          */
-        throw unimplemented();
+        throw intentionallyUnimplemented(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
     public boolean isMethod(ResolvedJavaMethod method) {
         checkDeoptimized();
-        return ((SharedMethod) method).getDeoptOffsetInImage() == frameInfo.getDeoptMethodOffset();
+        return ((SharedMethod) method).getImageCodeDeoptOffset() == frameInfo.getDeoptMethodOffset();
     }
 
     @Override
     public String toString() {
+        StringBuilder result = new StringBuilder();
         checkDeoptimized();
 
-        StringBuilder result = new StringBuilder();
-        final StackTraceElement sourceReference = frameInfo.getSourceReference();
+        StackTraceElement sourceReference = frameInfo != null ? frameInfo.getSourceReference() : null;
         result.append(sourceReference != null ? sourceReference.toString() : "[method name not available]");
 
         result.append("  bci: ").append(frameInfo.getBci());
@@ -355,17 +520,14 @@ class SubstrateInspectedFrame implements InspectedFrame {
         result.append("  sp: 0x").append(Long.toHexString(sp.rawValue()));
         result.append("  ip: 0x").append(Long.toHexString(ip.rawValue()));
         if (frameInfo.getDeoptMethodOffset() != 0) {
-            result.append("  deoptTarget: 0x").append(Long.toHexString(frameInfo.getDeoptMethodAddress().rawValue()));
+            CodePointer deoptMethodAddress = frameInfo != null ? frameInfo.getDeoptMethodAddress() : Word.nullPointer();
+            result.append("  deoptTarget: 0x").append(Long.toHexString(deoptMethodAddress.rawValue()));
         }
 
-        for (int i = 0; i < frameInfo.getNumLocals(); i++) {
+        for (int i = 0; i < numLocals; i++) {
             JavaConstant con = getLocalConstant(i);
             if (con.getJavaKind() != JavaKind.Illegal) {
-                result.append("\n    local ").append(i);
-                String name = frameInfo.getLocalVariableName(i);
-                if (name != null) {
-                    result.append(" ").append(name);
-                }
+                result.append(System.lineSeparator()).append("    local ").append(i);
                 if (con.getJavaKind() == JavaKind.Object) {
                     if (isVirtual(i)) {
                         result.append("  [virtual object]");

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,22 +24,28 @@
  */
 package com.oracle.svm.core;
 
-import org.graalvm.compiler.word.Word;
-import org.graalvm.nativeimage.Isolate;
-import org.graalvm.nativeimage.c.type.WordPointer;
-import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
+import static com.oracle.svm.shared.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.NonmovableArrays;
-import com.oracle.svm.core.c.function.CEntryPointCreateIsolateParameters;
-import com.oracle.svm.core.c.function.CEntryPointErrors;
-import com.oracle.svm.core.c.function.CEntryPointSetup;
-import com.oracle.svm.core.code.CodeInfoTable;
-import com.oracle.svm.core.heap.Heap;
+import org.graalvm.nativeimage.Isolate;
+import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.c.type.WordPointer;
+import org.graalvm.word.Pointer;
+import org.graalvm.word.PointerBase;
+import org.graalvm.word.WordBase;
+import org.graalvm.word.impl.Word;
+
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.IsolateArguments;
+import com.oracle.svm.guest.staging.core.heap.Heap;
 import com.oracle.svm.core.os.CommittedMemoryProvider;
+import com.oracle.svm.core.util.PointerUtils;
+import com.oracle.svm.shared.util.TimeUtils;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.nodes.NamedLocationIdentity;
 
 public class Isolates {
     public static final String IMAGE_HEAP_BEGIN_SYMBOL_NAME = "__svm_heap_begin";
@@ -49,7 +55,15 @@ public class Isolates {
     public static final String IMAGE_HEAP_A_RELOCATABLE_POINTER_SYMBOL_NAME = "__svm_a_relocatable_pointer";
     public static final String IMAGE_HEAP_WRITABLE_BEGIN_SYMBOL_NAME = "__svm_heap_writable_begin";
     public static final String IMAGE_HEAP_WRITABLE_END_SYMBOL_NAME = "__svm_heap_writable_end";
+    public static final String IMAGE_HEAP_WRITABLE_PATCHED_BEGIN_SYMBOL_NAME = "__svm_heap_writable_patched_begin";
+    public static final String IMAGE_HEAP_WRITABLE_PATCHED_END_SYMBOL_NAME = "__svm_heap_writable_patched_end";
 
+    /*
+     * The values that are stored in the image heap symbols are either unaligned or at most aligned
+     * to the build-time page size. When using these values at run-time (e.g., for changing the
+     * memory access protection of the image heap), it may be necessary to round them to a multiple
+     * of the run-time page size.
+     */
     public static final CGlobalData<Word> IMAGE_HEAP_BEGIN = CGlobalDataFactory.forSymbol(IMAGE_HEAP_BEGIN_SYMBOL_NAME);
     public static final CGlobalData<Word> IMAGE_HEAP_END = CGlobalDataFactory.forSymbol(IMAGE_HEAP_END_SYMBOL_NAME);
     public static final CGlobalData<Word> IMAGE_HEAP_RELOCATABLE_BEGIN = CGlobalDataFactory.forSymbol(IMAGE_HEAP_RELOCATABLE_BEGIN_SYMBOL_NAME);
@@ -57,48 +71,121 @@ public class Isolates {
     public static final CGlobalData<Word> IMAGE_HEAP_A_RELOCATABLE_POINTER = CGlobalDataFactory.forSymbol(IMAGE_HEAP_A_RELOCATABLE_POINTER_SYMBOL_NAME);
     public static final CGlobalData<Word> IMAGE_HEAP_WRITABLE_BEGIN = CGlobalDataFactory.forSymbol(IMAGE_HEAP_WRITABLE_BEGIN_SYMBOL_NAME);
     public static final CGlobalData<Word> IMAGE_HEAP_WRITABLE_END = CGlobalDataFactory.forSymbol(IMAGE_HEAP_WRITABLE_END_SYMBOL_NAME);
+    public static final CGlobalData<Word> IMAGE_HEAP_WRITABLE_PATCHED_BEGIN = CGlobalDataFactory.forSymbol(IMAGE_HEAP_WRITABLE_PATCHED_BEGIN_SYMBOL_NAME);
+    public static final CGlobalData<Word> IMAGE_HEAP_WRITABLE_PATCHED_END = CGlobalDataFactory.forSymbol(IMAGE_HEAP_WRITABLE_PATCHED_END_SYMBOL_NAME);
+    public static final CGlobalData<Pointer> ISOLATE_COUNTER = CGlobalDataFactory.createWord((WordBase) Word.unsigned(1));
 
-    @Uninterruptible(reason = "Thread state not yet set up.")
-    public static int checkSanity(Isolate isolate) {
-        if (SubstrateOptions.SpawnIsolates.getValue()) {
-            return isolate.isNull() ? CEntryPointErrors.NULL_ARGUMENT : CEntryPointErrors.NO_ERROR;
+    private static boolean startTimesAssigned;
+    private static long startTimeNanos;
+    private static long initDoneTimeMillis;
+    private static long isolateId = -1;
+
+    /**
+     * Indicates if the current isolate is the first isolate in this process. If so, it can be
+     * responsible for taking certain initialization steps (and, symmetrically, shutdown steps).
+     * Such steps can be installing signals handlers or initializing built-in libraries that are
+     * explicitly or implicitly shared between the isolates of the process (for example, because
+     * they have a single native state that does not distinguish between isolates).
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isCurrentFirst() {
+        VMError.guarantee(isolateId >= 0);
+        return isolateId == 0;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static void assignIsolateId(boolean isFirstIsolate) {
+        if (isFirstIsolate) {
+            isolateId = 0;
         } else {
-            return isolate.equal(CEntryPointSetup.SINGLE_ISOLATE_SENTINEL) ? CEntryPointErrors.NO_ERROR : CEntryPointErrors.UNINITIALIZED_ISOLATE;
+            long nextId;
+            long currentId;
+            Pointer currentIdPointer = ISOLATE_COUNTER.get();
+            do {
+                currentId = currentIdPointer.readLong(0);
+                nextId = currentId + 1;
+            } while (!currentIdPointer.logicCompareAndSwapLong(0, currentId, nextId, NamedLocationIdentity.OFF_HEAP_LOCATION));
+            isolateId = currentId;
+            VMError.guarantee(isolateId > 0);
         }
     }
 
+    public static void assignStartTime() {
+        assert !startTimesAssigned;
+        startTimeNanos = System.nanoTime();
+        initDoneTimeMillis = TimeUtils.currentTimeMillis();
+        startTimesAssigned = true;
+    }
+
+    /** Epoch-based timestamp. If possible, {@link #getStartTimeNanos()} should be used instead. */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long getInitDoneTimeMillis() {
+        assert startTimesAssigned;
+        return initDoneTimeMillis;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long getUptimeMillis() {
+        return TimeUtils.millisSinceNanos(getStartTimeNanos());
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long getStartTimeNanos() {
+        assert startTimesAssigned;
+        return startTimeNanos;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean isStartTimeAssigned() {
+        return startTimesAssigned;
+    }
+
+    /**
+     * Gets an identifier for the current isolate that is guaranteed to be unique and non-negative.
+     */
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long getIsolateId() {
+        assert isolateId >= 0;
+        return isolateId;
+    }
+
     @Uninterruptible(reason = "Thread state not yet set up.")
-    public static int create(WordPointer isolatePointer, CEntryPointCreateIsolateParameters parameters) {
-        int result = CommittedMemoryProvider.get().initialize(isolatePointer, parameters);
-        if (result != CEntryPointErrors.NO_ERROR) {
-            return result;
-        }
-        result = checkSanity(isolatePointer.read());
-        if (result != CEntryPointErrors.NO_ERROR) {
-            isolatePointer.write(WordFactory.nullPointer());
-            return result;
+    public static int checkIsolate(Isolate isolate) {
+        if (isolate.isNull()) {
+            return CEntryPointErrors.NULL_ARGUMENT;
+        } else if (!PointerUtils.isAMultiple(isolate, Word.signed(Heap.getHeap().getHeapBaseAlignment()))) {
+            /*
+             * The Isolate pointer is currently the same as the heap base, so we can check if the
+             * alignment matches the one that is expected for the heap base. This will detect most
+             * (but not all) invalid isolates.
+             */
+            return CEntryPointErrors.INVALID_ISOLATE_ARGUMENT;
         }
         return CEntryPointErrors.NO_ERROR;
     }
 
-    @Uninterruptible(reason = "Thread state not yet set up.", mayBeInlined = true)
-    public static PointerBase getHeapBase(Isolate isolate) {
-        if (!SubstrateOptions.SpawnIsolates.getValue()) {
-            return IMAGE_HEAP_BEGIN.get();
+    @Uninterruptible(reason = "Thread state not yet set up.")
+    public static int create(WordPointer isolatePointer, IsolateArguments arguments) {
+        WordPointer heapBasePointer = StackValue.get(WordPointer.class);
+        int result = CommittedMemoryProvider.get().initialize(heapBasePointer, arguments);
+        if (result != CEntryPointErrors.NO_ERROR) {
+            return result;
         }
+
+        Isolate isolate = heapBasePointer.read();
+        result = checkIsolate(isolate);
+        if (result != CEntryPointErrors.NO_ERROR) {
+            isolatePointer.write(Word.nullPointer());
+            return result;
+        }
+
+        isolatePointer.write(isolate);
+
+        return CEntryPointErrors.NO_ERROR;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static PointerBase getHeapBase(Isolate isolate) {
         return isolate;
-    }
-
-    @Uninterruptible(reason = "Tear-down in progress.")
-    public static int tearDownCurrent() {
-        freeUnmanagedMemory();
-        Heap.getHeap().tearDown();
-        return CommittedMemoryProvider.get().tearDown();
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static void freeUnmanagedMemory() {
-        CodeInfoTable.tearDown();
-        NonmovableArrays.tearDown();
     }
 }

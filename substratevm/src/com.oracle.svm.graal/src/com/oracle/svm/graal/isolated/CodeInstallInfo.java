@@ -28,7 +28,10 @@ import org.graalvm.nativeimage.c.struct.RawField;
 import org.graalvm.nativeimage.c.struct.RawStructure;
 import org.graalvm.word.PointerBase;
 
-import com.oracle.svm.core.code.CodeInfo;
+import com.oracle.svm.guest.staging.core.code.CodeInfo;
+import com.oracle.svm.core.graal.isolated.ClientHandle;
+
+import jdk.graal.compiler.core.common.CompilationIdentifier;
 
 /** The data that is required for installing compiled code in a different isolate. */
 @RawStructure
@@ -44,4 +47,11 @@ interface CodeInstallInfo extends PointerBase {
 
     @RawField
     void setAdjusterData(ForeignIsolateReferenceAdjusterData value);
+
+    @RawField
+    ClientHandle<CompilationIdentifier> getCompilationId();
+
+    @RawField
+    void setCompilationId(ClientHandle<CompilationIdentifier> value);
+
 }

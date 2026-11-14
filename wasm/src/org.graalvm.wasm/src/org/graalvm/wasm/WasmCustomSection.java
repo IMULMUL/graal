@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,52 +42,10 @@ package org.graalvm.wasm;
 
 /**
  * Information about a custom section.
+ *
+ * @param name Name of the custom section.
+ * @param offset Location in the custom sections array.
+ * @param length Length of the custom section.
  */
-public class WasmCustomSection {
-    /**
-     * Name of the custom section.
-     */
-    private final String name;
-    /**
-     * Position of the custom section in module's data.
-     */
-    private final int offset;
-    /**
-     * Length of the custom section.
-     */
-    private final int length;
-
-    public WasmCustomSection(String name, int offset, int length) {
-        this.name = name;
-        this.offset = offset;
-        this.length = length;
-    }
-
-    /**
-     * Returns the name of the custom section.
-     * 
-     * @return name of the custom section.
-     */
-    public String getName() {
-        return name;
-    }
-
-    /**
-     * Returns the position of the custom section in module's data.
-     * 
-     * @return position of the custom section in module's data.
-     */
-    public int getOffset() {
-        return offset;
-    }
-
-    /**
-     * Returns the length of the custom section.
-     * 
-     * @return length of the custom section.
-     */
-    public int getLength() {
-        return length;
-    }
-
+public record WasmCustomSection(String name, int offset, int length) {
 }

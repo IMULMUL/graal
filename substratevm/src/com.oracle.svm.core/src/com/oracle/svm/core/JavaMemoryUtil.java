@@ -24,16 +24,18 @@
  */
 package com.oracle.svm.core;
 
-import org.graalvm.compiler.word.BarrieredAccess;
-import org.graalvm.compiler.word.Word;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.guest.staging.core.IntrinsicCandidate;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.Uninterruptible;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.util.VMError;
+
+import org.graalvm.word.impl.BarrieredAccess;
 
 /**
  * The methods in this class are mainly used to fill or copy Java heap memory. All methods guarantee
@@ -142,7 +144,7 @@ public final class JavaMemoryUtil {
         UnsignedWord alignBits = diffBits.not().and(diffBits.subtract(1)).and(0x7);
         UnsignedWord alignment = alignBits.add(1);
         if (alignment.equal(1)) {
-            for (UnsignedWord offset = WordFactory.zero(); offset.belowThan(size); offset = offset.add(1)) {
+            for (UnsignedWord offset = Word.zero(); offset.belowThan(size); offset = offset.add(1)) {
                 to.writeByte(offset, from.readByte(offset));
             }
             return;
@@ -179,7 +181,7 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void copyUnalignedLower(Pointer from, Pointer to, UnsignedWord length) {
-        UnsignedWord offset = WordFactory.zero();
+        UnsignedWord offset = Word.zero();
         if (length.and(1).notEqual(0)) {
             to.writeByte(offset, from.readByte(offset));
             offset = offset.add(1);
@@ -195,7 +197,7 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void copyUnalignedUpper(Pointer from, Pointer to, UnsignedWord length) {
-        UnsignedWord offset = WordFactory.zero();
+        UnsignedWord offset = Word.zero();
         if (length.and(4).notEqual(0)) {
             to.writeInt(offset, from.readInt(offset));
             offset = offset.add(4);
@@ -268,19 +270,10 @@ public final class JavaMemoryUtil {
         copyUnalignedLower(from, to, offset);
     }
 
-    /** Implementation of {@code Unsafe.copyMemory}. */
-    public static void unsafeCopyMemory(Object srcBase, long srcOffset, Object destBase, long destOffset, long bytes) {
-        if (srcBase != null || destBase != null) {
-            copyOnHeap(srcBase, WordFactory.unsigned(srcOffset), destBase, WordFactory.unsigned(destOffset), WordFactory.unsigned(bytes));
-        } else {
-            UnmanagedMemoryUtil.copy(WordFactory.pointer(srcOffset), WordFactory.pointer(destOffset), WordFactory.unsigned(bytes));
-        }
-    }
-
     @Uninterruptible(reason = "Memory is on the heap, copying must not be interrupted.")
-    private static void copyOnHeap(Object srcBase, UnsignedWord srcOffset, Object destBase, UnsignedWord destOffset, UnsignedWord size) {
-        Word fromPtr = Word.objectToUntrackedPointer(srcBase).add(srcOffset);
-        Word toPtr = Word.objectToUntrackedPointer(destBase).add(destOffset);
+    public static void copyOnHeap(Object srcBase, UnsignedWord srcOffset, Object destBase, UnsignedWord destOffset, UnsignedWord size) {
+        Pointer fromPtr = Word.objectToUntrackedPointer(srcBase).add(srcOffset);
+        Pointer toPtr = Word.objectToUntrackedPointer(destBase).add(destOffset);
         UnmanagedMemoryUtil.copy(fromPtr, toPtr, size);
     }
 
@@ -302,8 +295,8 @@ public final class JavaMemoryUtil {
         v = (v << 16) | v;
         v = (v << 32) | v;
 
-        UnsignedWord alignMask = WordFactory.unsigned(0x7);
-        UnsignedWord lowerSize = WordFactory.unsigned(0x8).subtract(to).and(alignMask);
+        UnsignedWord alignMask = Word.unsigned(0x7);
+        UnsignedWord lowerSize = Word.unsigned(0x8).subtract(to).and(alignMask);
         if (lowerSize.aboveThan(0)) {
             if (size.belowThan(lowerSize)) {
                 lowerSize = size.and(lowerSize);
@@ -324,7 +317,7 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void fillUnalignedLower(Pointer to, long value, UnsignedWord length) {
-        UnsignedWord offset = WordFactory.zero();
+        UnsignedWord offset = Word.zero();
         if (length.and(1).notEqual(0)) {
             to.writeByte(offset, (byte) value);
             offset = offset.add(1);
@@ -341,7 +334,7 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void fillUnalignedUpper(Pointer to, long value, UnsignedWord upperSize) {
-        UnsignedWord offset = WordFactory.zero();
+        UnsignedWord offset = Word.zero();
         if (upperSize.and(4).notEqual(0)) {
             to.writeInt(offset, (int) value);
             offset = offset.add(4);
@@ -356,20 +349,10 @@ public final class JavaMemoryUtil {
         }
     }
 
-    /** Implementation of {@code Unsafe.setMemory}. */
-    public static void unsafeSetMemory(Object destBase, long destOffset, long bytes, byte bvalue) {
-        // Can't use UnmanagedMemoryUtil.fill as that method doesn't guarantee atomicity.
-        if (destBase != null) {
-            fillOnHeap(destBase, destOffset, bytes, bvalue);
-        } else {
-            fill(WordFactory.pointer(destOffset), WordFactory.unsigned(bytes), bvalue);
-        }
-    }
-
     @Uninterruptible(reason = "Accessed memory is on the heap, code must not be interrupted.")
-    private static void fillOnHeap(Object destBase, long destOffset, long bytes, byte bvalue) {
-        Word fromPtr = Word.objectToUntrackedPointer(destBase).add(WordFactory.unsigned(destOffset));
-        fill(fromPtr, WordFactory.unsigned(bytes), bvalue);
+    static void fillOnHeap(Object destBase, long destOffset, long bytes, byte bvalue) {
+        Pointer fromPtr = Word.objectToUntrackedPointer(destBase).add(Word.unsigned(destOffset));
+        fill(fromPtr, Word.unsigned(bytes), bvalue);
     }
 
     /**
@@ -398,28 +381,19 @@ public final class JavaMemoryUtil {
     }
 
     @Uninterruptible(reason = "Accessed memory is on the heap, code must not be interrupted.")
-    private static void copySwapOnHeap(Object srcBase, long srcOffset, Object destBase, long destOffset, long bytes, long elemSize) {
-        Word fromPtr = Word.objectToUntrackedPointer(srcBase).add(WordFactory.unsigned(srcOffset));
-        Word toPtr = Word.objectToUntrackedPointer(destBase).add(WordFactory.unsigned(destOffset));
-        copySwap(fromPtr, toPtr, WordFactory.unsigned(bytes), WordFactory.unsigned(elemSize));
-    }
-
-    /** Implementation of {@code Unsafe.copySwapMemory}. */
-    public static void unsafeCopySwapMemory(Object srcBase, long srcOffset, Object destBase, long destOffset, long bytes, long elemSize) {
-        if (srcBase != null || destBase != null) {
-            copySwapOnHeap(srcBase, srcOffset, destBase, destOffset, bytes, elemSize);
-        } else {
-            copySwap(WordFactory.unsigned(srcOffset), WordFactory.unsigned(destOffset), WordFactory.unsigned(bytes), WordFactory.unsigned(elemSize));
-        }
+    static void copySwapOnHeap(Object srcBase, long srcOffset, Object destBase, long destOffset, long bytes, long elemSize) {
+        Pointer fromPtr = Word.objectToUntrackedPointer(srcBase).add(Word.unsigned(srcOffset));
+        Pointer toPtr = Word.objectToUntrackedPointer(destBase).add(Word.unsigned(destOffset));
+        copySwap(fromPtr, toPtr, Word.unsigned(bytes), Word.unsigned(elemSize));
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void copySwap2(Pointer from, Pointer to, UnsignedWord size) {
-        if (from.aboveThan(to)) {
-            for (UnsignedWord offset = WordFactory.zero(); offset.belowThan(size); offset = offset.add(2)) {
+        if (from.aboveOrEqual(to)) {
+            for (UnsignedWord offset = Word.zero(); offset.belowThan(size); offset = offset.add(2)) {
                 to.writeShort(offset, Short.reverseBytes(from.readShort(offset)));
             }
-        } else if (from.belowThan(to)) {
+        } else {
             for (UnsignedWord offset = size; offset.aboveThan(0); offset = offset.subtract(2)) {
                 to.writeShort(offset.subtract(2), Short.reverseBytes(from.readShort(offset.subtract(2))));
             }
@@ -428,11 +402,11 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void copySwap4(Pointer from, Pointer to, UnsignedWord size) {
-        if (from.aboveThan(to)) {
-            for (UnsignedWord offset = WordFactory.zero(); offset.belowThan(size); offset = offset.add(4)) {
+        if (from.aboveOrEqual(to)) {
+            for (UnsignedWord offset = Word.zero(); offset.belowThan(size); offset = offset.add(4)) {
                 to.writeInt(offset, Integer.reverseBytes(from.readInt(offset)));
             }
-        } else if (from.belowThan(to)) {
+        } else {
             for (UnsignedWord offset = size; offset.aboveThan(0); offset = offset.subtract(4)) {
                 to.writeInt(offset.subtract(4), Integer.reverseBytes(from.readInt(offset.subtract(4))));
             }
@@ -441,11 +415,11 @@ public final class JavaMemoryUtil {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static void copySwap8(Pointer from, Pointer to, UnsignedWord size) {
-        if (from.aboveThan(to)) {
-            for (UnsignedWord offset = WordFactory.zero(); offset.belowThan(size); offset = offset.add(8)) {
+        if (from.aboveOrEqual(to)) {
+            for (UnsignedWord offset = Word.zero(); offset.belowThan(size); offset = offset.add(8)) {
                 to.writeLong(offset, Long.reverseBytes(from.readLong(offset)));
             }
-        } else if (from.belowThan(to)) {
+        } else {
             for (UnsignedWord offset = size; offset.aboveThan(0); offset = offset.subtract(8)) {
                 to.writeLong(offset.subtract(8), Long.reverseBytes(from.readLong(offset.subtract(8))));
             }
@@ -458,11 +432,11 @@ public final class JavaMemoryUtil {
      * compatible).
      */
     public static void copyObjectArrayForward(Object fromArray, int fromIndex, Object toArray, int toIndex, int length, int layoutEncoding) {
-        assert length >= 0;
+        assert length >= 0 : length;
 
         UnsignedWord fromOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, fromIndex);
         UnsignedWord toOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, toIndex);
-        UnsignedWord count = WordFactory.unsigned(length);
+        UnsignedWord count = Word.unsigned(length);
 
         copyReferencesForward(fromArray, fromOffset, toArray, toOffset, count);
     }
@@ -473,11 +447,11 @@ public final class JavaMemoryUtil {
      * compatible).
      */
     public static void copyObjectArrayBackward(Object fromArray, int fromIndex, Object toArray, int toIndex, int length, int layoutEncoding) {
-        assert length >= 0;
+        assert length >= 0 : length;
 
         UnsignedWord fromOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, fromIndex);
         UnsignedWord toOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, toIndex);
-        UnsignedWord count = WordFactory.unsigned(length);
+        UnsignedWord count = Word.unsigned(length);
 
         copyReferencesBackward(fromArray, fromOffset, toArray, toOffset, count);
     }
@@ -488,9 +462,9 @@ public final class JavaMemoryUtil {
      * copying between arrays, it is up to the caller to ensure that the arrays are compatible).
      */
     public static void copyReferencesForward(Object from, UnsignedWord fromOffset, Object to, UnsignedWord toOffset, UnsignedWord length) {
-        int elementSize = ConfigurationValues.getObjectLayout().getReferenceSize();
+        int elementSize = ObjectLayout.singleton().getReferenceSize();
         UnsignedWord size = length.multiply(elementSize);
-        UnsignedWord copied = WordFactory.zero();
+        UnsignedWord copied = Word.zero();
         while (copied.belowThan(size)) {
             BarrieredAccess.writeObject(to, toOffset.add(copied), BarrieredAccess.readObject(from, fromOffset.add(copied)));
             copied = copied.add(elementSize);
@@ -503,7 +477,7 @@ public final class JavaMemoryUtil {
      * copying between arrays, it is up to the caller to ensure that the arrays are compatible).
      */
     public static void copyReferencesBackward(Object from, UnsignedWord fromOffset, Object to, UnsignedWord toOffset, UnsignedWord length) {
-        int elementSize = ConfigurationValues.getObjectLayout().getReferenceSize();
+        int elementSize = ObjectLayout.singleton().getReferenceSize();
         UnsignedWord remaining = length.multiply(elementSize);
         while (remaining.aboveThan(0)) {
             remaining = remaining.subtract(elementSize);
@@ -531,13 +505,13 @@ public final class JavaMemoryUtil {
      * Copies between Java primitive arrays.
      */
     public static void copyPrimitiveArrayForward(Object fromArray, int fromIndex, Object toArray, int toIndex, int length, int layoutEncoding) {
-        assert length >= 0;
+        assert length >= 0 : length;
         assert fromArray != null;
         assert toArray != null;
 
         UnsignedWord fromOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, fromIndex);
         UnsignedWord toOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, toIndex);
-        UnsignedWord elementSize = WordFactory.unsigned(LayoutEncoding.getArrayIndexScale(layoutEncoding));
+        UnsignedWord elementSize = Word.unsigned(LayoutEncoding.getArrayIndexScale(layoutEncoding));
         UnsignedWord size = elementSize.multiply(length);
 
         copyPrimitiveArrayForward(fromArray, fromOffset, toArray, toOffset, size);
@@ -545,7 +519,7 @@ public final class JavaMemoryUtil {
 
     @IntrinsicCandidate
     @Uninterruptible(reason = "Arrays must not move")
-    private static void copyPrimitiveArrayForward(Object fromArray, UnsignedWord fromOffset, Object toArray, UnsignedWord toOffset, UnsignedWord size) {
+    public static void copyPrimitiveArrayForward(Object fromArray, UnsignedWord fromOffset, Object toArray, UnsignedWord toOffset, UnsignedWord size) {
         Pointer fromPtr = Word.objectToUntrackedPointer(fromArray).add(fromOffset);
         Pointer toPtr = Word.objectToUntrackedPointer(toArray).add(toOffset);
         copyPrimitiveArrayForward(fromPtr, toPtr, size);
@@ -566,13 +540,13 @@ public final class JavaMemoryUtil {
      * Copies between Java primitive arrays.
      */
     public static void copyPrimitiveArrayBackward(Object fromArray, int fromIndex, Object toArray, int toIndex, int length, int layoutEncoding) {
-        assert length >= 0;
+        assert length >= 0 : length;
         assert fromArray != null;
         assert toArray != null;
 
         UnsignedWord fromOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, fromIndex);
         UnsignedWord toOffset = LayoutEncoding.getArrayElementOffset(layoutEncoding, toIndex);
-        UnsignedWord elementSize = WordFactory.unsigned(LayoutEncoding.getArrayIndexScale(layoutEncoding));
+        UnsignedWord elementSize = Word.unsigned(LayoutEncoding.getArrayIndexScale(layoutEncoding));
         UnsignedWord size = elementSize.multiply(length);
 
         copyPrimitiveArrayBackward(fromArray, fromOffset, toArray, toOffset, size);

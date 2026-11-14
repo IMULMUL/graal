@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -50,7 +50,12 @@ final class DefaultIndirectCallNode extends IndirectCallNode {
 
     @Override
     public Object call(CallTarget target, Object... arguments) {
-        return ((DefaultCallTarget) target).callDirectOrIndirect(this, arguments);
+        return ((DefaultCallTarget) target).call(this, arguments);
+    }
+
+    @Override
+    public Object call(CallTarget target, int bytecodeIndex, Object[] arguments) {
+        return ((DefaultCallTarget) target).call(this, bytecodeIndex, arguments);
     }
 
 }

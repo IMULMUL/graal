@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,16 +24,17 @@
  */
 package com.oracle.svm.core.jdk.localization.substitutions;
 
-import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.Substitute;
-import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.jdk.localization.LocalizationSupport;
-import com.oracle.svm.core.jdk.localization.substitutions.modes.SubstituteLoadLookup;
-import org.graalvm.nativeimage.ImageSingletons;
-
 import java.util.Map;
 
-//Checkstyle: allow synchronization
+import com.oracle.svm.core.annotate.Alias;
+import com.oracle.svm.core.annotate.KeepOriginal;
+import com.oracle.svm.core.annotate.Substitute;
+import com.oracle.svm.core.annotate.TargetClass;
+import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.RuntimeClassLoading;
+import com.oracle.svm.core.jdk.localization.BundleContentSubstitutedLocalizationSupport;
+import com.oracle.svm.core.jdk.localization.substitutions.modes.SubstituteLoadLookup;
 
 @TargetClass(value = sun.util.resources.OpenListResourceBundle.class, onlyWith = SubstituteLoadLookup.class)
 @SuppressWarnings({"static-method"})
@@ -41,20 +42,33 @@ final class Target_sun_util_resources_OpenListResourceBundle_SubstituteLoadLooku
 
     @Alias private volatile Map<String, Object> lookup;
 
+    @Alias
+    public native Object[][] getContents();
+
+    @Alias
+    @KeepOriginal
+    @TargetElement(name = "loadLookup")
+    private native void loadLookupOriginal();
+
     @Substitute
     private void loadLookup() {
-        LocalizationSupport support = ImageSingletons.lookup(LocalizationSupport.class);
-        Map<String, Object> content = support.getBundleContentOf(this);
-        // use the supplied map implementation specified by the factory method
-        Map<String, Object> tmp = createMap(content.size());
-        tmp.putAll(content);
+        if (lookup != null) {
+            return;
+        }
+        if (RuntimeClassLoading.isSupported() && DynamicHub.fromClass(getClass()).isRuntimeLoaded()) {
+            /*
+             * Runtime-loaded bundle classes do not have build-time LocalizationSupport entries in
+             * the libjvm image. Let their original JDK implementation populate the lookup table
+             * from the runtime-loaded class contents instead.
+             */
+            loadLookupOriginal();
+            return;
+        }
+        Map<String, Object> content = BundleContentSubstitutedLocalizationSupport.getBundleContentOf(this);
         synchronized (this) {
             if (lookup == null) {
                 lookup = content;
             }
         }
     }
-
-    @Alias
-    protected native <K, V> Map<K, V> createMap(int size);
 }

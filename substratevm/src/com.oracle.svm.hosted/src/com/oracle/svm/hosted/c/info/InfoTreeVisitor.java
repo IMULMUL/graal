@@ -28,12 +28,14 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
+import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.svm.core.util.UserError;
 
 public abstract class InfoTreeVisitor {
 
     /**
-     * Compares the the Class name, the name and the result of
+     * Compares the Class name, the name and the result of
      * {@link ElementInfo#getAnnotatedElement()} to get a stable order for sorting the children of
      * an {@link ElementInfo} node.
      *
@@ -47,8 +49,18 @@ public abstract class InfoTreeVisitor {
     static {
         /* Defining the comparator chain on multiple lines requires less type annotations. */
         Comparator<ElementInfo> classNameComparator = Comparator.comparing(e -> e.getClass().getName());
-        Comparator<ElementInfo> nameComparator = classNameComparator.thenComparing(e -> e.getName());
-        elementInfoComparator = nameComparator.thenComparing(e -> e.getAnnotatedElement().toString());
+        Comparator<ElementInfo> nameComparator = classNameComparator.thenComparing(ElementInfo::getName);
+        elementInfoComparator = nameComparator.thenComparing(e -> asString(e.getAnnotatedElement()));
+    }
+
+    private static String asString(Object annotatedElement) {
+        if (annotatedElement instanceof AnalysisMethod) {
+            return ((AnalysisMethod) annotatedElement).getQualifiedName();
+        } else if (annotatedElement instanceof AnalysisType) {
+            return ((AnalysisType) annotatedElement).getName();
+        } else {
+            return annotatedElement.toString();
+        }
     }
 
     protected final void processChildren(ElementInfo info) {
@@ -63,7 +75,7 @@ public abstract class InfoTreeVisitor {
             try {
                 child.accept(this);
             } catch (NumberFormatException e) {
-                throw UserError.abort("Missing CAP cache value for: %s", child.getUniqueID());
+                throw UserError.abort(e, "Missing CAP cache value for: %s", child.getUniqueID());
             }
         }
     }
@@ -113,14 +125,6 @@ public abstract class InfoTreeVisitor {
     }
 
     protected void visitEnumConstantInfo(EnumConstantInfo info) {
-        processChildren(info);
-    }
-
-    protected void visitEnumValueInfo(EnumValueInfo info) {
-        processChildren(info);
-    }
-
-    protected void visitEnumLookupInfo(EnumLookupInfo info) {
         processChildren(info);
     }
 }

@@ -25,18 +25,17 @@
  */
 package com.oracle.svm.core.graal.aarch64;
 
-import org.graalvm.compiler.core.aarch64.AArch64SuitesCreator;
-import org.graalvm.compiler.core.phases.CommunityCompilerConfiguration;
-import org.graalvm.compiler.core.phases.EconomyCompilerConfiguration;
-import org.graalvm.compiler.phases.schedule.SchedulePhase;
-
 import com.oracle.svm.core.graal.code.SubstrateSuitesCreatorProvider;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
-import java.util.Arrays;
+import jdk.graal.compiler.core.phases.EconomyCompilerConfiguration;
 
+@SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class)
 public class SubstrateAArch64SuitesCreatorProvider extends SubstrateSuitesCreatorProvider {
     public SubstrateAArch64SuitesCreatorProvider() {
-        super(new AArch64SuitesCreator(new CommunityCompilerConfiguration(), Arrays.asList(SchedulePhase.class)),
-                        new AArch64SuitesCreator(new EconomyCompilerConfiguration(), Arrays.asList(SchedulePhase.class)));
+        super(new AArch64SubstrateSuitesCreator(getHostedCompilerConfiguration()),
+                        new AArch64SubstrateSuitesCreator(new EconomyCompilerConfiguration()), new AArch64SubstrateSuitesCreator(getFallbackCompilerConfiguration()));
     }
 }

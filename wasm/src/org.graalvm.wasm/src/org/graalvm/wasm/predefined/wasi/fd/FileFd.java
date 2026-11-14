@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,19 +45,24 @@ import com.oracle.truffle.api.TruffleFile;
 import com.oracle.truffle.api.nodes.Node;
 import org.graalvm.polyglot.io.FileSystem;
 import org.graalvm.wasm.memory.WasmMemory;
+import org.graalvm.wasm.predefined.wasi.WasiClockTimeGetNode;
 import org.graalvm.wasm.predefined.wasi.types.Errno;
 import org.graalvm.wasm.predefined.wasi.types.Fdflags;
 import org.graalvm.wasm.predefined.wasi.types.Filetype;
+import org.graalvm.wasm.predefined.wasi.types.Fstflags;
 import org.graalvm.wasm.predefined.wasi.types.Oflags;
 import org.graalvm.wasm.predefined.wasi.types.Rights;
 
 import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.LinkOption;
 import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.FileTime;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.graalvm.wasm.predefined.wasi.FlagUtils.isSet;
 
@@ -66,8 +71,19 @@ import static org.graalvm.wasm.predefined.wasi.FlagUtils.isSet;
  */
 class FileFd extends SeekableByteChannelFd {
 
+    /**
+     * The increment with which we grow files which are opened in Append mode and for which we
+     * increase the size using fd_filestat_set_size.
+     */
+    private static final int APPEND_GROW_CHUNK_SIZE = 1024 * 1024;
+
     private final TruffleFile file;
     private final short oflags;
+    private final boolean followSymlinks;
+
+    private LinkOption[] linkOptions() {
+        return FdUtils.linkOptions(followSymlinks);
+    }
 
     /**
      * @throws FileAlreadyExistsException if {@link StandardOpenOption#CREATE_NEW} option is set and
@@ -79,13 +95,14 @@ class FileFd extends SeekableByteChannelFd {
      * @throws SecurityException if the {@link FileSystem} denied the operation
      * @see TruffleFile#newByteChannel(Set, FileAttribute[])
      */
-    FileFd(TruffleFile file, short oflags, long fsRightsBase, long fsRightsInheriting, short fdFlags) throws IOException {
-        super(file.newByteChannel(parseOptions(oflags, fdFlags)), Filetype.RegularFile, fsRightsBase, fsRightsInheriting, fdFlags);
+    FileFd(TruffleFile file, short oflags, long fsRightsBase, long fsRightsInheriting, short fdFlags, boolean followSymlinks) throws IOException {
+        super(file.newByteChannel(parseOptions(oflags, fdFlags, followSymlinks)), Filetype.RegularFile, fsRightsBase, fsRightsInheriting, fdFlags);
         this.file = file;
         this.oflags = oflags;
+        this.followSymlinks = followSymlinks;
     }
 
-    private static Set<? extends OpenOption> parseOptions(short oflags, short fdFlags) {
+    private static Set<? extends OpenOption> parseOptions(short oflags, short fdFlags, boolean followSymlinks) {
         final Set<OpenOption> openOptions = new LinkedHashSet<>();
 
         // In WASI, the file access mode (read vs. write) is not specified when opening a file.
@@ -93,6 +110,9 @@ class FileFd extends SeekableByteChannelFd {
         // reading and writing.
         openOptions.add(StandardOpenOption.READ);
         openOptions.add(StandardOpenOption.WRITE);
+        if (!followSymlinks) {
+            openOptions.add(LinkOption.NOFOLLOW_LINKS);
+        }
         if (isSet(oflags, Oflags.Creat)) {
             openOptions.add(StandardOpenOption.CREATE);
         }
@@ -145,7 +165,7 @@ class FileFd extends SeekableByteChannelFd {
         if (!isSet(fsRightsBase, Rights.FdFilestatGet)) {
             return Errno.Notcapable;
         }
-        return FdUtils.writeFilestat(node, memory, resultAddress, file);
+        return FdUtils.writeFilestat(node, memory, resultAddress, file, linkOptions());
     }
 
     @Override
@@ -156,11 +176,82 @@ class FileFd extends SeekableByteChannelFd {
         try {
             close();
             fdFlags = newFsflags;
-            setChannel(file.newByteChannel(parseOptions(oflags, newFsflags)));
+            setChannel(file.newByteChannel(parseOptions(oflags, newFsflags, followSymlinks)));
             return Errno.Success;
         } catch (IOException e) {
             return Errno.Io;
         }
     }
 
+    @Override
+    public Errno filestatSetSize(Node node, long size) {
+        if (!isSet(fsRightsBase, Rights.FdFilestatSetSize)) {
+            return Errno.Notcapable;
+        }
+        if (size < 0) {
+            return Errno.Inval;
+        }
+        try {
+            if (size < file.size()) {
+                // We can decrease the size of a file using truncate.
+                getChannel().truncate(size);
+            } else if (size > file.size()) {
+                // To increase the size of a file, we write a 0 byte at the last desired position.
+                if (isSet(fdFlags, Fdflags.Append)) {
+                    // However, this is not possible in append mode, where we can only perform
+                    // writes at the end. In order to grow the file, we must write to it.
+                    long sizeDifference = size - file.size();
+                    if (sizeDifference >= APPEND_GROW_CHUNK_SIZE) {
+                        byte[] chunk = new byte[APPEND_GROW_CHUNK_SIZE];
+                        while (sizeDifference >= APPEND_GROW_CHUNK_SIZE) {
+                            getOutputStream().write(chunk);
+                            sizeDifference -= APPEND_GROW_CHUNK_SIZE;
+                        }
+                        getOutputStream().write(chunk, 0, (int) sizeDifference);
+                    } else {
+                        byte[] chunk = new byte[(int) sizeDifference];
+                        getOutputStream().write(chunk);
+                    }
+                    getOutputStream().write(new byte[(int) (size - file.size())]);
+                } else {
+                    long currentPosition = getChannel().position();
+                    try {
+                        getChannel().position(size - 1);
+                        getOutputStream().write(0);
+                    } finally {
+                        getChannel().position(currentPosition);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            return Errno.Io;
+        }
+        return Errno.Success;
+    }
+
+    @Override
+    public Errno filestatSetTimes(Node node, long atim, long mtim, int fstFlags) {
+        if (!isSet(fsRightsBase, Rights.FdFilestatSetTimes)) {
+            return Errno.Notcapable;
+        }
+        try {
+            if (isSet(fstFlags, Fstflags.Atim)) {
+                file.setLastAccessTime(FileTime.from(atim, TimeUnit.NANOSECONDS), linkOptions());
+            }
+            if (isSet(fstFlags, Fstflags.AtimNow)) {
+                file.setLastAccessTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS), linkOptions());
+            }
+            if (isSet(fstFlags, Fstflags.Mtim)) {
+                file.setLastModifiedTime(FileTime.from(mtim, TimeUnit.NANOSECONDS), linkOptions());
+            }
+            if (isSet(fstFlags, Fstflags.MtimNow)) {
+                file.setLastModifiedTime(FileTime.from(WasiClockTimeGetNode.realtimeNow(), TimeUnit.NANOSECONDS), linkOptions());
+            }
+        } catch (IOException e) {
+            return Errno.Io;
+        } catch (SecurityException e) {
+            return Errno.Acces;
+        }
+        return Errno.Success;
+    }
 }

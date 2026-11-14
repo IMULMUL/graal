@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -46,15 +46,14 @@ import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.regex.RegexExecNode;
 import com.oracle.truffle.regex.RegexLanguage;
 import com.oracle.truffle.regex.RegexObject;
+import com.oracle.truffle.regex.RegexProfile;
 import com.oracle.truffle.regex.RegexSource;
 import com.oracle.truffle.regex.RegexSyntaxException;
 import com.oracle.truffle.regex.UnsupportedRegexException;
 import com.oracle.truffle.regex.tregex.nfa.NFA;
-import com.oracle.truffle.regex.tregex.nodes.TRegexExecNode;
 import com.oracle.truffle.regex.tregex.nodes.TRegexExecNode.LazyCaptureGroupRegexSearchNode;
 import com.oracle.truffle.regex.tregex.nodes.dfa.TRegexDFAExecutorNode;
-import com.oracle.truffle.regex.tregex.nodes.nfa.TRegexBacktrackingNFAExecutorNode;
-import com.oracle.truffle.regex.tregex.parser.flavors.RegexFlavorProcessor;
+import com.oracle.truffle.regex.tregex.nodes.nfa.TRegexBacktrackerSubExecutorNode;
 import com.oracle.truffle.regex.tregex.util.DebugUtil;
 import com.oracle.truffle.regex.tregex.util.Loggers;
 
@@ -74,11 +73,11 @@ public final class TRegexCompiler {
         }
         try {
             RegexObject regex = doCompile(language, source);
-            logCompilationTime(source, timer);
+            logCompilationTime(source, timer, regex);
             Loggers.LOG_COMPILER_FALLBACK.finer(() -> "TRegex compiled: " + source);
             return regex;
         } catch (UnsupportedRegexException bailout) {
-            logCompilationTime(source, timer);
+            logCompilationTime(source, timer, null);
             Loggers.LOG_BAILOUT_MESSAGES.fine(() -> bailout.getReason() + ": " + source);
             throw bailout;
         }
@@ -86,32 +85,32 @@ public final class TRegexCompiler {
 
     @TruffleBoundary
     private static RegexObject doCompile(RegexLanguage language, RegexSource source) throws RegexSyntaxException {
-        RegexSource ecmascriptSource = source;
-        RegexFlavorProcessor flavorProcessor = source.getOptions().getFlavor() == null ? null : source.getOptions().getFlavor().forRegex(source);
-        if (flavorProcessor != null) {
-            ecmascriptSource = flavorProcessor.toECMAScriptRegex();
-        }
-        TRegexCompilationRequest compReq = new TRegexCompilationRequest(language, ecmascriptSource);
+        TRegexCompilationRequest compReq = new TRegexCompilationRequest(language, source);
         RegexExecNode execNode = compReq.compile();
-        if (flavorProcessor == null) {
-            return new RegexObject(execNode, source, compReq.getAst().getFlags(), compReq.getAst().getNumberOfCaptureGroups(), compReq.getAst().getNamedCaputureGroups());
-        } else {
-            return new RegexObject(execNode, source, flavorProcessor.getFlags(), flavorProcessor.getNumberOfCaptureGroups(), flavorProcessor.getNamedCaptureGroups());
-        }
+        return new RegexObject(language, source, execNode, compReq.getAst().getFlavorSpecificFlags(), compReq.getAst().getNumberOfCaptureGroups(), compReq.getNamedCaptureGroups());
     }
 
     @TruffleBoundary
     public static TRegexDFAExecutorNode compileEagerDFAExecutor(RegexLanguage language, RegexSource source) {
-        return new TRegexCompilationRequest(language, source).compileEagerDFAExecutor();
+        TRegexDFAExecutorNode executor = new TRegexCompilationRequest(language, source).compileEagerDFAExecutor();
+        if (executor.getCGTrackingCost() > TRegexOptions.TRegexMaxEagerCGDFACost) {
+            throw new UnsupportedRegexException("Too much additional capture group tracking overhead");
+        }
+        return executor;
     }
 
     @TruffleBoundary
-    public static LazyCaptureGroupRegexSearchNode compileLazyDFAExecutor(RegexLanguage language, NFA nfa, TRegexExecNode rootNode, boolean allowSimpleCG) {
-        return new TRegexCompilationRequest(language, nfa).compileLazyDFAExecutor(rootNode, allowSimpleCG);
+    public static LazyCaptureGroupRegexSearchNode compileLazyDFAExecutor(RegexLanguage language, RegexSource source, NFA nfa, RegexProfile rootNodeProfile, boolean allowSimpleCG) {
+        assert nfa == null || nfa.getAst().getSource() == source;
+        if (nfa == null) {
+            return new TRegexCompilationRequest(language, source).compileLazyDFAExecutorFromSource(rootNodeProfile, allowSimpleCG);
+        } else {
+            return new TRegexCompilationRequest(language, nfa).compileLazyDFAExecutor(rootNodeProfile, allowSimpleCG);
+        }
     }
 
     @TruffleBoundary
-    public static TRegexBacktrackingNFAExecutorNode compileBacktrackingExecutor(RegexLanguage language, NFA nfa) {
+    public static TRegexBacktrackerSubExecutorNode compileBacktrackingExecutor(RegexLanguage language, NFA nfa) {
         return new TRegexCompilationRequest(language, nfa).compileBacktrackingExecutor();
     }
 
@@ -121,10 +120,11 @@ public final class TRegexCompiler {
     }
 
     @TruffleBoundary
-    private static void logCompilationTime(RegexSource regexSource, DebugUtil.Timer timer) {
+    private static void logCompilationTime(RegexSource regexSource, DebugUtil.Timer timer, RegexObject regex) {
         if (timer != null) {
-            Loggers.LOG_TOTAL_COMPILATION_TIME.log(Level.FINE, "{0}, {1}", new Object[]{
+            Loggers.LOG_TOTAL_COMPILATION_TIME.log(Level.FINE, "Total compilation time: {0}, matcher: {1}, regex: {2}", new Object[]{
                             timer.elapsedToString(),
+                            regex == null ? "bailout" : regex.getLabel(),
                             DebugUtil.jsStringEscape(regexSource.toString())
             });
         }

@@ -25,33 +25,20 @@
 package com.oracle.svm.core.windows;
 
 import org.graalvm.nativeimage.LogHandler;
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CCharPointer;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.UnsignedWord;
 
 import com.oracle.svm.core.SubstrateDiagnostics;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.headers.LibC;
 import com.oracle.svm.core.thread.VMThreads;
 import com.oracle.svm.core.windows.headers.FileAPI;
-import com.oracle.svm.core.windows.headers.LibC;
-
-@AutomaticFeature
-@Platforms(Platform.WINDOWS.class)
-class WindowsLogHandlerFeature implements Feature {
-    @Override
-    public void beforeAnalysis(BeforeAnalysisAccess access) {
-        Log.finalizeDefaultLogHandler(new WindowsLogHandler());
-    }
-}
+import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
 
 public class WindowsLogHandler implements LogHandler {
 
     @Override
     public void log(CCharPointer bytes, UnsignedWord length) {
-        if (!WindowsUtils.writeBytes(getOutputFile(), bytes, length)) {
+        if (!WindowsUtils.write(getOutputFile(), bytes, length)) {
             /*
              * We are in a low-level log routine and output failed, so there is little we can do.
              */
@@ -67,14 +54,14 @@ public class WindowsLogHandler implements LogHandler {
 
     @Override
     public void fatalError() {
-        if (SubstrateDiagnostics.isInProgress()) {
+        if (SubstrateDiagnostics.isFatalErrorHandlingInProgress()) {
             // Delay the shutdown a bit if another thread has something important to report.
             VMThreads.singleton().nativeSleep(3000);
         }
         LibC.abort();
     }
 
-    private static int getOutputFile() {
+    private static HANDLE getOutputFile() {
         // [TODO] Change to use FileDescriptor.err once FileDescriptor class is functional
         return FileAPI.GetStdHandle(FileAPI.STD_ERROR_HANDLE());
     }

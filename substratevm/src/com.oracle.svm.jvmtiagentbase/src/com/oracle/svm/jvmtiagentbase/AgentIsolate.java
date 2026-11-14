@@ -30,39 +30,42 @@ import org.graalvm.nativeimage.Isolate;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.WordPointer;
 
-import com.oracle.svm.core.c.CGlobalData;
-import com.oracle.svm.core.c.CGlobalDataFactory;
-import com.oracle.svm.core.c.function.CEntryPointActions;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.c.function.CEntryPointActions;
+import com.oracle.svm.guest.staging.c.function.CEntryPointErrors;
+import com.oracle.svm.guest.staging.c.function.CEntryPointOptions;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.c.CGlobalData;
+import com.oracle.svm.guest.staging.c.CGlobalDataFactory;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * A utility class for managing the JVMTI agent's isolate. The JVMTI agent uses a single isolate
  * that is created during the {@link JvmtiAgentBase#onLoad} callback.
  */
 public final class AgentIsolate {
-    private static final CGlobalData<WordPointer> GLOBAL_ISOLATE = CGlobalDataFactory.createWord();
+    static final CGlobalData<WordPointer> GLOBAL_ISOLATE = CGlobalDataFactory.createWord();
 
-    public static final class Prologue {
+    public static final class Prologue implements CEntryPointOptions.Prologue {
         private static final CGlobalData<CCharPointer> errorMessage = CGlobalDataFactory.createCString(
                         "Failed to enter (or attach to) the global isolate in the current thread.");
 
+        @Uninterruptible(reason = "prologue")
         static void enter() {
             int code = CEntryPointActions.enterAttachThread(GLOBAL_ISOLATE.get().read(), true);
-            if (code != 0) {
+            if (code != CEntryPointErrors.NO_ERROR) {
                 CEntryPointActions.failFatally(code, errorMessage.get());
             }
         }
     }
 
-    public static final class EnterOrBailoutPrologue {
-        static void enter() {
+    public static final class EnterOrBailoutPrologue implements CEntryPointOptions.Prologue {
+        @Uninterruptible(reason = "prologue")
+        static int enter() {
             Isolate global = GLOBAL_ISOLATE.get().read();
             if (global.isNull()) {
-                CEntryPointActions.bailoutInPrologue();
+                return CEntryPointErrors.UNINITIALIZED_ISOLATE;
             }
-            if (CEntryPointActions.enterIsolate(global) != 0) {
-                CEntryPointActions.bailoutInPrologue();
-            }
+            return CEntryPointActions.enterByIsolate(global);
         }
     }
 

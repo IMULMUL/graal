@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,66 +25,148 @@
 package com.oracle.svm.configure.config;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.List;
+import java.util.EnumSet;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
-import com.oracle.svm.configure.json.JsonPrintable;
-import com.oracle.svm.configure.json.JsonWriter;
-import com.oracle.svm.core.util.UserError;
+import com.oracle.svm.configure.ConditionalElement;
+import com.oracle.svm.configure.ConfigurationBase;
+import com.oracle.svm.configure.ConfigurationParser;
+import com.oracle.svm.configure.ConfigurationParserOption;
+import com.oracle.svm.configure.ConfigurationTypeDescriptor;
+import com.oracle.svm.configure.ReflectionConfigurationParser;
+import com.oracle.svm.configure.UnresolvedAccessCondition;
+import com.oracle.svm.configure.config.conditional.AccessConditionResolver;
 
-import jdk.vm.ci.meta.JavaKind;
+import jdk.graal.compiler.util.json.JsonPrinter;
+import jdk.graal.compiler.util.json.JsonWriter;
 
-public class TypeConfiguration implements JsonPrintable {
-    private final ConcurrentMap<String, ConfigurationType> types = new ConcurrentHashMap<>();
+public final class TypeConfiguration extends ConfigurationBase<TypeConfiguration, TypeConfiguration.Predicate> {
 
-    public ConfigurationType get(String qualifiedJavaName) {
-        return types.get(qualifiedJavaName);
+    private final ConcurrentMap<ConditionalElement<ConfigurationTypeDescriptor>, ConfigurationType> types = new ConcurrentHashMap<>();
+
+    public TypeConfiguration() {
+    }
+
+    public TypeConfiguration(TypeConfiguration other) {
+        other.types.forEach((key, value) -> types.put(key, new ConfigurationType(value)));
+    }
+
+    @Override
+    public TypeConfiguration copy() {
+        return new TypeConfiguration(this);
+    }
+
+    @Override
+    protected void merge(TypeConfiguration other) {
+        other.types.forEach((key, value) -> {
+            types.compute(key, (_, v) -> {
+                if (v != null) {
+                    return ConfigurationType.copyAndMerge(v, value);
+                }
+                return value;
+            });
+        });
+    }
+
+    @Override
+    public void subtract(TypeConfiguration other) {
+        other.types.forEach((key, type) -> {
+            types.computeIfPresent(key, (_, v) -> ConfigurationType.copyAndSubtract(v, type));
+        });
+    }
+
+    @Override
+    protected void intersect(TypeConfiguration other) {
+        types.forEach((key, type) -> {
+            ConfigurationType intersectedType = other.types.get(key);
+            if (intersectedType != null) {
+                types.compute(key, (_, _) -> ConfigurationType.copyAndIntersect(type, intersectedType));
+            } else {
+                types.remove(key);
+            }
+        });
+    }
+
+    @Override
+    protected void removeIf(Predicate predicate) {
+        types.entrySet().removeIf(entry -> predicate.testIncludedType(entry.getKey(), entry.getValue()));
+    }
+
+    public ConfigurationType get(UnresolvedAccessCondition condition, ConfigurationTypeDescriptor typeDescriptor) {
+        return types.get(new ConditionalElement<>(condition, typeDescriptor));
     }
 
     public void add(ConfigurationType type) {
-        ConfigurationType previous = types.putIfAbsent(type.getQualifiedJavaName(), type);
-        UserError.guarantee(previous == null || previous == type, "Cannot replace existing type %s with %s", previous, type);
+        ConfigurationType previous = types.putIfAbsent(new ConditionalElement<>(type.getCondition(), type.getTypeDescriptor()), type);
+        if (previous != null && previous != type) {
+            throw new IllegalArgumentException("Cannot replace existing type " + previous + " with " + type);
+        }
     }
 
-    public ConfigurationType getOrCreateType(String qualifiedForNameString) {
-        assert qualifiedForNameString.indexOf('/') == -1 : "Requires qualified Java name, not internal representation";
-        assert !qualifiedForNameString.endsWith("[]") : "Requires Class.forName syntax, for example '[Ljava.lang.String;'";
-        String s = qualifiedForNameString;
-        int n = 0;
-        while (n < s.length() && s.charAt(n) == '[') {
-            n++;
-        }
-        if (n > 0) { // transform to Java source syntax
-            StringBuilder sb = new StringBuilder(s.length() + n);
-            if (s.charAt(n) == 'L' && s.charAt(s.length() - 1) == ';') {
-                sb.append(s, n + 1, s.length() - 1); // cut off leading '[' and 'L' and trailing ';'
-            } else if (n == s.length() - 1) {
-                sb.append(JavaKind.fromPrimitiveOrVoidTypeChar(s.charAt(n)).getJavaName());
+    public void addOrMerge(ConfigurationType type) {
+        types.compute(new ConditionalElement<>(type.getCondition(), type.getTypeDescriptor()), (_, value) -> {
+            if (value == null) {
+                return type;
             } else {
-                throw new IllegalArgumentException();
+                value.mergeFrom(type);
+                return value;
             }
-            for (int i = 0; i < n; i++) {
-                sb.append("[]");
-            }
-            s = sb.toString();
-        }
-        return types.computeIfAbsent(s, ConfigurationType::new);
+        });
+    }
+
+    public ConfigurationType getOrCreateType(UnresolvedAccessCondition condition, ConfigurationTypeDescriptor typeDescriptor) {
+        return types.computeIfAbsent(new ConditionalElement<>(condition, typeDescriptor), p -> new ConfigurationType(p.condition(), p.element(), true));
+    }
+
+    @Override
+    public void mergeConditional(UnresolvedAccessCondition condition, TypeConfiguration other) {
+        other.types.forEach((_, value) -> {
+            addOrMerge(new ConfigurationType(value, condition));
+        });
     }
 
     @Override
     public void printJson(JsonWriter writer) throws IOException {
-        writer.append('[');
-        String prefix = "\n";
-        List<ConfigurationType> list = new ArrayList<>(types.values());
-        list.sort(Comparator.comparing(ConfigurationType::getQualifiedJavaName));
-        for (ConfigurationType value : list) {
-            writer.append(prefix);
-            value.printJson(writer);
-            prefix = ",\n";
+        JsonPrinter.printCollection(writer, types.values(), Comparator.comparing(ConfigurationType::getTypeDescriptor).thenComparing(ConfigurationType::getCondition), ConfigurationType::printJson);
+    }
+
+    @Override
+    public ConfigurationParser createParser(boolean combinedFileSchema, EnumSet<ConfigurationParserOption> parserOptions) {
+        return ReflectionConfigurationParser.create(combinedFileSchema, AccessConditionResolver.identityResolver(), new ParserConfigurationAdapter(this), parserOptions);
+    }
+
+    @Override
+    public boolean isEmpty() {
+        return types.isEmpty();
+    }
+
+    @Override
+    public boolean supportsCombinedFile() {
+        return true;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
         }
-        writer.newline().append(']').newline();
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        TypeConfiguration that = (TypeConfiguration) o;
+        return types.equals(that.types);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(types);
+    }
+
+    public interface Predicate {
+
+        boolean testIncludedType(ConditionalElement<ConfigurationTypeDescriptor> conditionalElement, ConfigurationType type);
     }
 }

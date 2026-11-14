@@ -24,16 +24,15 @@
  */
 package com.oracle.svm.core.allocationprofile;
 
-// Checkstyle: allow reflection
-
 import java.lang.reflect.Field;
 
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.annotate.UnknownObjectField;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.BuildPhaseProvider.AfterCompilation;
+import com.oracle.svm.shared.NeverInline;
+import com.oracle.svm.guest.staging.core.heap.UnknownObjectField;
+import com.oracle.svm.shared.util.VMError;
 
 /**
  * Passed as an argument to the allocation snippet during lowering.
@@ -42,7 +41,8 @@ public class AllocationCounter {
     /** Name of the method that increments this counter. */
     private final String name;
     /** Next allocation counter - this value is only written during compilation. */
-    @UnknownObjectField(types = AllocationCounter.class) private AllocationCounter next;
+    @UnknownObjectField(canBeNull = true, availability = AfterCompilation.class)//
+    private AllocationCounter next;
     /** Number of allocations. */
     private long count;
     /** Size of allocations in bytes. */

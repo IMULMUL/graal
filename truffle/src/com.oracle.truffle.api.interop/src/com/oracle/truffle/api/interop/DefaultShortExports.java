@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,8 @@
  */
 package com.oracle.truffle.api.interop;
 
-import com.oracle.truffle.api.TruffleLanguage;
+import java.math.BigInteger;
+
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
@@ -59,10 +60,7 @@ final class DefaultShortExports {
     static boolean fitsInByte(Short receiver) {
         short s = receiver;
         byte b = (byte) s;
-        if (b == s) {
-            return true;
-        }
-        return false;
+        return b == s;
     }
 
     @ExportMessage
@@ -87,6 +85,11 @@ final class DefaultShortExports {
 
     @ExportMessage
     static boolean fitsInLong(Short receiver) {
+        return true;
+    }
+
+    @ExportMessage
+    static boolean fitsInBigInteger(Short receiver) {
         return true;
     }
 
@@ -116,6 +119,12 @@ final class DefaultShortExports {
     }
 
     @ExportMessage
+    @TruffleBoundary
+    static BigInteger asBigInteger(Short receiver) {
+        return BigInteger.valueOf(receiver);
+    }
+
+    @ExportMessage
     static float asFloat(Short receiver) {
         return receiver;
     }
@@ -123,20 +132,6 @@ final class DefaultShortExports {
     @ExportMessage
     static double asDouble(Short receiver) {
         return receiver;
-    }
-
-    /*
-     * We export these messages explicitly because the legacy default is very costly. Remove with
-     * the complicated legacy implementation in InteropLibrary.
-     */
-    @ExportMessage
-    static boolean hasLanguage(Short receiver) {
-        return false;
-    }
-
-    @ExportMessage
-    static Class<? extends TruffleLanguage<?>> getLanguage(Short receiver) throws UnsupportedMessageException {
-        throw UnsupportedMessageException.create();
     }
 
     @ExportMessage

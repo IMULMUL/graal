@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021, Oracle and/or its affiliates.
+# Copyright (c) 2021, 2025, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -27,7 +27,7 @@
 # NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 #
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 project(com.oracle.truffle.llvm.libraries.native LANGUAGES C)
 
 set(TRUFFLE_NFI_NATIVE_INCLUDE)
@@ -37,15 +37,21 @@ if(NOT TRUFFLE_NFI_NATIVE_INCLUDE)
 endif()
 
 set(CMAKE_INSTALL_PREFIX ${CMAKE_BINARY_DIR})
-add_compile_options(-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=${CMAKE_PROJECT_NAME})
-add_compile_options(-fdebug-prefix-map=${CMAKE_BINARY_DIR}=${CMAKE_PROJECT_NAME})
+add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=${CMAKE_PROJECT_NAME})
+add_compile_options(-ffile-prefix-map=${CMAKE_BINARY_DIR}=${CMAKE_PROJECT_NAME})
+add_compile_options(-ffile-prefix-map=${TRUFFLE_NFI_NATIVE_INCLUDE}=TRUFFLE_NFI_NATIVE/include)
 
 add_library(sulong-native SHARED
-    src/stat.c
     src/misc.c
-    src/posix.c
-    src/fp80.c
+    src/longdouble.c
     src/globals.c
 )
+if(NOT WIN32)
+    target_sources(sulong-native PRIVATE
+        src/posix.c
+        src/stat.c
+    )
+endif()
+
 target_include_directories(sulong-native PRIVATE ${TRUFFLE_NFI_NATIVE_INCLUDE})
 install(TARGETS sulong-native DESTINATION bin)

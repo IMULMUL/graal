@@ -26,33 +26,88 @@ package com.oracle.svm.core.windows.headers;
 
 import static org.graalvm.nativeimage.c.function.CFunction.Transition.NO_TRANSITION;
 
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.CContext;
 import org.graalvm.nativeimage.c.constant.CConstant;
 import org.graalvm.nativeimage.c.function.CFunction;
+import org.graalvm.nativeimage.c.struct.CField;
+import org.graalvm.nativeimage.c.struct.CFieldAddress;
+import org.graalvm.nativeimage.c.struct.CStruct;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CIntPointer;
+import org.graalvm.nativeimage.c.type.CLongPointer;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.windows.headers.LibC.WCharPointer;
+import com.oracle.svm.core.windows.headers.WinBase.HANDLE;
+import com.oracle.svm.core.windows.headers.WindowsLibC.WCharPointer;
 
-//Checkstyle: stop
+// Checkstyle: stop
 
 /**
- * Definitions manually translated from the Windows header file fileapi.h.
+ * Definitions for Windows fileapi.h
  */
 @CContext(WindowsDirectives.class)
-@Platforms(Platform.WINDOWS.class)
 public class FileAPI {
 
+    /** Generic Access Rights */
+    @CConstant
+    public static native int GENERIC_READ();
+
+    @CConstant
+    public static native int GENERIC_WRITE();
+
+    /** Creates or opens a file or I/O device. */
+    @CFunction(transition = NO_TRANSITION)
+    public static native HANDLE CreateFileW(WCharPointer lpFileName, int dwDesiredAccess, int dwShareMode,
+                    PointerBase lpSecurityAttributes, int dwCreationDisposition, int dwFlagsAndAttributes,
+                    HANDLE hTemplateFile);
+
+    /** CreateFile - dwShareMode Constants */
+    @CConstant
+    public static native int FILE_SHARE_READ();
+
+    @CConstant
+    public static native int FILE_SHARE_WRITE();
+
+    @CConstant
+    public static native int FILE_SHARE_DELETE();
+
+    /** CreateFile - dwCreationDisposition Constants */
+    @CConstant
+    public static native int OPEN_EXISTING();
+
+    @CConstant
+    public static native int CREATE_NEW();
+
+    @CConstant
+    public static native int CREATE_ALWAYS();
+
+    @CConstant
+    public static native int FILE_ATTRIBUTE_NORMAL();
+
+    @CConstant
+    public static native int FILE_ATTRIBUTE_DIRECTORY();
+
+    @CConstant
+    public static native int FILE_ATTRIBUTE_REPARSE_POINT();
+
+    @CConstant
+    public static native int FILE_FLAG_OPEN_REPARSE_POINT();
+
+    @CConstant
+    public static native int FILE_FLAG_BACKUP_SEMANTICS();
+
+    @CConstant
+    public static native int FILE_BEGIN();
+
+    @CConstant
+    public static native int FILE_CURRENT();
+
     @CFunction
-    public static native int WriteFile(int hFile, CCharPointer lpBuffer, UnsignedWord nNumberOfBytesToWrite,
+    public static native int WriteFile(HANDLE hFile, CCharPointer lpBuffer, int nNumberOfBytesToWrite,
                     CIntPointer lpNumberOfBytesWritten, PointerBase lpOverlapped);
 
     @CFunction
-    public static native int FlushFileBuffers(int hFile);
+    public static native int FlushFileBuffers(HANDLE hFile);
 
     @CConstant
     public static native int STD_INPUT_HANDLE();
@@ -64,8 +119,67 @@ public class FileAPI {
     public static native int STD_ERROR_HANDLE();
 
     @CFunction
-    public static native int GetStdHandle(int stdHandle);
+    public static native HANDLE GetStdHandle(int stdHandle);
 
     @CFunction(transition = NO_TRANSITION)
     public static native int GetTempPathW(int nBufferLength, WCharPointer lpBuffer);
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native int GetFileAttributesW(WCharPointer lpFileName);
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native HANDLE FindFirstFileW(WCharPointer lpFileName, WIN32_FIND_DATAW lpFindFileData);
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native int FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW lpFindFileData);
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native int FindClose(HANDLE hFindFile);
+
+    @CConstant
+    public static native int FILE_NAME_NORMALIZED();
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native int GetFinalPathNameByHandleW(HANDLE hFile, WCharPointer lpszFilePath, int cchFilePath, int dwFlags);
+
+    @CFunction(transition = NO_TRANSITION)
+    public static native int GetFileInformationByHandle(HANDLE hFile, BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    @CConstant
+    public static native int INVALID_FILE_ATTRIBUTES();
+
+    @CStruct("BY_HANDLE_FILE_INFORMATION")
+    public interface BY_HANDLE_FILE_INFORMATION extends PointerBase {
+        @CField("dwFileAttributes")
+        int getFileAttributes();
+    }
+
+    @CStruct("WIN32_FIND_DATAW")
+    public interface WIN32_FIND_DATAW extends PointerBase {
+        @CField("dwFileAttributes")
+        int getFileAttributes();
+
+        @CFieldAddress("cFileName")
+        WCharPointer getFileName();
+    }
+
+    public static class NoTransition {
+        @CFunction(transition = NO_TRANSITION)
+        public static native int ReadFile(HANDLE hFile, CCharPointer lpBuffer, int nNumberOfBytesToRead, CIntPointer lpNumberOfBytesRead, PointerBase lpOverlapped);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int GetFileSizeEx(HANDLE hFile, CLongPointer lpFileSize);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int SetFilePointerEx(HANDLE hFile, long liDistanceToMove, CLongPointer lpNewFilePointer, int dwMoveMethod);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int WriteFile(HANDLE hFile, CCharPointer lpBuffer, int nNumberOfBytesToWrite, CIntPointer lpNumberOfBytesWritten, PointerBase lpOverlapped);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native int FlushFileBuffers(HANDLE hFile);
+
+        @CFunction(transition = NO_TRANSITION)
+        public static native HANDLE GetStdHandle(int stdHandle);
+    }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -56,7 +56,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.CodeSource;
-import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -65,43 +64,37 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
-import java.util.function.Supplier;
 import java.util.jar.JarFile;
-import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import com.oracle.truffle.api.provider.TruffleLanguageProvider;
+import com.oracle.truffle.api.test.ReflectionUtils;
 import org.junit.Assert;
 import org.junit.Assume;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class LanguageCacheTest {
 
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
+
     @Test
     public void testDuplicateLanguageIds() throws Throwable {
+        TruffleTestAssumptions.assumeNotAOT();
         CodeSource codeSource = LanguageCacheTest.class.getProtectionDomain().getCodeSource();
         Assume.assumeNotNull(codeSource);
         Path location = Paths.get(codeSource.getLocation().toURI());
-        Function<String, List<URL>> loader = new Function<String, List<URL>>() {
-            @Override
-            public List<URL> apply(String binaryName) {
-                try {
-                    if (Files.isRegularFile(location)) {
-                        return Collections.singletonList(new URL("jar:" + location.toUri().toString() + "!/" + binaryName));
-                    } else {
-                        return Collections.singletonList(new URL(location.toUri().toString() + binaryName));
-                    }
-                } catch (MalformedURLException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        };
+        Loader loader = new DuplicateLoader(location);
         ClassLoader testClassLoader = new TestClassLoader(loader);
         try {
-            invokeLanguageCacheCreateLanguages(LanguageCacheTest.class.getClassLoader(), testClassLoader);
+            invokeLanguageCacheCreateLanguages(testClassLoader);
             Assert.fail("Expected IllegalStateException");
         } catch (IllegalStateException ise) {
             // Expected exception
@@ -110,6 +103,7 @@ public class LanguageCacheTest {
 
     @Test
     public void testNestedArchives() throws Throwable {
+        TruffleTestAssumptions.assumeNotAOT();
         CodeSource codeSource = LanguageCacheTest.class.getProtectionDomain().getCodeSource();
         Assume.assumeNotNull(codeSource);
         URL location = codeSource.getLocation();
@@ -122,26 +116,14 @@ public class LanguageCacheTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> invokeLanguageCacheCreateLanguages(ClassLoader... loaders) throws Throwable {
+    private static Map<String, Object> invokeLanguageCacheCreateLanguages(ClassLoader loader) throws Throwable {
         try {
-            final Class<?> langCacheClz = Class.forName("com.oracle.truffle.polyglot.LanguageCache", true, LanguageCacheTest.class.getClassLoader());
-            final Method createLanguages = langCacheClz.getDeclaredMethod("createLanguages", List.class);
+            Class<?> abstractClassLoaderSupplierClz = Class.forName("com.oracle.truffle.polyglot.EngineAccessor$AbstractClassLoaderSupplier", true, LanguageCacheTest.class.getClassLoader());
+            Class<?> strongClassLoaderSupplierClz = Class.forName("com.oracle.truffle.polyglot.EngineAccessor$StrongClassLoaderSupplier", true, LanguageCacheTest.class.getClassLoader());
+            Class<?> langCacheClz = Class.forName("com.oracle.truffle.polyglot.LanguageCache", true, LanguageCacheTest.class.getClassLoader());
+            Method createLanguages = langCacheClz.getDeclaredMethod("createLanguages", abstractClassLoaderSupplierClz);
             createLanguages.setAccessible(true);
-            class LoaderSupplier implements Supplier<ClassLoader> {
-
-                private final ClassLoader classLoader;
-
-                LoaderSupplier(ClassLoader classLoader) {
-                    this.classLoader = classLoader;
-                }
-
-                @Override
-                public ClassLoader get() {
-                    return classLoader;
-                }
-            }
-            return (Map<String, Object>) createLanguages.invoke(null,
-                            Arrays.stream(loaders).map(LoaderSupplier::new).collect(Collectors.toList()));
+            return (Map<String, Object>) createLanguages.invoke(null, ReflectionUtils.newInstance(strongClassLoaderSupplierClz, new Class<?>[]{ClassLoader.class}, loader));
         } catch (InvocationTargetException ite) {
             throw ite.getCause();
         } catch (ReflectiveOperationException re) {
@@ -149,6 +131,10 @@ public class LanguageCacheTest {
         }
     }
 
+    /**
+     * Language registered by the normal Truffle annotation processor and used as the first owner of
+     * {@link #ID} in {@link #testDuplicateLanguageIds()}.
+     */
     @TruffleLanguage.Registration(id = DuplicateIdLanguage.ID, name = DuplicateIdLanguage.ID, version = "1.0")
     public static final class DuplicateIdLanguage extends TruffleLanguage<Void> {
         static final String ID = "DuplicateIdLanguage";
@@ -161,29 +147,65 @@ public class LanguageCacheTest {
     }
 
     /**
-     * Inverse {@link ClassLoader} for loading second instance of {@code DuplicateIdLanguage}. This
-     * classloader delegates all requests to its parent except of loading of
-     * {@code DuplicateIdLanguage} class.
+     * Second test language that intentionally uses the same id as {@link DuplicateIdLanguage}.
+     *
+     * <p>It is not registered directly. Instead, {@link DuplicateIdLanguage2Provider} exposes it via
+     * the synthetic service descriptor used by {@link #testDuplicateLanguageIds()}.
+     */
+    public static final class DuplicateIdLanguage2 extends TruffleLanguage<Void> {
+        static final String ID = "DuplicateIdLanguage";
+
+        @Override
+        protected Void createContext(Env env) {
+            return null;
+        }
+
+    }
+
+    /**
+     * Manual language provider loaded from {@code duplicate_id_registration.txt} to create a duplicate
+     * language id in a single {@link ClassLoader}.
+     */
+    @TruffleLanguage.Registration(id = DuplicateIdLanguage2.ID, name = DuplicateIdLanguage2.ID, version = "1.0")
+    public static final class DuplicateIdLanguage2Provider extends TruffleLanguageProvider {
+
+        @Override
+        protected String getLanguageClassName() {
+            return DuplicateIdLanguage2.class.getName();
+        }
+
+        @Override
+        protected Object create() {
+            return new DuplicateIdLanguage2();
+        }
+
+        @Override
+        protected Collection<String> getServicesClassNames() {
+            return List.of();
+        }
+
+        @Override
+        protected List<?> createFileTypeDetectors() {
+            return List.of();
+        }
+    }
+
+    /**
+     * Class loader that delegates to a {@link Loader} for selected resources and classes and to its
+     * parent for everything else.
      */
     private static final class TestClassLoader extends ClassLoader {
 
-        private static final Set<String> IMPORTANT_RESOURCES;
-        static {
-            IMPORTANT_RESOURCES = new HashSet<>();
-            IMPORTANT_RESOURCES.add(binaryName(DuplicateIdLanguage.class.getName()) + ".class");
-            IMPORTANT_RESOURCES.add(binaryName(LanguageCacheTestDuplicateIdLanguageProvider.class.getName()) + ".class");
-        }
+        private final Loader loader;
 
-        private final Function<String, List<URL>> loader;
-
-        TestClassLoader(Function<String, List<URL>> loader) {
+        TestClassLoader(Loader loader) {
             super(TestClassLoader.class.getClassLoader());
             this.loader = loader;
         }
 
         @Override
         protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-            if (!IMPORTANT_RESOURCES.contains(binaryName(name) + ".class")) {
+            if (!loader.handles(binaryName(name) + ".class")) {
                 return super.loadClass(name, resolve);
             } else {
                 synchronized (getClassLoadingLock(name)) {
@@ -202,9 +224,6 @@ public class LanguageCacheTest {
         @Override
         protected Class<?> findClass(String name) throws ClassNotFoundException {
             String filePath = binaryName(name) + ".class";
-            if (!IMPORTANT_RESOURCES.contains(filePath)) {
-                throw new IllegalArgumentException("Only " + String.join(", ", IMPORTANT_RESOURCES) + " can be loaded.");
-            }
             try {
                 URL location = findResource(filePath);
                 if (location == null) {
@@ -223,7 +242,7 @@ public class LanguageCacheTest {
 
         @Override
         public URL getResource(String name) {
-            if (!IMPORTANT_RESOURCES.contains(name)) {
+            if (!loader.handles(name)) {
                 return super.getResource(name);
             } else {
                 URL url = findResource(name);
@@ -233,7 +252,7 @@ public class LanguageCacheTest {
 
         @Override
         public Enumeration<URL> getResources(String name) throws IOException {
-            if (!IMPORTANT_RESOURCES.contains(name)) {
+            if (!loader.handles(name)) {
                 return super.getResources(name);
             } else {
                 Enumeration<URL> e1 = findResources(name);
@@ -257,7 +276,11 @@ public class LanguageCacheTest {
 
         @Override
         protected Enumeration<URL> findResources(String name) throws IOException {
-            return Collections.enumeration(loader.apply(name));
+            if (loader.handles(name)) {
+                return Collections.enumeration(loader.find(name));
+            } else {
+                return Collections.emptyEnumeration();
+            }
         }
 
         private static <T> void addAll(Collection<? super T> dest, Enumeration<? extends T> src) {
@@ -289,16 +312,72 @@ public class LanguageCacheTest {
             int lastDot = className.lastIndexOf('.');
             return lastDot == -1 ? "" : className.substring(0, lastDot);
         }
+    }
 
-        private static String binaryName(String name) {
-            return name.replace(".", "/");
+    private static String binaryName(String name) {
+        return name.replace(".", "/");
+    }
+
+    private interface Loader {
+
+        boolean handles(String binaryName);
+
+        List<URL> find(String binaryName);
+    }
+
+    private static final class DuplicateLoader implements Loader {
+
+        private static final String IMPORTANT_RESOURCE = "META-INF/services/com.oracle.truffle.api.provider.TruffleLanguageProvider";
+        private static final String REPLACEMENT = binaryName(DuplicateLoader.class.getPackageName()) + "/duplicate_id_registration.txt";
+
+        private final Path location;
+
+        DuplicateLoader(Path testClassesRoot) {
+            this.location = testClassesRoot;
+        }
+
+        @Override
+        public boolean handles(String binaryName) {
+            return IMPORTANT_RESOURCE.equals(binaryName);
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public List<URL> find(String binaryName) {
+            if (!handles(binaryName)) {
+                throw new IllegalArgumentException("Unhandled resource " + binaryName + ", supported resources are: " + IMPORTANT_RESOURCE);
+            }
+            try {
+                URL url;
+                if (Files.isRegularFile(location)) {
+                    url = new URL("jar:" + location.toUri() + "!/" + REPLACEMENT);
+                } else {
+                    url = new URL(location.toUri() + "/" + REPLACEMENT);
+                }
+                try {
+                    url.openConnection().connect();
+                    return Collections.singletonList(url);
+                } catch (IOException ioe) {
+                    return Collections.emptyList();
+                }
+            } catch (MalformedURLException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 
     /**
      * Simulates a jar file inside a container jar (war, ear) file.
      */
-    private static final class NestedJarLoader implements Function<String, List<URL>>, Closeable {
+    private static final class NestedJarLoader implements Loader, Closeable {
+
+        private static final Set<String> IMPORTANT_RESOURCES;
+
+        static {
+            IMPORTANT_RESOURCES = new HashSet<>();
+            IMPORTANT_RESOURCES.add(binaryName(DuplicateIdLanguage.class.getName()) + ".class");
+            IMPORTANT_RESOURCES.add(binaryName(LanguageCacheTestDuplicateIdLanguageProvider.class.getName()) + ".class");
+        }
 
         private final ZipFile zipFile;
         private final String relocation;
@@ -312,7 +391,16 @@ public class LanguageCacheTest {
         }
 
         @Override
-        public List<URL> apply(String binaryName) {
+        public boolean handles(String binaryName) {
+            return IMPORTANT_RESOURCES.contains(binaryName);
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public List<URL> find(String binaryName) {
+            if (!handles(binaryName)) {
+                throw new IllegalArgumentException("Unhandled resource " + binaryName + ", supported resources are: " + String.join(", ", IMPORTANT_RESOURCES));
+            }
             String entryName = binaryName.charAt(0) == '/' ? binaryName.substring(1) : binaryName;
             ZipEntry e = zipFile.getEntry(entryName);
             if (e != null) {
@@ -349,6 +437,7 @@ public class LanguageCacheTest {
                         throw new UnsupportedOperationException("Not supported.");
                     }
 
+                    @SuppressWarnings("deprecation")
                     @Override
                     public URL getJarFileURL() {
                         try {

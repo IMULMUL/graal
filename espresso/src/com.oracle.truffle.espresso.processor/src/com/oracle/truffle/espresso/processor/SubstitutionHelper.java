@@ -24,38 +24,82 @@ package com.oracle.truffle.espresso.processor;
 
 import java.util.List;
 
+import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.TypeMirror;
+
+import com.oracle.truffle.espresso.processor.EspressoProcessor.InjectableType;
 
 /**
- * passed around during espresso annotation processing. It is meant to be subclassed to serve as
+ * Passed around during espresso annotation processing. It is meant to be subclassed to serve as
  * storage for the data required during processing.
  * 
  * @see NativeEnvProcessor.IntrinsincsHelper
  * @see com.oracle.truffle.espresso.processor.SubstitutionProcessor.SubstitutorHelper
  */
 public class SubstitutionHelper {
-    List<GuestCall> guestCalls;
-    boolean hasMetaInjection;
-    boolean hasProfileInjection;
+    final List<InjectableType> injectedTypes;
+    final boolean skipSafepoint;
+    private final boolean needsContextInjection;
 
-    public SubstitutionHelper(EspressoProcessor processor, ExecutableElement method) {
-        guestCalls = processor.getGuestCalls(method);
-        hasMetaInjection = processor.hasMetaInjection(method);
-        hasProfileInjection = processor.hasProfileInjection(method);
+    // Target of the substitution, can be a public static method or a node.
+    private final Element target;
+
+    private final TypeElement implAnnotation;
+
+    private final TypeElement enclosingClass;
+
+    public TypeElement getNodeTarget() {
+        return (TypeElement) target;
     }
 
-    public static final class GuestCall {
-        public final String target;
-        public final boolean original;
+    public ExecutableElement getMethodTarget() {
+        return (ExecutableElement) target;
+    }
 
-        public GuestCall(String target, boolean original) {
-            this.target = target;
-            this.original = original;
-        }
+    public TypeMirror getCollectTarget() {
+        return implAnnotation.asType();
+    }
 
-        @Override
-        public String toString() {
-            return target;
+    @SuppressWarnings("this-escape")
+    public SubstitutionHelper(EspressoProcessor processor, Element target, TypeElement implAnnotation, TypeElement enclosingClass) {
+        this.target = target;
+        this.implAnnotation = implAnnotation;
+        this.enclosingClass = enclosingClass;
+        // If the target is a node, obtain the abstract execute* method.
+        ExecutableElement targetMethod = isNodeTarget()
+                        ? processor.findNodeExecute(getNodeTarget())
+                        : getMethodTarget();
+        this.injectedTypes = processor.getInjectedTypes(targetMethod);
+        this.skipSafepoint = processor.skipsSafepoint(target);
+        boolean ctxInject = false;
+        for (InjectableType injectableType : injectedTypes) {
+            if (injectableType == InjectableType.CONTEXT || !InjectableType.knownTypes.contains(injectableType)) {
+                ctxInject = true;
+                break;
+            }
         }
+        this.needsContextInjection = ctxInject;
+    }
+
+    public boolean isNodeTarget() {
+        return target instanceof TypeElement;
+    }
+
+    public TypeElement getImplAnnotation() {
+        return implAnnotation;
+    }
+
+    public Element getTarget() {
+        return target;
+    }
+
+    public final boolean needsContextInjection() {
+        return needsContextInjection;
+    }
+
+    public TypeElement getEnclosingClass() {
+        return enclosingClass;
     }
 }

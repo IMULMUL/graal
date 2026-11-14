@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,39 +24,42 @@
  */
 package com.oracle.svm.core.c;
 
-// Checkstyle: allow reflection
-
 import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import org.graalvm.compiler.nodes.java.ArrayLengthNode;
-import org.graalvm.compiler.word.Word;
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
-import org.graalvm.nativeimage.impl.UnmanagedMemorySupport;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
 import com.oracle.svm.core.JavaMemoryUtil;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.config.ConfigurationValues;
-import com.oracle.svm.core.heap.Heap;
-import com.oracle.svm.core.heap.ObjectHeader;
-import com.oracle.svm.core.heap.ObjectReferenceVisitor;
+import com.oracle.svm.core.SubstrateTarget;
+import com.oracle.svm.guest.staging.core.c.NonmovableArray;
+import com.oracle.svm.guest.staging.core.c.NonmovableObjectArray;
+import com.oracle.svm.guest.staging.core.UnmanagedMemoryUtil;
+import com.oracle.svm.shared.config.ObjectLayout;
+import com.oracle.svm.guest.staging.core.heap.Heap;
+import com.oracle.svm.guest.staging.core.heap.ObjectHeader;
+import com.oracle.svm.guest.staging.core.heap.ObjectReferenceVisitor;
 import com.oracle.svm.core.heap.ReferenceAccess;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.LayoutEncoding;
-import com.oracle.svm.core.jdk.UninterruptibleUtils;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils;
+import com.oracle.svm.core.memory.NullableNativeMemory;
+import com.oracle.svm.core.nmt.NmtCategory;
+import com.oracle.svm.core.hub.DynamicHubIntrinsics;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.guest.staging.util.PreallocatedExceptions;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.util.VMError;
+
+import jdk.graal.compiler.nodes.NamedLocationIdentity;
+import jdk.graal.compiler.nodes.java.ArrayLengthNode;
 
 /**
  * Support for allocating and accessing non-moving arrays. Such arrays are safe to access during
@@ -81,29 +84,32 @@ public final class NonmovableArrays {
 
     private static final UninterruptibleUtils.AtomicLong runtimeArraysInExistence = new UninterruptibleUtils.AtomicLong(0);
 
-    private static final OutOfMemoryError OUT_OF_MEMORY_ERROR = new OutOfMemoryError("Could not allocate nonmovable array");
+    private static final OutOfMemoryError OUT_OF_MEMORY_ERROR = PreallocatedExceptions.createOutOfMemoryError("Could not allocate nonmovable array");
+    private static final NegativeArraySizeException NEGATIVE_ARRAY_SIZE_EXCEPTION = PreallocatedExceptions.createNegativeArraySizeException();
 
     @SuppressWarnings("unchecked")
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    private static <T extends NonmovableArray<?>> T createArray(int length, Class<?> arrayType) {
+    private static <T extends NonmovableArray<?>> T createArray(int length, Class<?> arrayType, NmtCategory nmtCategory) {
         if (SubstrateUtil.HOSTED) {
             Class<?> componentType = arrayType.getComponentType();
             Object array = Array.newInstance(componentType, length);
             return (T) (componentType.isPrimitive() ? new HostedNonmovableArray<>(array) : new HostedNonmovableObjectArray<>(array));
         }
+        if (length < 0) {
+            throw NEGATIVE_ARRAY_SIZE_EXCEPTION;
+        }
         DynamicHub hub = SubstrateUtil.cast(arrayType, DynamicHub.class);
         assert LayoutEncoding.isArray(hub.getLayoutEncoding());
-        UnsignedWord size = LayoutEncoding.getArraySize(hub.getLayoutEncoding(), length);
-        Pointer array = ImageSingletons.lookup(UnmanagedMemorySupport.class).calloc(size);
+        UnsignedWord size = LayoutEncoding.getArrayAllocationSize(hub.getLayoutEncoding(), length);
+        Pointer array = NullableNativeMemory.calloc(size, nmtCategory);
         if (array.isNull()) {
             throw OUT_OF_MEMORY_ERROR;
         }
 
         ObjectHeader header = Heap.getHeap().getObjectHeader();
         Word encodedHeader = header.encodeAsUnmanagedObjectHeader(hub);
-        header.initializeHeaderOfNewObject(array, encodedHeader);
-
-        array.writeInt(ConfigurationValues.getObjectLayout().getArrayLengthOffset(), length);
+        header.initializeHeaderOfNewObjectOffHeap(array, encodedHeader, true);
+        array.writeInt(ObjectLayout.singleton().getArrayLengthOffset(), length, NamedLocationIdentity.OFF_HEAP_LOCATION);
         // already zero-initialized thanks to calloc()
         trackUnmanagedArray((NonmovableArray<?>) array);
         return (T) array;
@@ -119,7 +125,7 @@ public final class NonmovableArrays {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private static DynamicHub readHub(NonmovableArray<?> array) {
         ObjectHeader objectHeader = Heap.getHeap().getObjectHeader();
-        return objectHeader.readDynamicHubFromPointer((Pointer) array);
+        return (DynamicHub) objectHeader.readDynamicHubFromPointer((Pointer) array);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -143,13 +149,13 @@ public final class NonmovableArrays {
         if (SubstrateUtil.HOSTED) {
             return Array.getLength(getHostedArray(array));
         }
-        return ((Pointer) array).readInt(ConfigurationValues.getObjectLayout().getArrayLengthOffset());
+        return ((Pointer) array).readInt(ObjectLayout.singleton().getArrayLengthOffset());
     }
 
     /** Provides the size of the given array in bytes. */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static UnsignedWord byteSizeOf(NonmovableArray<?> array) {
-        return array.isNonNull() ? LayoutEncoding.getArraySize(readLayoutEncoding(array), lengthOf(array)) : WordFactory.zero();
+        return array.isNonNull() ? LayoutEncoding.getArrayAllocationSize(readLayoutEncoding(array), lengthOf(array)) : Word.zero();
     }
 
     /** @see System#arraycopy */
@@ -161,7 +167,7 @@ public final class NonmovableArrays {
         }
         assert srcPos >= 0 && destPos >= 0 && length >= 0 && srcPos + length <= lengthOf(src) && destPos + length <= lengthOf(dest);
         assert readHub(src) == readHub(dest) : "copying is only allowed with same component types";
-        UnmanagedMemoryUtil.copy(addressOf(src, srcPos), addressOf(dest, destPos), WordFactory.unsigned(length << readElementShift(dest)));
+        UnmanagedMemoryUtil.copy(addressOf(src, srcPos), addressOf(dest, destPos), Word.unsigned(length).shiftLeft(readElementShift(dest)));
     }
 
     /** Provides an array for which {@link NonmovableArray#isNull()} returns {@code true}. */
@@ -171,7 +177,7 @@ public final class NonmovableArrays {
         if (SubstrateUtil.HOSTED) {
             return (T) HOSTED_NULL_VALUE;
         }
-        return WordFactory.nullPointer();
+        return Word.nullPointer();
     }
 
     /**
@@ -182,8 +188,8 @@ public final class NonmovableArrays {
      * array, it is not a Java object and must never be referenced as an object.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static NonmovableArray<Byte> createByteArray(int nbytes) {
-        return createArray(nbytes, byte[].class);
+    public static NonmovableArray<Byte> createByteArray(int nbytes, NmtCategory nmtCategory) {
+        return createArray(nbytes, byte[].class, nmtCategory);
     }
 
     /**
@@ -194,8 +200,8 @@ public final class NonmovableArrays {
      * of a Java array, it is not a Java object and must never be referenced as an object.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static NonmovableArray<Integer> createIntArray(int length) {
-        return createArray(length, int[].class);
+    public static NonmovableArray<Integer> createIntArray(int length, NmtCategory nmtCategory) {
+        return createArray(length, int[].class, nmtCategory);
     }
 
     /**
@@ -206,8 +212,8 @@ public final class NonmovableArrays {
      * of a Java array, it is not a Java object and must never be referenced as an object.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T extends WordBase> NonmovableArray<T> createWordArray(int length) {
-        return createArray(length, WordBase[].class);
+    public static <T extends WordBase> NonmovableArray<T> createWordArray(int length, NmtCategory nmtCategory) {
+        return createArray(length, WordBase[].class, nmtCategory);
     }
 
     /**
@@ -221,16 +227,16 @@ public final class NonmovableArrays {
      * that of a Java array, it is not a Java object and must never be referenced as an object.
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T> NonmovableObjectArray<T> createObjectArray(Class<T[]> arrayType, int length) {
+    public static <T> NonmovableObjectArray<T> createObjectArray(Class<T[]> arrayType, int length, NmtCategory nmtCategory) {
         assert (SubstrateUtil.HOSTED ? (arrayType.isArray() && !arrayType.getComponentType().isPrimitive())
                         : LayoutEncoding.isObjectArray(SubstrateUtil.cast(arrayType, DynamicHub.class).getLayoutEncoding())) : "must be an object array type";
-        return createArray(length, arrayType);
+        return createArray(length, arrayType, nmtCategory);
     }
 
     /** @see java.util.Arrays#copyOf */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source, int newLength) {
-        NonmovableObjectArray<T> array = createArray(newLength, source.getClass());
+    public static <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source, int newLength, NmtCategory nmtCategory) {
+        NonmovableObjectArray<T> array = createArray(newLength, source.getClass(), nmtCategory);
         int copyLength = (source.length < newLength) ? source.length : newLength;
         for (int i = 0; i < copyLength; i++) {
             setObject(array, i, source[i]);
@@ -240,8 +246,18 @@ public final class NonmovableArrays {
 
     /** Same as {@link #copyOfObjectArray} with a {@code newLength} of the array length. */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source) {
-        return copyOfObjectArray(source, source.length);
+    public static <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source, NmtCategory nmtCategory) {
+        return copyOfObjectArray(source, source.length, nmtCategory);
+    }
+
+    /** Copies a heap byte array into a nonmovable byte array. */
+    public static NonmovableArray<Byte> copyOfByteArray(byte[] source, NmtCategory nmtCategory) {
+        if (source == null) {
+            return nullArray();
+        }
+        NonmovableArray<Byte> copy = createByteArray(source.length, nmtCategory);
+        asByteBuffer(copy).put(source);
+        return copy;
     }
 
     public static byte[] heapCopyOfByteArray(NonmovableArray<Byte> source) {
@@ -281,13 +297,13 @@ public final class NonmovableArrays {
             System.arraycopy(getHostedArray(src), srcPos, dest, destPos, length);
             return dest;
         }
-        DynamicHub destHub = KnownIntrinsics.readHub(dest);
+        DynamicHub destHub = DynamicHubIntrinsics.readHub(dest);
         assert LayoutEncoding.isArray(destHub.getLayoutEncoding()) && destHub == readHub(src) : "Copying is only supported for arrays with identical types";
         assert srcPos >= 0 && destPos >= 0 && length >= 0 && srcPos + length <= lengthOf(src) && destPos + length <= ArrayLengthNode.arrayLength(dest);
         Pointer destAddressAtPos = Word.objectToUntrackedPointer(dest).add(LayoutEncoding.getArrayElementOffset(destHub.getLayoutEncoding(), destPos));
         if (LayoutEncoding.isPrimitiveArray(destHub.getLayoutEncoding())) {
             Pointer srcAddressAtPos = addressOf(src, srcPos);
-            JavaMemoryUtil.copyPrimitiveArrayForward(srcAddressAtPos, destAddressAtPos, WordFactory.unsigned(length << readElementShift(src)));
+            JavaMemoryUtil.copyPrimitiveArrayForward(srcAddressAtPos, destAddressAtPos, Word.unsigned(length).shiftLeft(readElementShift(src)));
         } else { // needs barriers
             Object[] destArr = (Object[]) dest;
             for (int i = 0; i < length; i++) {
@@ -300,7 +316,7 @@ public final class NonmovableArrays {
     /** Releases an array created at runtime. */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static void releaseUnmanagedArray(NonmovableArray<?> array) {
-        ImageSingletons.lookup(UnmanagedMemorySupport.class).free(array);
+        NullableNativeMemory.free(array);
         untrackUnmanagedArray(array);
     }
 
@@ -323,7 +339,7 @@ public final class NonmovableArrays {
             return new HostedNonmovableArray<>(array);
         }
         assert array == null || Heap.getHeap().isInImageHeap(array);
-        return (array != null) ? (NonmovableArray<T>) Word.objectToUntrackedPointer(array) : WordFactory.nullPointer();
+        return (array != null) ? (NonmovableArray<T>) Word.objectToUntrackedPointer(array) : Word.nullPointer();
     }
 
     /** Returns a {@link NonmovableObjectArray} for an object array in the image heap. */
@@ -388,7 +404,7 @@ public final class NonmovableArrays {
             hosted[index] = value;
             return;
         }
-        assert matches(array, true, ConfigurationValues.getTarget().wordSize);
+        assert matches(array, true, SubstrateTarget.getWordSize());
         ((Pointer) addressOf(array, index)).writeWord(0, value);
     }
 
@@ -399,7 +415,7 @@ public final class NonmovableArrays {
             T[] hosted = getHostedArray(array);
             return hosted[index];
         }
-        assert matches(array, true, ConfigurationValues.getTarget().wordSize);
+        assert matches(array, true, SubstrateTarget.getWordSize());
         return ((Pointer) addressOf(array, index)).readWord(0);
     }
 
@@ -408,7 +424,8 @@ public final class NonmovableArrays {
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static <T extends PointerBase> T addressOf(NonmovableArray<?> array, int index) {
         assert index >= 0 && index <= lengthOf(array);
-        return (T) getArrayBase(array).add(index << readElementShift(array));
+        UnsignedWord offset = Word.unsigned(index).shiftLeft(readElementShift(array));
+        return (T) getArrayBase(array).add(offset);
     }
 
     /** Reads the value at the given index in an object array. */
@@ -426,8 +443,8 @@ public final class NonmovableArrays {
             Object[] hosted = getHostedArray(array);
             return (T) hosted[index];
         }
-        assert matches(array, false, ConfigurationValues.getObjectLayout().getReferenceSize());
-        return (T) KnownIntrinsics.convertUnknownValue(ReferenceAccess.singleton().readObjectAt(addressOf(array, index), true), Object.class);
+        assert matches(array, false, ObjectLayout.singleton().getReferenceSize());
+        return (T) ReferenceAccess.singleton().readObjectAt(addressOf(array, index), true);
     }
 
     /** Writes the value at the given index in an object array. */
@@ -438,39 +455,37 @@ public final class NonmovableArrays {
             hosted[index] = value;
             return;
         }
-        assert matches(array, false, ConfigurationValues.getObjectLayout().getReferenceSize());
+        assert matches(array, false, ObjectLayout.singleton().getReferenceSize());
         ReferenceAccess.singleton().writeObjectAt(addressOf(array, index), value, true);
     }
 
     /**
      * Visits all array elements with the provided {@link ObjectReferenceVisitor}.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true, calleeMustBe = false)
-    public static boolean walkUnmanagedObjectArray(NonmovableObjectArray<?> array, ObjectReferenceVisitor visitor) {
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static void walkUnmanagedObjectArray(NonmovableObjectArray<?> array, ObjectReferenceVisitor visitor) {
         if (array.isNonNull()) {
-            return walkUnmanagedObjectArray(array, visitor, 0, lengthOf(array));
+            walkUnmanagedObjectArray(array, visitor, 0, lengthOf(array));
         }
-        return true;
     }
 
     /**
      * Visits all array elements with the provided {@link ObjectReferenceVisitor}.
      */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true, calleeMustBe = false)
-    public static boolean walkUnmanagedObjectArray(NonmovableObjectArray<?> array, ObjectReferenceVisitor visitor, int startIndex, int count) {
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static void walkUnmanagedObjectArray(NonmovableObjectArray<?> array, ObjectReferenceVisitor visitor, int startIndex, int count) {
         if (array.isNonNull()) {
             assert startIndex >= 0 && count <= lengthOf(array) - startIndex;
-            int refSize = ConfigurationValues.getObjectLayout().getReferenceSize();
+            int refSize = ObjectLayout.singleton().getReferenceSize();
             assert refSize == (1 << readElementShift(array));
-            Pointer p = ((Pointer) array).add(readArrayBase(array)).add(startIndex * refSize);
-            for (int i = 0; i < count; i++) {
-                if (!visitor.visitObjectReference(p, true)) {
-                    return false;
-                }
-                p = p.add(refSize);
-            }
+            Pointer firstObjRef = addressOf(array, startIndex);
+            callVisitor(visitor, firstObjRef, refSize, count);
         }
-        return true;
+    }
+
+    @Uninterruptible(reason = "Bridge between uninterruptible and potentially interruptible code.", mayBeInlined = true, calleeMustBe = false)
+    private static void callVisitor(ObjectReferenceVisitor visitor, Pointer firstObjRef, int referenceSize, int count) {
+        visitor.visitObjectReferences(firstObjRef, true, referenceSize, null, count);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)

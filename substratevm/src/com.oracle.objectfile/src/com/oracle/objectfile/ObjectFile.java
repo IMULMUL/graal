@@ -25,18 +25,17 @@
 package com.oracle.objectfile;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -46,12 +45,16 @@ import java.util.TreeSet;
 import java.util.function.Consumer;
 import java.util.stream.StreamSupport;
 
-import org.graalvm.compiler.debug.DebugContext;
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.objectfile.debuginfo.DebugInfoProvider;
 import com.oracle.objectfile.elf.ELFObjectFile;
 import com.oracle.objectfile.macho.MachOObjectFile;
 import com.oracle.objectfile.pecoff.PECoffObjectFile;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.serviceprovider.GraalServices;
+import sun.nio.ch.DirectBuffer;
 
 /**
  * Abstract superclass for object files. An object file is a binary container for sections,
@@ -61,6 +64,7 @@ import com.oracle.objectfile.pecoff.PECoffObjectFile;
  * contents; layout decisions (offsets, ordering) are modelled separately (see
  * {@link LayoutDecision}), being computed on write-out (see {@link WriteLayout}).
  */
+@SuppressWarnings("this-escape")
 public abstract class ObjectFile {
 
     /*
@@ -103,7 +107,8 @@ public abstract class ObjectFile {
     public enum Format {
         ELF,
         MACH_O,
-        PECOFF
+        PECOFF,
+        LLVM
     }
 
     public abstract Format getFormat();
@@ -121,7 +126,7 @@ public abstract class ObjectFile {
     private final int pageSize;
 
     public ObjectFile(int pageSize) {
-        assert pageSize > 0 : "invalid page size";
+        assert pageSize > 0 : "Invalid page size";
         this.pageSize = pageSize;
     }
 
@@ -166,18 +171,22 @@ public abstract class ObjectFile {
 
     public abstract void setByteOrder(ByteOrder byteOrder);
 
-    // FIXME: replace OS string with enum (or just get rid of the concept,
-    // perhaps merging with getFilenameSuffix).
-    private static String getHostOS() {
-        final String osName = System.getProperty("os.name");
+    private enum HostOS {
+        LINUX,
+        MAC_OS_X,
+        WINDOWS
+    }
+
+    private static HostOS getHostOS() {
+        final String osName = GraalServices.getSavedProperty("os.name");
         if (osName.startsWith("Linux")) {
-            return "Linux";
+            return HostOS.LINUX;
         } else if (osName.startsWith("Mac OS X")) {
-            return "Mac OS X";
+            return HostOS.MAC_OS_X;
         } else if (osName.startsWith("Windows")) {
-            return "Windows";
+            return HostOS.WINDOWS;
         } else {
-            throw new IllegalStateException("unsupported OS: " + osName);
+            throw new IllegalStateException("Unsupported OS: " + osName);
         }
     }
 
@@ -191,99 +200,110 @@ public abstract class ObjectFile {
     }
 
     public static String getFilenameSuffix() {
-        switch (ObjectFile.getNativeFormat()) {
-            case ELF:
-            case MACH_O:
-                return ".o";
-            case PECOFF:
-                return ".obj";
-            default:
-                throw new AssertionError("unreachable");
-        }
+        return getFilenameSuffix(getNativeFormat());
+    }
+
+    public static String getFilenameSuffix(Format format) {
+        return switch (format) {
+            case ELF, MACH_O -> ".o";
+            case PECOFF -> ".obj";
+            case LLVM -> ".bc";
+        };
     }
 
     public static Format getNativeFormat() {
-        switch (getHostOS()) {
-            case "Linux":
-                return Format.ELF;
-            case "Mac OS X":
-                return Format.MACH_O;
-            case "Windows":
-                return Format.PECOFF;
-            default:
-                throw new AssertionError("unreachable"); // we must handle any output of getHostOS()
-        }
-    }
-
-    private static ObjectFile getNativeObjectFile(int pageSize, boolean runtimeDebugInfoGeneration) {
-        switch (ObjectFile.getNativeFormat()) {
-            case ELF:
-                return new ELFObjectFile(pageSize, runtimeDebugInfoGeneration);
-            case MACH_O:
-                return new MachOObjectFile(pageSize);
-            case PECOFF:
-                return new PECoffObjectFile(pageSize);
-            default:
-                throw new AssertionError("unreachable");
-        }
+        return switch (getHostOS()) {
+            case LINUX -> Format.ELF;
+            case MAC_OS_X -> Format.MACH_O;
+            case WINDOWS -> Format.PECOFF;
+        };
     }
 
     public static ObjectFile getNativeObjectFile(int pageSize) {
-        return getNativeObjectFile(pageSize, true);
+        return switch (ObjectFile.getNativeFormat()) {
+            case ELF -> new ELFObjectFile(pageSize, true);
+            case MACH_O -> new MachOObjectFile(pageSize);
+            case PECOFF -> new PECoffObjectFile(pageSize);
+            case LLVM -> throw new AssertionError("Unsupported NativeObjectFile for format " + ObjectFile.getNativeFormat());
+        };
     }
 
     public static ObjectFile createRuntimeDebugInfo(int pageSize) {
-        return getNativeObjectFile(pageSize, true);
+        return getNativeObjectFile(pageSize);
     }
 
     /*
      * Abstract notions of relocation.
      */
     public enum RelocationKind {
-
-        UNKNOWN,
+        UNKNOWN(-1),
         /**
          * The relocation's symbol provides an address whose absolute value (plus addend) supplies
          * the fixup bytes.
          */
-        DIRECT_1,
-        DIRECT_2,
-        DIRECT_4,
-        DIRECT_8,
+        DIRECT_1(1),
+        DIRECT_2(2),
+        DIRECT_4(4),
+        DIRECT_8(8),
+        /**
+         * The relocation's symbol provides an address whose image-base-relative value (plus addend)
+         * supplies the fixup bytes.
+         */
+        ADDR32NB_4(4),
         /**
          * The index of the object file section containing the relocation's symbol supplies the
          * fixup bytes. (used in CodeView debug information)
          */
-        SECTION_2,
+        SECTION_2(2),
         /**
          * The address of the object file section containing the relocation's symbol (plus addend)
          * supplies the fixup bytes. (used in CodeView debug information)
          */
-        SECREL_4,
+        SECREL_4(4),
         /**
          * The relocation's symbol provides an address whose PC-relative value (plus addend)
          * supplies the fixup bytes.
          */
-        PC_RELATIVE_1,
-        PC_RELATIVE_2,
-        PC_RELATIVE_4,
-        PC_RELATIVE_8,
-        AARCH64_R_MOVW_UABS_G0,
-        AARCH64_R_MOVW_UABS_G0_NC,
-        AARCH64_R_MOVW_UABS_G1,
-        AARCH64_R_MOVW_UABS_G1_NC,
-        AARCH64_R_MOVW_UABS_G2,
-        AARCH64_R_MOVW_UABS_G2_NC,
-        AARCH64_R_MOVW_UABS_G3,
-        AARCH64_R_AARCH64_ADR_PREL_PG_HI21,
-        AARCH64_R_AARCH64_ADD_ABS_LO12_NC,
-        AARCH64_R_LD_PREL_LO19,
-        AARCH64_R_GOT_LD_PREL19,
-        AARCH64_R_AARCH64_LDST128_ABS_LO12_NC,
-        AARCH64_R_AARCH64_LDST64_ABS_LO12_NC,
-        AARCH64_R_AARCH64_LDST32_ABS_LO12_NC,
-        AARCH64_R_AARCH64_LDST16_ABS_LO12_NC,
-        AARCH64_R_AARCH64_LDST8_ABS_LO12_NC;
+        PC_RELATIVE_1(1),
+        PC_RELATIVE_2(2),
+        PC_RELATIVE_4(4),
+        PC_RELATIVE_8(8),
+        /**
+         * AArch64-specific relocation types (instructions are 4 bytes).
+         */
+        AARCH64_R_MOVW_UABS_G0(4),
+        AARCH64_R_MOVW_UABS_G0_NC(4),
+        AARCH64_R_MOVW_UABS_G1(4),
+        AARCH64_R_MOVW_UABS_G1_NC(4),
+        AARCH64_R_MOVW_UABS_G2(4),
+        AARCH64_R_MOVW_UABS_G2_NC(4),
+        AARCH64_R_MOVW_UABS_G3(4),
+        AARCH64_R_AARCH64_ADR_PREL_PG_HI21(4),
+        AARCH64_R_AARCH64_ADD_ABS_LO12_NC(4),
+        AARCH64_R_LD_PREL_LO19(4),
+        AARCH64_R_GOT_LD_PREL19(4),
+        AARCH64_R_AARCH64_LDST128_ABS_LO12_NC(4),
+        AARCH64_R_AARCH64_LDST64_ABS_LO12_NC(4),
+        AARCH64_R_AARCH64_LDST32_ABS_LO12_NC(4),
+        AARCH64_R_AARCH64_LDST16_ABS_LO12_NC(4),
+        AARCH64_R_AARCH64_LDST8_ABS_LO12_NC(4);
+
+        private final int size;
+
+        RelocationKind(int size) {
+            this.size = size;
+        }
+
+        /**
+         * The number of bytes affected by this relocation,  e.g., the size of an instruction for
+         * which an immediate is patched (even if that immediate itself is smaller).
+         */
+        public int getRelocationSize() {
+            if (size < 0) {
+                throw new UnsupportedOperationException();
+            }
+            return size;
+        }
 
         public static RelocationKind getDirect(int relocationSize) {
             switch (relocationSize) {
@@ -321,30 +341,36 @@ public abstract class ObjectFile {
                 case PC_RELATIVE_2:
                 case PC_RELATIVE_4:
                 case PC_RELATIVE_8:
+                case AARCH64_R_AARCH64_ADR_PREL_PG_HI21:
+                case AARCH64_R_AARCH64_ADD_ABS_LO12_NC:
+                case AARCH64_R_LD_PREL_LO19:
+                case AARCH64_R_GOT_LD_PREL19:
+                case AARCH64_R_AARCH64_LDST128_ABS_LO12_NC:
+                case AARCH64_R_AARCH64_LDST64_ABS_LO12_NC:
+                case AARCH64_R_AARCH64_LDST32_ABS_LO12_NC:
+                case AARCH64_R_AARCH64_LDST16_ABS_LO12_NC:
+                case AARCH64_R_AARCH64_LDST8_ABS_LO12_NC:
                     return true;
             }
             return false;
         }
 
-        public static int getRelocationSize(RelocationKind kind) {
+        public static boolean isDirect(RelocationKind kind) {
             switch (kind) {
                 case DIRECT_1:
-                case PC_RELATIVE_1:
-                    return 1;
                 case DIRECT_2:
-                case PC_RELATIVE_2:
-                case SECTION_2:
-                    return 2;
                 case DIRECT_4:
-                case PC_RELATIVE_4:
-                case SECREL_4:
-                    return 4;
                 case DIRECT_8:
-                case PC_RELATIVE_8:
-                    return 8;
+                case AARCH64_R_MOVW_UABS_G0:
+                case AARCH64_R_MOVW_UABS_G0_NC:
+                case AARCH64_R_MOVW_UABS_G1:
+                case AARCH64_R_MOVW_UABS_G1_NC:
+                case AARCH64_R_MOVW_UABS_G2:
+                case AARCH64_R_MOVW_UABS_G2_NC:
+                case AARCH64_R_MOVW_UABS_G3:
+                    return true;
             }
-            // other types should not be queried
-            throw new IllegalArgumentException("Invalid RelocationKind provided: " + kind);
+            return false;
         }
     }
 
@@ -352,11 +378,6 @@ public abstract class ObjectFile {
      * Interface implemented by objects implementing a specific relocation method and size.
      */
     public interface RelocationMethod {
-
-        boolean canUseImplicitAddend();
-
-        boolean canUseExplicitAddend();
-
         /*
          * If we were implementing a linker, we'd have a method something like
          *
@@ -406,11 +427,9 @@ public abstract class ObjectFile {
          * @param k the kind of fixup to be applied
          * @param symbolName the name of the symbol whose value is used to compute the fixed-up
          *            bytes
-         * @param useImplicitAddend whether the current bytes are to be used as an addend
-         * @param explicitAddend a full-width addend, or null if useImplicitAddend is true
-         * @return the relocation record created (or found, if it exists already)
+         * @param addend a full-width addend, or 0 if unneeded
          */
-        RelocationRecord markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend);
+        void markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, long addend);
 
         /**
          * Force the creation of a relocation section/element for this section, and return it. This
@@ -418,13 +437,12 @@ public abstract class ObjectFile {
          * which leads to unpredictable results (e.g. not appearing in the ELF SHT, if the SHT was
          * written before the section was created).
          *
-         * @param useImplicitAddend whether the relocation section of interest is for implicit
-         *            addends
+         * @param addend whether a full-width addend, or 0 if unneeded
          *
          * @return the element which will hold relocation records (of the argument-specified kind)
          *         for this section
          */
-        Element getOrCreateRelocationElement(boolean useImplicitAddend);
+        Element getOrCreateRelocationElement(long addend);
     }
 
     /**
@@ -441,7 +459,7 @@ public abstract class ObjectFile {
          * passed a buffer. It uses the byte array accessed by {@link #getContent} and
          * {@link #setContent}.
          */
-        RelocationRecord markRelocationSite(int offset, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend);
+        void markRelocationSite(int offset, RelocationKind k, String symbolName, long addend);
     }
 
     public interface NobitsSectionImpl extends ElementImpl {
@@ -488,10 +506,13 @@ public abstract class ObjectFile {
     // convenience overrides when specifying neither segment nor segment name
 
     public Section newUserDefinedSection(String name, ElementImpl impl) {
-        final Segment segment = getOrCreateSegment(null, name, false, false);
         final int alignment = getWordSizeInBytes();
-        final Section result = newUserDefinedSection(segment, name, alignment, impl);
-        return result;
+        return newUserDefinedSection(name, alignment, impl);
+    }
+
+    public Section newUserDefinedSection(String name, int alignment, ElementImpl impl) {
+        Segment segment = getOrCreateSegment(null, name, false, false);
+        return newUserDefinedSection(segment, name, alignment, impl);
     }
 
     public Section newDebugSection(String name, ElementImpl impl) {
@@ -539,12 +560,44 @@ public abstract class ObjectFile {
     }
 
     public static int nextIntegerMultipleWithCongruence(int start, int multipleOf, int congruentTo, int modulo) {
-        // FIXME: this is a stupid solution; improvements wanted (some maths is required)
-        int candidate = start;
-        while (candidate % modulo != congruentTo % modulo) {
-            candidate = nextIntegerMultiple(candidate + 1, multipleOf);
+        int remainder = Math.floorMod(congruentTo - start, modulo);
+        if (remainder == 0) {
+            return start;
         }
-        return candidate;
+        int alignedStart = nextIntegerMultiple(start + 1, multipleOf);
+        remainder = Math.floorMod(congruentTo - alignedStart, modulo);
+        if (remainder == 0) {
+            return alignedStart;
+        }
+        int congruenceDivisor = greatestCommonDivisor(multipleOf, modulo);
+        if (remainder % congruenceDivisor != 0) {
+            throw new IllegalArgumentException("No integer multiple satisfies the congruence");
+        }
+        int normalizedMultiple = multipleOf / congruenceDivisor;
+        int normalizedModulo = modulo / congruenceDivisor;
+        int normalizedRemainder = remainder / congruenceDivisor;
+        int multiplier = Math.floorMod(normalizedRemainder * modularInverse(normalizedMultiple, normalizedModulo), normalizedModulo);
+        return alignedStart + multiplier * multipleOf;
+    }
+
+    private static int modularInverse(int value, int modulo) {
+        int previousRemainder = modulo;
+        int remainder = Math.floorMod(value, modulo);
+        int previousCoefficient = 0;
+        int coefficient = 1;
+        while (remainder != 0) {
+            int quotient = previousRemainder / remainder;
+
+            int nextRemainder = previousRemainder - quotient * remainder;
+            previousRemainder = remainder;
+            remainder = nextRemainder;
+
+            int nextCoefficient = previousCoefficient - quotient * coefficient;
+            previousCoefficient = coefficient;
+            coefficient = nextCoefficient;
+        }
+        assert previousRemainder == 1;
+        return Math.floorMod(previousCoefficient, modulo);
     }
 
     protected static int greatestCommonDivisor(int arg1, int arg2) {
@@ -711,8 +764,8 @@ public abstract class ObjectFile {
     /** Determines whether references between debug sections should be recorded for relocation. */
     public abstract boolean shouldRecordDebugRelocations();
 
-    public static HashSet<BuildDependency> basicDependencies(Map<Element, LayoutDecisionMap> decisions, Element el, boolean sizeOnContent, boolean vaddrOnOffset) {
-        HashSet<BuildDependency> deps = new HashSet<>();
+    public static EconomicSet<BuildDependency> basicDependencies(Map<Element, LayoutDecisionMap> decisions, Element el, boolean sizeOnContent, boolean vaddrOnOffset) {
+        EconomicSet<BuildDependency> deps = EconomicSet.create();
         /*
          * As a minimum, we specify that the offset and vaddr of an element depend on its size. This
          * is so that once we assign an offset or vaddr, the "next available" offset/vaddr can
@@ -732,11 +785,11 @@ public abstract class ObjectFile {
         return deps;
     }
 
-    public static HashSet<BuildDependency> minimalDependencies(Map<Element, LayoutDecisionMap> decisions, Element el) {
+    public static EconomicSet<BuildDependency> minimalDependencies(Map<Element, LayoutDecisionMap> decisions, Element el) {
         return basicDependencies(decisions, el, false, true);
     }
 
-    public static HashSet<BuildDependency> defaultDependencies(Map<Element, LayoutDecisionMap> decisions, Element el) {
+    public static EconomicSet<BuildDependency> defaultDependencies(Map<Element, LayoutDecisionMap> decisions, Element el) {
         /*
          * By default, we specify that an element's own decisions are taken in a particular order:
          * content, size, offset. Some elements relax this so that their content can be decided
@@ -757,11 +810,9 @@ public abstract class ObjectFile {
     }
 
     public static int defaultGetOrDecideOffset(Map<Element, LayoutDecisionMap> alreadyDecided, Element el, int offsetHint) {
-        // FIXME: in this implementation, we must not have decided the vaddr already!
-        // We should instead support both cases, and if the vaddr is decided, apply
-        // the modulo constraint (if necessary) here!
-        assert (alreadyDecided.get(el).getDecision(LayoutDecision.Kind.VADDR) == null || !alreadyDecided.get(el).getDecision(LayoutDecision.Kind.VADDR).isTaken());
-        // now we are free to worry about the modulo constraint during vaddr assignment only
+        LayoutDecision vaddrDecision = alreadyDecided.get(el).getDecision(LayoutDecision.Kind.VADDR);
+        assert vaddrDecision == null || !vaddrDecision.isTaken() : "Pre-decided virtual addresses require reverse offset/virtual-address constraint handling";
+        // Now we are free to worry about the modulo constraint during vaddr assignment only.
 
         // we take the hint, but bumped up to proper alignment
         return defaultGetOrDecide(alreadyDecided, el, LayoutDecision.Kind.OFFSET, nextIntegerMultiple(offsetHint, el.getAlignment()));
@@ -931,11 +982,9 @@ public abstract class ObjectFile {
          * so there is no such complicated delegation relationship (hence the 'transitive closure'
          * case above).
          *
-         * FIXME: there is some tidying-up to do: we could define, say, ELFBuiltinSection to gather
-         * up the common delegations to ObjectFile, rather than repeating them in each class. Same
-         * goes for Mach-O once I have coded up all that stuff. In the case of non-builtin sections,
-         * we include this delegation in BasicElementImpl, but the ELF builtin sections do not
-         * derive from that (they use up their superclass slot by deriving from ELFSection).
+         * Format-specific built-in sections repeat the common delegations to ObjectFile because
+         * they use their superclass slot for the format-specific section base class. Non-built-in
+         * sections avoid this repetition by delegating through BasicElementImpl.
          */
 
         private final String name;
@@ -974,7 +1023,7 @@ public abstract class ObjectFile {
 
         @Override
         public String toString() {
-            return getClass().getSimpleName() + "(" + name + ")";
+            return getClass().getName() + "(" + name + ")";
         }
 
         @Override
@@ -1156,27 +1205,21 @@ public abstract class ObjectFile {
     protected Iterable<Element> elementsMappedOnPage(long vaddr, Map<Element, LayoutDecisionMap> alreadyDecided) {
         final long vaddrRoundedDown = (vaddr >> getPageSizeShift()) << getPageSizeShift();
 
-        // FIXME: use FilteringIterator instead of copying
-        ArrayList<Element> ss = new ArrayList<>();
+        return () -> StreamSupport.stream(decisionsByKind(LayoutDecision.Kind.VADDR, alreadyDecided).spliterator(), false)
+                        .filter(decision -> elementOverlapsPage(decision, vaddrRoundedDown, alreadyDecided))
+                        .map(LayoutDecision::getElement)
+                        .iterator();
+    }
 
-        for (LayoutDecision d : decisionsByKind(LayoutDecision.Kind.VADDR, alreadyDecided)) {
-            Element s = d.getElement();
-            assert d.getKind() == LayoutDecision.Kind.VADDR;
-            int va = (int) d.getValue();
-            int sizeInMemory = d.getElement().getMemSize(alreadyDecided);
-            assert sizeInMemory != -1;
-            // if it begins before the end of this page
-            // and doesn't end before the start,
-            // it overlaps the page.
-            int mappingBegin = va;
-            int mappingEnd = va + sizeInMemory;
-            long pageBegin = vaddrRoundedDown;
-            long pageEnd = vaddrRoundedDown + getPageSize();
-            if (mappingBegin < pageEnd && mappingEnd > pageBegin) {
-                ss.add(s);
-            }
-        }
-        return ss;
+    private boolean elementOverlapsPage(LayoutDecision decision, long pageBegin, Map<Element, LayoutDecisionMap> alreadyDecided) {
+        assert decision.getKind() == LayoutDecision.Kind.VADDR;
+        int vaddr = (int) decision.getValue();
+        int sizeInMemory = decision.getElement().getMemSize(alreadyDecided);
+        assert sizeInMemory != -1;
+        int mappingBegin = vaddr;
+        int mappingEnd = vaddr + sizeInMemory;
+        long pageEnd = pageBegin + getPageSize();
+        return mappingBegin < pageEnd && mappingEnd > pageBegin;
     }
 
     public interface Segment extends List<Element> {
@@ -1219,7 +1262,7 @@ public abstract class ObjectFile {
         return sections;
     }
 
-    public abstract Set<Segment> getSegments();
+    public abstract Set<Segment> getSegments(); // noEconomicSet(streaming)
 
     /**
      * @return a platform-dependent {@link Header}. Depending on the mode of the object file (read
@@ -1233,9 +1276,9 @@ public abstract class ObjectFile {
             }
         }
         if (headers.size() == 0) {
-            throw new IllegalStateException("file has no header");
+            throw new IllegalStateException("File has no header");
         } else if (headers.size() > 1) {
-            throw new IllegalStateException("file has multiple headers");
+            throw new IllegalStateException("File has multiple headers");
         } else {
             assert headers.size() == 1;
         }
@@ -1253,12 +1296,20 @@ public abstract class ObjectFile {
 
     private final TreeSet<BuildDependency> allDependencies = new TreeSet<>();
 
-    private final HashSet<LayoutDecision> allDecisions = new HashSet<>();
+    private final EconomicSet<LayoutDecision> allDecisions = EconomicSet.create();
     private final Map<Element, LayoutDecisionMap> decisionsByElement = new IdentityHashMap<>();
     private final Map<Element, LayoutDecisionMap> decisionsTaken = new IdentityHashMap<>();
 
     private final Map<Element, List<BuildDependency>> dependenciesByDependingElement = new IdentityHashMap<>();
     private final Map<Element, List<BuildDependency>> dependenciesByDependedOnElement = new IdentityHashMap<>();
+
+    public void write(DebugContext context, Path outputFile) throws IOException {
+        try (FileChannel channel = FileChannel.open(outputFile, StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE)) {
+            withDebugContext(context, "ObjectFile.write", () -> {
+                write(channel);
+            });
+        }
+    }
 
     @SuppressWarnings("try")
     public final void write(FileChannel outputChannel) {
@@ -1269,33 +1320,12 @@ public abstract class ObjectFile {
             try {
                 writeBuffer(sortedObjectFileElements, buffer);
             } finally {
-                cleanBuffer(buffer); // unmap immediately
+                // unmap immediately
+                ((DirectBuffer) buffer).cleaner().clean();
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private static void cleanBuffer(ByteBuffer buffer) throws IOException {
-        // The Cleaner class returned by DirectBuffer.cleaner() was moved from to jdk.internal from
-        // sun.misc, so we need to call it reflectively to ensure binary compatibility between JDKs
-        Object cleaner;
-        try {
-            Class<? extends ByteBuffer> bufferClass = buffer.getClass();
-            ModuleAccess.openModuleByClass(bufferClass, ObjectFile.class);
-            cleaner = getMethodAndSetAccessible(bufferClass, "cleaner").invoke(buffer);
-            Class<?> cleanerClass = cleaner.getClass();
-            ModuleAccess.openModuleByClass(cleanerClass, ObjectFile.class);
-            getMethodAndSetAccessible(cleanerClass, "clean").invoke(cleaner);
-        } catch (ReflectiveOperationException e) {
-            throw new IOException("Could not clean mapped ByteBuffer", e);
-        }
-    }
-
-    private static Method getMethodAndSetAccessible(Class<?> clazz, String name, Class<?>... parameterTypes) throws NoSuchMethodException {
-        Method method = clazz.getMethod(name, parameterTypes);
-        method.setAccessible(true);
-        return method;
     }
 
     /*
@@ -1332,16 +1362,16 @@ public abstract class ObjectFile {
 
     }
 
-    private String dependencyGraphAsDotString(Set<LayoutDecision> decisionsToInclude) {
+    private String dependencyGraphAsDotString(EconomicSet<LayoutDecision> decisionsToInclude) {
         // null argument means "include all decisions"
         StringBuilder sb = new StringBuilder();
-        sb.append("digraph deps {\n");
+        sb.append("digraph deps {").append(System.lineSeparator());
         for (BuildDependency d : allDependencies) {
             if (decisionsToInclude == null || (decisionsToInclude.contains(d.depending) && decisionsToInclude.contains(d.dependedOn))) {
-                sb.append("\t\"" + d.depending + "\" -> \"" + d.dependedOn + "\";\n");
+                sb.append(String.format("\t\"%s\" -> \"%s\";%n", d.depending, d.dependedOn));
             }
         }
-        sb.append("}\n");
+        sb.append('}').append(System.lineSeparator());
         return sb.toString();
     }
 
@@ -1379,9 +1409,6 @@ public abstract class ObjectFile {
             decisionsByElement.put(e, m);
 
             // assert that we have at least the minimum expected decision set
-            // FIXME: arguably nobits/bss/zerofill sections should not have an offset,
-            // and removing this would simplify the maximum offset/vaddr calculation
-            // (because there would always be a unique section occupying the max offset/vaddr)
             assert decisionsByElement.containsKey(e);
             assert decisionsByElement.get(e).containsKey(LayoutDecision.Kind.CONTENT);
             assert decisionsByElement.get(e).containsKey(LayoutDecision.Kind.SIZE);
@@ -1430,7 +1457,7 @@ public abstract class ObjectFile {
          */
         LayoutDecision dummyFinalDecision = new LayoutDecision(LayoutDecision.Kind.OFFSET, null, null);
 
-        LayoutDecision[] realDecisions = allDecisions.toArray(new LayoutDecision[0]);
+        LayoutDecision[] realDecisions = allDecisions.toArray(new LayoutDecision[allDecisions.size()]);
         /* Add a dependency from this to every other decision. */
         allDecisions.add(dummyFinalDecision);
         for (LayoutDecision decision : realDecisions) {
@@ -1517,7 +1544,7 @@ public abstract class ObjectFile {
         List<LayoutDecision> reverseBuildOrder = new ArrayList<>();
 
         // 1. find nodes with no in-edges
-        Set<LayoutDecision> decisionsWithNoInEdges = new HashSet<>();
+        EconomicSet<LayoutDecision> decisionsWithNoInEdges = EconomicSet.create(allDecisions.size());
 
         decisionsWithNoInEdges.addAll(allDecisions);
         for (LayoutDecision d : allDecisions) {
@@ -1536,13 +1563,15 @@ public abstract class ObjectFile {
         Map<LayoutDecision, ArrayList<LayoutDecision>> removedEdgesDependingOn = new HashMap<>();
         Map<LayoutDecision, ArrayList<LayoutDecision>> removedEdgesDependedOnBy = new HashMap<>();
         for (LayoutDecision l : allDecisions) {
-            removedEdgesDependingOn.put(l, new ArrayList<LayoutDecision>());
-            removedEdgesDependedOnBy.put(l, new ArrayList<LayoutDecision>());
+            removedEdgesDependingOn.put(l, new ArrayList<>());
+            removedEdgesDependedOnBy.put(l, new ArrayList<>());
         }
 
         // 2. run Kahn's algorithm
         Set<LayoutDecision> working = new TreeSet<>();
-        working.addAll(decisionsWithNoInEdges);
+        for (LayoutDecision l : decisionsWithNoInEdges) {
+            working.add(l);
+        }
         while (!working.isEmpty()) {
             LayoutDecision n = working.iterator().next();
             working.remove(n);
@@ -1573,10 +1602,10 @@ public abstract class ObjectFile {
             // this means we have a cycle somewhere in our dependencies
             // We print only the subgraph defined by the remaining nodes,
             // i.e. decisions in allDecisions but not in reverseBuildOrder.
-            Set<LayoutDecision> remainingDecisions = new HashSet<>();
+            EconomicSet<LayoutDecision> remainingDecisions = EconomicSet.create(allDecisions.size());
             remainingDecisions.addAll(allDecisions);
             remainingDecisions.removeAll(reverseBuildOrder);
-            throw new IllegalStateException("cyclic build dependencies: " + dependencyGraphAsDotString(remainingDecisions));
+            throw new IllegalStateException("Cyclic build dependencies: " + dependencyGraphAsDotString(remainingDecisions));
         }
         assert reverseBuildOrder.get(0) == dummyFinalDecision; // it's the final one, innit
 
@@ -1595,11 +1624,7 @@ public abstract class ObjectFile {
         }
 
         /*
-         * Take decisions in the topsorted order. FIXME: in the case where some decisions have been
-         * explicitly "taken" by the FileLayout, we should be able to simplify the graph at this
-         * point. Also, these decisions should be put into decisionsTake *here* rather than at the
-         * point where they were scheduled. In fact, let's take them out of the schedule and remove
-         * their dependencies.
+         * Take decisions in the topsorted order.
          */
         for (LayoutDecision d : buildOrder) {
             Element e = d.getElement();
@@ -1649,7 +1674,7 @@ public abstract class ObjectFile {
                         assert valueDecided != null;
                         break;
                     default:
-                        throw new AssertionError("unreachable");
+                        throw new AssertionError("Unreachable");
                 }
                 d.setValue(valueDecided); // sets decision to "taken"
             }
@@ -1671,6 +1696,11 @@ public abstract class ObjectFile {
 
         int totalSize = getMinimumFileSize();
         for (Element e : sortedObjectFileElements) {
+            /*
+             * Non-file-backed sections such as ELF NOBITS and Mach-O zerofill currently still
+             * participate in the generic file-offset layout. Revisit this if their offsets become
+             * observable outside this package's internal layout model.
+             */
             totalSize = Math.max(totalSize, (int) decisionsTaken.get(e).getDecision(LayoutDecision.Kind.OFFSET).getValue() + (int) decisionsTaken.get(e).getDecidedValue(LayoutDecision.Kind.SIZE));
         }
         return totalSize;
@@ -1680,19 +1710,12 @@ public abstract class ObjectFile {
         return decisionsByElement;
     }
 
-    /**
-     * See {@code org.graalvm.compiler.serviceprovider.BufferUtil}.
-     */
-    private static Buffer asBaseBuffer(Buffer obj) {
-        return obj;
-    }
-
     public void writeBuffer(List<Element> sortedObjectFileElements, ByteBuffer out) {
         /* Emit each one! */
         for (Element e : sortedObjectFileElements) {
             int off = (int) decisionsTaken.get(e).getDecision(LayoutDecision.Kind.OFFSET).getValue();
             assert off != Integer.MAX_VALUE; // not allowed any more -- this was a broken approach
-            asBaseBuffer(out).position(off);
+            out.position(off);
             int expectedSize = (int) decisionsTaken.get(e).getDecidedValue(LayoutDecision.Kind.SIZE);
             byte[] content = (byte[]) decisionsTaken.get(e).getDecidedValue(LayoutDecision.Kind.CONTENT);
             out.put(content);
@@ -1708,7 +1731,7 @@ public abstract class ObjectFile {
     protected abstract int getMinimumFileSize();
 
     public int getPageSize() {
-        assert pageSize > 0 : "must be initialized";
+        assert pageSize > 0 : "Must be initialized";
         return pageSize;
     }
 
@@ -1785,9 +1808,9 @@ public abstract class ObjectFile {
         boolean isGlobal();
     }
 
-    public abstract Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal);
+    public abstract Symbol createDefinedSymbol(String name, Element baseSection, long position, int size, boolean isCode, boolean isGlobal, boolean isExported);
 
-    public abstract Symbol createUndefinedSymbol(String name, int size, boolean isCode);
+    public abstract Symbol createUndefinedSymbol(String name, boolean isCode);
 
     protected abstract SymbolTable createSymbolTable();
 
@@ -1806,7 +1829,7 @@ public abstract class ObjectFile {
      * Temporary storage for a debug context installed in a nested scope under a call. to
      * {@link #withDebugContext}
      */
-    private DebugContext debugContext = null;
+    protected DebugContext debugContext = DebugContext.disabled(null);
 
     /**
      * Allows a task to be executed with a debug context in a named subscope bound to the object

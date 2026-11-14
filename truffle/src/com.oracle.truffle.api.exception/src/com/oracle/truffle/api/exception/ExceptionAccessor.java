@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,29 +40,25 @@
  */
 package com.oracle.truffle.api.exception;
 
-import static com.oracle.truffle.api.exception.AbstractTruffleException.isTruffleException;
+import java.util.Iterator;
+import java.util.function.Function;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.TruffleStackTrace;
-import com.oracle.truffle.api.TruffleStackTraceElement;
 import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.interop.ExceptionType;
 import com.oracle.truffle.api.interop.InteropLibrary;
-import com.oracle.truffle.api.interop.InvalidArrayIndexException;
-import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
-import com.oracle.truffle.api.library.ExportLibrary;
-import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.SourceSection;
-import java.util.Collections;
-import java.util.List;
 
 final class ExceptionAccessor extends Accessor {
 
     static final ExceptionAccessor ACCESSOR = new ExceptionAccessor();
+    static final EngineSupport ENGINE = ACCESSOR.engineSupport();
+    static final HostSupport HOST = ACCESSOR.hostSupport();
     static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
+    static final RuntimeSupport RUNTIME = ACCESSOR.runtimeSupport();
 
     private ExceptionAccessor() {
     }
@@ -80,8 +76,8 @@ final class ExceptionAccessor extends Accessor {
         }
 
         @Override
-        public Object createDefaultStackTraceElementObject(RootNode rootNode, SourceSection sourceSection) {
-            return new DefaultStackTraceElementObject(rootNode, sourceSection);
+        public Object createDefaultStackTraceElementObject(RootNode rootNode, SourceSection sourceSection, int byteCodeIndex) {
+            return new DefaultStackTraceElementObject(rootNode, sourceSection, byteCodeIndex);
         }
 
         @Override
@@ -111,13 +107,13 @@ final class ExceptionAccessor extends Accessor {
 
         @Override
         public boolean hasExceptionCause(Object receiver) {
-            return isTruffleException(((AbstractTruffleException) receiver).getCause());
+            return isException(((AbstractTruffleException) receiver).getCause());
         }
 
         @Override
         public Object getExceptionCause(Object receiver) {
             Throwable throwable = ((AbstractTruffleException) receiver).getCause();
-            if (isTruffleException(throwable)) {
+            if (isException(throwable)) {
                 return throwable;
             } else {
                 throw throwUnsupportedMessageException();
@@ -147,29 +143,23 @@ final class ExceptionAccessor extends Accessor {
         }
 
         @Override
-        @TruffleBoundary
-        public Object getExceptionStackTrace(Object receiver) {
-            List<TruffleStackTraceElement> stack = TruffleStackTrace.getStackTrace((Throwable) receiver);
-            if (stack == null) {
-                stack = Collections.emptyList();
-            }
-            Object[] items = new Object[stack.size()];
-            for (int i = 0; i < items.length; i++) {
-                items[i] = stack.get(i).getGuestObject();
-            }
-            return new InteropList(items);
+        public Object getExceptionStackTrace(Throwable throwable, Object polyglotContext) {
+            return MergedHostGuestIterator.getExceptionStackTrace(throwable, polyglotContext, false, false);
+        }
+
+        @Override
+        public Object getEmbedderStackTrace(Throwable throwable, Object vmObject, boolean fromHost) {
+            return MergedHostGuestIterator.getExceptionStackTrace(throwable, vmObject, fromHost, true);
         }
 
         @Override
         public boolean hasSourceLocation(Object receiver) {
-            Node location = ((AbstractTruffleException) receiver).getLocation();
-            return location != null && location.getEncapsulatingSourceSection() != null;
+            return ((AbstractTruffleException) receiver).getEncapsulatingSourceSection() != null;
         }
 
         @Override
         public SourceSection getSourceLocation(Object receiver) {
-            Node location = ((AbstractTruffleException) receiver).getLocation();
-            SourceSection sourceSection = location != null ? location.getEncapsulatingSourceSection() : null;
+            SourceSection sourceSection = ((AbstractTruffleException) receiver).getEncapsulatingSourceSection();
             if (sourceSection == null) {
                 throw throwUnsupportedMessageException();
             }
@@ -177,9 +167,24 @@ final class ExceptionAccessor extends Accessor {
         }
 
         @Override
+        public int getStackTraceElementLimit(Object receiver) {
+            return ((AbstractTruffleException) receiver).getStackTraceElementLimit();
+        }
+
+        @Override
+        public int getBytecodeIndex(Object receiver) {
+            return ((AbstractTruffleException) receiver).getBytecodeIndex();
+        }
+
+        @Override
+        public Node getLocation(Object receiver) {
+            return ((AbstractTruffleException) receiver).getLocation();
+        }
+
+        @Override
         public boolean assertGuestObject(Object guestObject) {
             if (guestObject == null) {
-                throw new AssertionError("Guest object must be null.");
+                throw new AssertionError("Guest object must not be null.");
             }
             InteropLibrary interop = InteropLibrary.getUncached();
             if (interop.hasExecutableName(guestObject)) {
@@ -207,6 +212,12 @@ final class ExceptionAccessor extends Accessor {
             return true;
         }
 
+        @Override
+        public <T, G> Iterator<T> mergeHostGuestFrames(Object polyglotEngine, StackTraceElement[] hostStack, Iterator<G> guestFrames, boolean inHostLanguage,
+                        boolean includeHostFrames, Function<StackTraceElement, T> hostFrameConvertor, Function<G, T> guestFrameConvertor) {
+            return new MergedHostGuestIterator<>(polyglotEngine, hostStack, guestFrames, inHostLanguage, includeHostFrames, hostFrameConvertor, guestFrameConvertor);
+        }
+
         private static RuntimeException throwUnsupportedMessageException() {
             throw silenceException(RuntimeException.class, UnsupportedMessageException.create());
         }
@@ -214,40 +225,6 @@ final class ExceptionAccessor extends Accessor {
         @SuppressWarnings({"unchecked", "unused"})
         private static <E extends Throwable> E silenceException(Class<E> type, Throwable ex) throws E {
             throw (E) ex;
-        }
-    }
-
-    @ExportLibrary(InteropLibrary.class)
-    static final class InteropList implements TruffleObject {
-
-        private final Object[] items;
-
-        InteropList(Object[] items) {
-            this.items = items;
-        }
-
-        @ExportMessage
-        @SuppressWarnings("static-method")
-        boolean hasArrayElements() {
-            return true;
-        }
-
-        @ExportMessage
-        long getArraySize() {
-            return items.length;
-        }
-
-        @ExportMessage
-        boolean isArrayElementReadable(long index) {
-            return index >= 0 && index < items.length;
-        }
-
-        @ExportMessage
-        Object readArrayElement(long index) throws InvalidArrayIndexException {
-            if (index < 0 || index >= items.length) {
-                throw InvalidArrayIndexException.create(index);
-            }
-            return items[(int) index];
         }
     }
 }

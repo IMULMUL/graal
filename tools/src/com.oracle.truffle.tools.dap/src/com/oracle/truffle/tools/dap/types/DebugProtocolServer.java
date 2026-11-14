@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,8 +24,8 @@
  */
 package com.oracle.truffle.tools.dap.types;
 
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -34,14 +34,19 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -72,7 +77,7 @@ public class DebugProtocolServer {
         throw new UnsupportedOperationException("'restart' command not supported");
     }
 
-    public CompletableFuture<Void> disconnect(@SuppressWarnings("unused") DisconnectArguments args) {
+    public CompletableFuture<Void> disconnect(@SuppressWarnings("unused") DisconnectArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'disconnect' command not supported");
     }
 
@@ -104,35 +109,36 @@ public class DebugProtocolServer {
         throw new UnsupportedOperationException("'setDataBreakpoints' command not supported");
     }
 
-    public CompletableFuture<ContinueResponse.ResponseBody> doContinue(@SuppressWarnings("unused") ContinueArguments args) {
+    public CompletableFuture<ContinueResponse.ResponseBody> doContinue(@SuppressWarnings("unused") ContinueArguments args,
+                    @SuppressWarnings("unused") Consumer<? super ContinueResponse.ResponseBody> response) {
         throw new UnsupportedOperationException("'doContinue' command not supported");
     }
 
-    public CompletableFuture<Void> next(@SuppressWarnings("unused") NextArguments args) {
+    public CompletableFuture<Void> next(@SuppressWarnings("unused") NextArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'next' command not supported");
     }
 
-    public CompletableFuture<Void> stepIn(@SuppressWarnings("unused") StepInArguments args) {
+    public CompletableFuture<Void> stepIn(@SuppressWarnings("unused") StepInArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'stepIn' command not supported");
     }
 
-    public CompletableFuture<Void> stepOut(@SuppressWarnings("unused") StepOutArguments args) {
+    public CompletableFuture<Void> stepOut(@SuppressWarnings("unused") StepOutArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'stepOut' command not supported");
     }
 
-    public CompletableFuture<Void> stepBack(@SuppressWarnings("unused") StepBackArguments args) {
+    public CompletableFuture<Void> stepBack(@SuppressWarnings("unused") StepBackArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'stepBack' command not supported");
     }
 
-    public CompletableFuture<Void> reverseContinue(@SuppressWarnings("unused") ReverseContinueArguments args) {
+    public CompletableFuture<Void> reverseContinue(@SuppressWarnings("unused") ReverseContinueArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'reverseContinue' command not supported");
     }
 
-    public CompletableFuture<Void> restartFrame(@SuppressWarnings("unused") RestartFrameArguments args) {
+    public CompletableFuture<Void> restartFrame(@SuppressWarnings("unused") RestartFrameArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'restartFrame' command not supported");
     }
 
-    public CompletableFuture<Void> doGoto(@SuppressWarnings("unused") GotoArguments args) {
+    public CompletableFuture<Void> doGoto(@SuppressWarnings("unused") GotoArguments args, @SuppressWarnings("unused") Consumer<? super Void> responseConsumer) {
         throw new UnsupportedOperationException("'doGoto' command not supported");
     }
 
@@ -239,14 +245,18 @@ public class DebugProtocolServer {
         private final InputStream in;
         private final OutputStream out;
         private final Map<Integer, CompletableFuture<Response>> pendingSentRequests = new ConcurrentHashMap<>();
-        private final Map<Integer, CompletableFuture<?>> pendingReceivedRequests = new ConcurrentHashMap<>();
+        private final Set<CompletableFuture<?>> pendingReceivedRequests = ConcurrentHashMap.newKeySet();
+        private final Runnable closeConnection;
+        private final Runnable dispose;
         private AtomicInteger sequenceNum = new AtomicInteger(1);
-        private boolean closed = false;
+        private volatile boolean closed = false;
 
-        private Session(DebugProtocolServer server, InputStream in, OutputStream out) {
+        private Session(DebugProtocolServer server, InputStream in, OutputStream out, Runnable closeConnection, Runnable dispose) {
             this.server = server;
             this.in = in;
             this.out = out;
+            this.closeConnection = closeConnection;
+            this.dispose = dispose;
             this.server.connect(new DebugProtocolClient() {
                 @Override
                 public void initialized() {
@@ -342,6 +352,18 @@ public class DebugProtocolServer {
                     }
                 }
             } catch (IOException ioe) {
+                server.getLogger().log(Level.FINE, "DAP connection closed", ioe);
+            } finally {
+                closed = true;
+                closeConnection.run();
+                // Resume suspended guest threads before awaiting their pending requests.
+                dispose.run();
+                synchronized (out) {
+                    for (CompletableFuture<Response> request : pendingSentRequests.values()) {
+                        request.completeExceptionally(new IOException("DAP connection closed"));
+                    }
+                }
+                CompletableFuture.allOf(pendingReceivedRequests.toArray(new CompletableFuture<?>[0])).handle((result, error) -> null).join();
             }
         }
 
@@ -399,7 +421,7 @@ public class DebugProtocolServer {
                         if (server.getLogger().isLoggable(Level.FINER)) {
                             String format = "[Trace - %s] Received request '%s - (%d)'\nArgs: %s";
                             server.getLogger().log(Level.FINER,
-                                            String.format(format, Instant.now().toString(), request.getCommand(), request.getSeq(), getJSONData(request.getArguments()).toString()));
+                                            format(format, Instant.now().toString(), request.getCommand(), request.getSeq(), getJSONData(request.getArguments())));
                         }
                         processRequest(request);
                         break;
@@ -407,14 +429,14 @@ public class DebugProtocolServer {
                         final Response response = new Response(message.jsonData);
                         if (server.getLogger().isLoggable(Level.FINER)) {
                             String format = "[Trace - %s] Received response '(%d)'\nResult: %s";
-                            server.getLogger().log(Level.FINER, String.format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody()).toString()));
+                            server.getLogger().log(Level.FINER, format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody())));
                         }
                         processResponse(response);
                         break;
                     default:
                         sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
                                         Message.create(1014, "Unrecognized message type: {_type}").setVariables(Collections.singletonMap("_type", messageType))),
-                                        message.getSeq(), false, null, sequenceNum.getAndIncrement()).setMessage(String.format("Unrecognized message type: `%s`", messageType)));
+                                        message.getSeq(), false, null, sequenceNum.getAndIncrement()).setMessage(format("Unrecognized message type: `%s`", messageType)));
                 }
             } catch (Exception e) {
                 server.getLogger().log(Level.SEVERE, "Error while processing an incomming message: " + e.getMessage());
@@ -459,8 +481,10 @@ public class DebugProtocolServer {
                         });
                         break;
                     case "disconnect":
-                        future = server.disconnect(new DisconnectArguments(args)).thenAccept(body -> {
+                        future = server.disconnect(new DisconnectArguments(args), body -> {
                             sendResponse(DisconnectResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
+                            closed = true;
+                            closeConnection.run();
                         });
                         break;
                     case "terminate":
@@ -499,42 +523,42 @@ public class DebugProtocolServer {
                         });
                         break;
                     case "continue":
-                        future = server.doContinue(new ContinueArguments(args)).thenAccept(body -> {
+                        future = server.doContinue(new ContinueArguments(args), body -> {
                             sendResponse(ContinueResponse.create(body, seq, true, command, sequenceNum.getAndIncrement()));
                         });
                         break;
                     case "next":
-                        future = server.next(new NextArguments(args)).thenAccept(body -> {
+                        future = server.next(new NextArguments(args), body -> {
                             sendResponse(NextResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "stepIn":
-                        future = server.stepIn(new StepInArguments(args)).thenAccept(body -> {
+                        future = server.stepIn(new StepInArguments(args), body -> {
                             sendResponse(StepInResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "stepOut":
-                        future = server.stepOut(new StepOutArguments(args)).thenAccept(body -> {
+                        future = server.stepOut(new StepOutArguments(args), body -> {
                             sendResponse(StepOutResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "stepBack":
-                        future = server.stepBack(new StepBackArguments(args)).thenAccept(body -> {
+                        future = server.stepBack(new StepBackArguments(args), body -> {
                             sendResponse(StepBackResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "reverseContinue":
-                        future = server.reverseContinue(new ReverseContinueArguments(args)).thenAccept(body -> {
+                        future = server.reverseContinue(new ReverseContinueArguments(args), body -> {
                             sendResponse(ReverseContinueResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "restartFrame":
-                        future = server.restartFrame(new RestartFrameArguments(args)).thenAccept(body -> {
+                        future = server.restartFrame(new RestartFrameArguments(args), body -> {
                             sendResponse(RestartFrameResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
                     case "goto":
-                        future = server.doGoto(new GotoArguments(args)).thenAccept(body -> {
+                        future = server.doGoto(new GotoArguments(args), body -> {
                             sendResponse(GotoResponse.create(seq, true, command, sequenceNum.getAndIncrement()).setBody(body));
                         });
                         break;
@@ -631,27 +655,30 @@ public class DebugProtocolServer {
                     default:
                         sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
                                         Message.create(1014, "Unrecognized command: {_cmd}").setVariables(Collections.singletonMap("_cmd", command))),
-                                        seq, false, command, sequenceNum.getAndIncrement()).setMessage(String.format("Unrecognized command: `%s`", command)));
+                                        seq, false, command, sequenceNum.getAndIncrement()).setMessage(format("Unrecognized command: `%s`", command)));
                 }
                 if (future != null) {
-                    pendingReceivedRequests.put(seq, future);
-                    future.exceptionally(throwable -> {
+                    CompletableFuture<?> pending = future.exceptionally(throwable -> {
+                        if (closed) {
+                            server.getLogger().log(Level.FINE, "DAP request failed after disconnect", throwable);
+                            return null;
+                        }
                         if (isCancellationException(throwable)) {
                             sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create(), seq, false, command, sequenceNum.getAndIncrement()).setMessage("cancelled"));
                         } else if (isExceptionWithMessage(throwable)) {
                             sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
-                                            asExceptionWithMessage(throwable).getDebugMessage()), seq, false, command, sequenceNum.getAndIncrement()).setMessage(throwable.getMessage()));
+                                            asExceptionWithMessage(throwable).getDebugMessage()), seq, false, command, sequenceNum.getAndIncrement()).setMessage(throwable.getCause().getMessage()));
                         } else {
                             final String msg = throwable.getMessage() != null ? throwable.getMessage() : "";
+                            server.getLogger().log(Level.SEVERE, msg, throwable);
                             sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
                                             Message.create(1104, "Internal Error: {_err}").setVariables(Collections.singletonMap("_err", msg))),
-                                            seq, false, command, sequenceNum.getAndIncrement()).setMessage(String.format("Internal Error: `%s`", msg)));
+                                            seq, false, command, sequenceNum.getAndIncrement()).setMessage(format("Internal Error: `%s`", msg)));
                         }
                         return null;
-                    }).thenApply((obj) -> {
-                        pendingReceivedRequests.remove(seq);
-                        return null;
                     });
+                    pendingReceivedRequests.add(pending);
+                    pending.whenComplete((result, error) -> pendingReceivedRequests.remove(pending));
                 }
             } catch (ExceptionWithMessage ewm) {
                 sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
@@ -661,7 +688,7 @@ public class DebugProtocolServer {
                 server.getLogger().log(Level.SEVERE, msg, e);
                 sendErrorResponse((ErrorResponse) ErrorResponse.create(ErrorResponse.ResponseBody.create().setError(
                                 Message.create(1104, "Internal Error: {_err}").setVariables(Collections.singletonMap("_err", msg))),
-                                seq, false, command, sequenceNum.getAndIncrement()).setMessage(String.format("Internal Error: `%s`", msg)));
+                                seq, false, command, sequenceNum.getAndIncrement()).setMessage(format("Internal Error: `%s`", msg)));
             }
         }
 
@@ -675,7 +702,7 @@ public class DebugProtocolServer {
                             future.complete(new RunInTerminalResponse(response.jsonData));
                             break;
                         default:
-                            future.completeExceptionally(new RuntimeException(String.format("Unrecognized command: `%s`", command)));
+                            future.completeExceptionally(new RuntimeException(format("Unrecognized command: `%s`", command)));
                     }
                 } catch (Exception e) {
                     server.getLogger().log(Level.SEVERE, e.getMessage(), e);
@@ -688,17 +715,22 @@ public class DebugProtocolServer {
             CompletableFuture<Response> future = new CompletableFuture<>();
             if (server.getLogger().isLoggable(Level.FINER)) {
                 String format = "[Trace - %s] Sending request '%s - (%d)'\nArgs: %s";
-                server.getLogger().log(Level.FINER, String.format(format, Instant.now().toString(), request.getCommand(), request.getSeq(), getJSONData(request.getArguments()).toString()));
+                server.getLogger().log(Level.FINER, format(format, Instant.now().toString(), request.getCommand(), request.getSeq(), getJSONData(request.getArguments())));
             }
-            writeMessage(getJSONData(request).toString());
-            pendingSentRequests.put(request.getSeq(), future);
+            synchronized (out) {
+                if (closed) {
+                    return CompletableFuture.failedFuture(new IOException("DAP connection closed"));
+                }
+                pendingSentRequests.put(request.getSeq(), future);
+                writeMessage(getJSONData(request).toString());
+            }
             return future;
         }
 
         private void sendResponse(Response response) {
             if (server.getLogger().isLoggable(Level.FINER)) {
                 String format = "[Trace - %s] Sending response '(%d)'\nResult: %s";
-                server.getLogger().log(Level.FINER, String.format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody()).toString()));
+                server.getLogger().log(Level.FINER, format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody())));
             }
             writeMessage(getJSONData(response).toString());
         }
@@ -706,7 +738,7 @@ public class DebugProtocolServer {
         private void sendErrorResponse(ErrorResponse response) {
             if (server.getLogger().isLoggable(Level.FINER)) {
                 String format = "[Trace - %s] Sending error response '(%d)'\nError: %s";
-                server.getLogger().log(Level.FINER, String.format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody().getError()).toString()));
+                server.getLogger().log(Level.FINER, format(format, Instant.now().toString(), response.getRequestSeq(), getJSONData(response.getBody().getError())));
             }
             writeMessage(getJSONData(response).toString());
 
@@ -715,24 +747,31 @@ public class DebugProtocolServer {
         private void sendEvent(Event event) {
             if (server.getLogger().isLoggable(Level.FINER)) {
                 String format = "[Trace - %s] Sending event '%s'\nBody: %s";
-                server.getLogger().log(Level.FINER, String.format(format, Instant.now().toString(), event.getType(), getJSONData(event.getBody()).toString()));
+                server.getLogger().log(Level.FINER, format(format, Instant.now().toString(), event.getEvent(), getJSONData(event.getBody())));
             }
             writeMessage(getJSONData(event).toString());
         }
 
         private void writeMessage(String message) {
-            try {
-                byte[] messageBytes = message.getBytes(StandardCharsets.UTF_8);
-                writeMessageBytes(out, messageBytes);
-            } catch (IOException ex) {
-                server.getLogger().log(Level.SEVERE, ex.getMessage(), ex);
-                throw new RuntimeException(ex);
+            synchronized (out) {
+                if (closed) {
+                    return;
+                }
+                try {
+                    byte[] messageBytes = message.getBytes(StandardCharsets.UTF_8);
+                    writeMessageBytes(out, messageBytes);
+                } catch (IOException ex) {
+                    if (!closed) {
+                        server.getLogger().log(Level.SEVERE, ex.getMessage(), ex);
+                        throw new RuntimeException(ex);
+                    }
+                }
             }
         }
 
         private static void writeMessageBytes(OutputStream out, byte[] messageBytes) throws IOException {
             int contentLength = messageBytes.length;
-            String header = String.format("Content-Length: %d\r\n\r\n", contentLength);
+            String header = format("Content-Length: %d\r\n\r\n", contentLength);
             byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
             synchronized (out) {
                 out.write(headerBytes);
@@ -766,17 +805,37 @@ public class DebugProtocolServer {
             return t instanceof CompletionException ? asExceptionWithMessage(t.getCause()) : t instanceof ExceptionWithMessage ? (ExceptionWithMessage) t : null;
         }
 
-        public static Future<?> connect(DebugProtocolServer server, InputStream in, OutputStream out, ExecutorService executors) {
-            Session s = new Session(server, in, out);
-            return executors.submit(s);
+        public static Future<?> connect(DebugProtocolServer server, InputStream in, OutputStream out, Executor executor) {
+            return connect(server, in, out, executor, () -> {
+            }, () -> {
+            });
+        }
+
+        /**
+         * Connects a client and completes only after its requests and cleanup have finished.
+         *
+         * @param server the per-client server
+         * @param in the client input
+         * @param out the client output
+         * @param executor the request-reader executor
+         * @param closeConnection closes the transport on disconnect or EOF, waking blocked reads
+         * @param dispose releases debugger state and resumes suspended guest threads
+         * @return completion of the client session, including outstanding requests
+         */
+        public static Future<?> connect(DebugProtocolServer server, InputStream in, OutputStream out, Executor executor, Runnable closeConnection, Runnable dispose) {
+            Session s = new Session(server, in, out, closeConnection, dispose);
+            RunnableFuture<?> future = new FutureTask<>(s, null);
+            executor.execute(future);
+            return future;
         }
     }
 
+    @SuppressWarnings("serial")
     public static class ExceptionWithMessage extends RuntimeException {
 
         private static final long serialVersionUID = 4950848492025420535L;
 
-        private Message debugMessage;
+        private final Message debugMessage;
 
         public ExceptionWithMessage(Message debugMessage, String message) {
             super(message);
@@ -795,5 +854,9 @@ public class DebugProtocolServer {
         void log(Level level, String msg);
 
         void log(Level level, String msg, Throwable thrown);
+    }
+
+    private static String format(String format, Object... args) {
+        return String.format(Locale.ENGLISH, format, args);
     }
 }

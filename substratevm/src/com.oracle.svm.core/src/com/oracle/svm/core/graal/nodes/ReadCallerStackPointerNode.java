@@ -24,15 +24,14 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
-import org.graalvm.compiler.nodes.spi.LIRLowerable;
-import org.graalvm.compiler.nodes.spi.NodeLIRBuilderTool;
-
-import com.oracle.svm.core.FrameAccess;
+import com.oracle.svm.core.SubstrateTarget;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.spi.LIRLowerable;
+import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 
 import jdk.vm.ci.meta.Value;
 
@@ -41,12 +40,12 @@ public final class ReadCallerStackPointerNode extends FixedWithNextNode implemen
     public static final NodeClass<ReadCallerStackPointerNode> TYPE = NodeClass.create(ReadCallerStackPointerNode.class);
 
     public ReadCallerStackPointerNode() {
-        super(TYPE, FrameAccess.getWordStamp());
+        super(TYPE, SubstrateTarget.getWordStamp());
     }
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
-        Value result = gen.getLIRGeneratorTool().emitReadCallerStackPointer(FrameAccess.getWordStamp());
+        Value result = gen.getLIRGeneratorTool().emitReadCallerStackPointer(SubstrateTarget.getWordStamp());
         gen.setResult(this, result);
     }
 }

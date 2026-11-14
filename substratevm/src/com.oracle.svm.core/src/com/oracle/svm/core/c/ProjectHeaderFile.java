@@ -29,60 +29,41 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.option.OptionUtils;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.BuildtimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.NoLayeredCallbacks;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.PartiallyLayerAware;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
+
+@AutomaticallyRegisteredFeature
+class RegisterSVMTestingResolverFeature implements InternalFeature {
+
+    @Override
+    public boolean isInConfiguration(IsInConfigurationAccess access) {
+        return access.findClassByName("com.oracle.svm.tutorial.CInterfaceTutorial") != null;
+    }
+
+    @Override
+    public void afterRegistration(AfterRegistrationAccess access) {
+        /**
+         * Search for headers in a directory, relative to the current working directory, that
+         * contains the Substrate VM projects. Using the "../substratevm*" relative path accounts
+         * for running SVM from sibling suites.
+         */
+        ProjectHeaderFile.HeaderResolversRegistry.registerAdditionalResolver(new ProjectHeaderFile.FallbackHeaderResolver("../../graal/substratevm/src"));
+    }
+}
 
 public final class ProjectHeaderFile {
-
-    @AutomaticFeature
-    public static class RegisterSVMTestingResolverFeature extends RegisterFallbackResolverFeature {
-
-        @Override
-        public boolean isInConfiguration(IsInConfigurationAccess access) {
-            return access.findClassByName("com.oracle.svm.tutorial.CInterfaceTutorial") != null;
-        }
-
-        @Override
-        public void afterRegistration(AfterRegistrationAccess access) {
-            /**
-             * Search for headers in a directory, relative to the current working directory, that
-             * contains the Substrate VM projects. Using the "../substratevm*" relative path
-             * accounts for running SVM from sibling suites.
-             */
-            HeaderResolversRegistry.registerAdditionalResolver(new FallbackHeaderResolver("../../graal/substratevm/src"));
-        }
-    }
-
-    @AutomaticFeature
-    public static class HeaderResolverRegistrationFeature implements Feature {
-
-        @Override
-        public void afterRegistration(AfterRegistrationAccess access) {
-            ImageSingletons.add(HeaderResolversRegistry.class, new HeaderResolversRegistry());
-        }
-    }
-
-    /**
-     * Base class for fall back resolvers registration. Extending this class will ensure that the
-     * {@link ProjectHeaderFile} will be added as a dependency.
-     */
-    public abstract static class RegisterFallbackResolverFeature implements Feature {
-
-        @Override
-        public List<Class<? extends Feature>> getRequiredFeatures() {
-            return Collections.singletonList(HeaderResolverRegistrationFeature.class);
-        }
-    }
-
     /**
      * Resolves the path to a C header file that is located in a Substrate VM project.
      */
@@ -95,11 +76,12 @@ public final class ProjectHeaderFile {
      * A registry for all the header resolvers. The search order is important, we want first to
      * search the location(s) specified by CLibraryPath, then registered fall back locations if any.
      */
+    @AutomaticallyRegisteredImageSingleton
+    @SingletonTraits(access = BuildtimeAccessOnly.class, layeredCallbacks = NoLayeredCallbacks.class, other = PartiallyLayerAware.class)
     public static class HeaderResolversRegistry {
 
         /** Register additional resolvers. */
         public static void registerAdditionalResolver(HeaderResolver resolver) {
-            assert ImageSingletons.contains(HeaderResolversRegistry.class);
             HeaderResolversRegistry registry = ImageSingletons.lookup(HeaderResolversRegistry.class);
             registry.register(resolver);
         }
@@ -135,10 +117,12 @@ public final class ProjectHeaderFile {
             }
 
             /* If the header was not found at any of the specified locations an error is thrown. */
-            throw VMError.shouldNotReachHere("Header file " + headerFile +
-                            " not found at main search location(s): \n" + String.join("\n", mainResult.locations) +
-                            (fallbackLocations.size() > 0 ? "\n or any of the fallback locations: \n" + String.join("\n", fallbackLocations) : "") +
-                            "\n Use option -H:CLibraryPath to specify header file search locations.");
+            throw VMError.shouldNotReachHere("Header file " + headerFile + " not found at main search location(s): " +
+                            System.lineSeparator() + String.join(System.lineSeparator(), mainResult.locations) +
+                            (!fallbackLocations.isEmpty()
+                                            ? System.lineSeparator() + " or any of the fallback locations: " + System.lineSeparator() + String.join(System.lineSeparator(), fallbackLocations)
+                                            : "") +
+                            System.lineSeparator() + " Use option -H:CLibraryPath to specify header file search locations.");
         }
 
     }
@@ -176,8 +160,8 @@ public final class ProjectHeaderFile {
         @Override
         public HeaderSearchResult resolveHeader(String projectName, String headerFile) {
             List<String> locations = new ArrayList<>();
-            for (String clibPathComponent : OptionUtils.flatten(",", SubstrateOptions.CLibraryPath.getValue())) {
-                Path clibPathHeaderFile = Paths.get(clibPathComponent).resolve(headerFile).normalize().toAbsolutePath();
+            for (Path clibPathComponent : SubstrateOptions.CLibraryPath.getValue().values()) {
+                Path clibPathHeaderFile = clibPathComponent.resolve(headerFile).normalize().toAbsolutePath();
                 locations.add(clibPathHeaderFile.toString());
                 if (Files.exists(clibPathHeaderFile)) {
                     return new HeaderSearchResult(Optional.of("\"" + clibPathHeaderFile + "\""), locations);

@@ -24,13 +24,17 @@
  */
 package com.oracle.svm.core.posix.linux;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.impl.ProcessPropertiesSupport;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.posix.PosixProcessPropertiesSupport;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
 
+@AutomaticallyRegisteredImageSingleton(ProcessPropertiesSupport.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class LinuxProcessPropertiesSupport extends PosixProcessPropertiesSupport {
 
     @Override
@@ -38,14 +42,4 @@ public class LinuxProcessPropertiesSupport extends PosixProcessPropertiesSupport
         final String exefileString = "/proc/self/exe";
         return realpath(exefileString);
     }
-
-    @AutomaticFeature
-    public static class ImagePropertiesFeature implements Feature {
-
-        @Override
-        public void afterRegistration(AfterRegistrationAccess access) {
-            ImageSingletons.add(ProcessPropertiesSupport.class, new LinuxProcessPropertiesSupport());
-        }
-    }
-
 }

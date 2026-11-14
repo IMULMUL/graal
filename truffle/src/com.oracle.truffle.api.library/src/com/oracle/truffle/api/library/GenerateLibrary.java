@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -46,6 +46,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
+import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
 
 /**
@@ -87,6 +88,25 @@ import com.oracle.truffle.api.nodes.EncapsulatingNodeReference;
  * exports can be specified explicitly, it can be used to provide a default implementation for
  * receiver types of third parties or the JDK. For example the Truffle interop library has default
  * exports for most {@link Number} types, {@link String} and {@link Boolean} type.
+ * <p>
+ * In order to enable AOT generation for a library annotate the class with {@link GenerateAOT} and
+ * enable exports to be used for AOT by setting {@link ExportLibrary#useForAOT()} to
+ * <code>true</code>.
+ *
+ * <h3>Deprecating Messages</h3>
+ *
+ * If a library message gets deprecated using the {@link Deprecated} annotation then all exports
+ * will get a deprecation warning. This can be useful to evolve libraries over time in a compatible
+ * way.
+ * <p>
+ * Sometimes it is needed to remove or modify types of parameters as part of evolution. In this case
+ * it is possible to declare multiple overloads of the same library message where all but one method
+ * are annotated with {@link Deprecated}. The non-deprecated method must use more generic or the
+ * same parameter types. For example, this allows to evolve message with parameter {@link String} to
+ * evolve into {@link Object}. It is also possible to add or remove parameter types in the
+ * non-deprecated method. These restrictions are necessary in order to ensure that exports of that
+ * message never export the new overload after recompilation unless the parameter types were
+ * updated.
  *
  * @see DefaultExport to specify default exports.
  * @see Abstract to make messages abstract if they have a default implemetnation
@@ -232,7 +252,9 @@ public @interface GenerateLibrary {
 
         /**
          * Specifies a message to be abstract only if another message is implemented. Multiple other
-         * messages can be specified.
+         * messages can be specified. If the list is empty, the message is always abstract unless
+         * {@link Abstract#ifExportedAsWarning()} is not empty. If the list is not empty it takes
+         * precedence over {@link Abstract#ifExportedAsWarning()}.
          * <p>
          * <b>For example:</b>
          *
@@ -259,6 +281,138 @@ public @interface GenerateLibrary {
          */
         String[] ifExported() default {};
 
+        /**
+         * Specifies a message to be abstract only if another message is implemented. Multiple other
+         * messages can be specified. The message is not actually made abstract unless it is in the
+         * {@link Abstract#ifExported()} list. Only a warning is produced that prompts the user to
+         * implement the message
+         * <p>
+         * <b>For example:</b>
+         *
+         * <pre>
+         * &#64;GenerateLibrary
+         * public abstract class MaybeNumberLibrary extends Library {
+         *
+         *     public boolean isNumber(Object receiver) {
+         *         return false;
+         *     }
+         *
+         *     &#64;Abstract(ifExportedAsWarning = "isNumber")
+         *     public Number getNumber(Object receiver) {
+         *         throw new UnsupportedOperationException();
+         *     }
+         * }
+         * </pre>
+         *
+         * In this example, if the isNumber message is exported and the getNumber message is not,
+         * the user gets a warning.
+         *
+         * @since 23.0
+         */
+        String[] ifExportedAsWarning() default {};
+
+        /**
+         * A tool to deprecate and replace messages during library evolution.
+         * <p>
+         * The primary use case is to facilitate transitions from one message to another by
+         * designating a new message as a replacement for an older, deprecated message. When this
+         * annotation is present, and the deprecated message is not explicitly implemented, a
+         * default implementation is generated that delegates from the deprecated message to its
+         * designated replacement. The message specification may optionally include argument types
+         * in parentheses. When delegation cannot be handled automatically, a custom implementation
+         * can be provided using {@link #replacementMethod()}.
+         * <p>
+         * The migration behavior between deprecated and replacement messages depends on whether the
+         * exporter (the library implementer) and the client (the library user) have migrated to the
+         * new API. The following combinations are supported:
+         * <ol>
+         * <li><b>Both exporter and client use the deprecated API:</b> The original deprecated
+         * message is used exactly as before deprecation. No delegation or generated replacement is
+         * involved.</li>
+         * <li><b>Exporter uses the deprecated API, client uses the new API:</b> The default
+         * implementation of the new message is used. It delegates to the exporter's implementation
+         * of the deprecated message.</li>
+         * <li><b>Exporter uses the new API, client uses the deprecated API:</b> The annotation
+         * processor generates an implementation of the deprecated message that delegates to the
+         * exporter's new message. When the default delegation is insufficient, the
+         * {@link #replacementMethod()} can be used to provide a custom conversion or adapter.</li>
+         * <li><b>Both exporter and client use the new API:</b> The generated deprecated message is
+         * no longer needed and can be safely removed once all usages have migrated.</li>
+         * </ol>
+         * <p>
+         * <b>Example:</b>
+         *
+         * <pre>
+         * &#64;GenerateLibrary
+         * public abstract class ArrayLibrary extends Library {
+         *
+         *     &#64;Abstract(ifExported = "isArray")
+         *     &#64;Deprecated
+         *     public int read(Object receiver, int index) {
+         *         throw new UnsupportedOperationException();
+         *     }
+         *
+         *     &#64;Abstract(ifExported = "isArray", replacementOf = "read(Object, int)")
+         *     public int read(Object receiver, long index) {
+         *         throw new UnsupportedOperationException();
+         *     }
+         * }
+         * </pre>
+         *
+         * In this example, the {@code read(Object, long)} message replaces
+         * {@code read(Object, int)}. If only the new message is implemented, the following
+         * delegation is generated automatically:
+         *
+         * <pre>
+         * public int read(Object receiver, int index) {
+         *     return read(receiver, (long) index);
+         * }
+         * </pre>
+         *
+         * Legacy clients can continue calling the deprecated message, while exporters need only
+         * implement the new message signature.
+         *
+         * @see #replacementMethod()
+         * @since 25.1
+         */
+        String replacementOf() default "";
+
+        /**
+         * Specifies a custom replacement method to handle delegation for a message declared with
+         * {@link #replacementOf()}.
+         * <p>
+         * This attribute provides a way to manually implement delegation logic when automatic
+         * delegation from the deprecated message to its replacement cannot be generated correctly.
+         * Typical reasons include differences in argument semantics, necessary type conversions, or
+         * behavioral changes that cannot be inferred automatically.
+         * <p>
+         * This element is only valid when {@link #replacementOf()} is also set. Using it without
+         * {@code replacementOf} will result in a compilation error. The specified method must have
+         * a compatible signature and be accessible from the annotated message.
+         *
+         * <p>
+         * <b>Example:</b>
+         *
+         * <pre>
+         * &#64;Abstract(ifExported = "isArray", replacementOf = "read(Object, int)", replacementMethod = "readLegacy")
+         * public int read(Object receiver, long unsignedIndex) {
+         *     throw new UnsupportedOperationException();
+         * }
+         *
+         * protected final int readLegacy(Object receiver, int index) {
+         *     long unsignedIndex = Integer.toUnsignedLong(index);
+         *     return read(receiver, unsignedIndex);
+         * }
+         * </pre>
+         *
+         * In this example, the deprecated {@code read(Object, int)} message cannot be automatically
+         * delegated to {@code read(Object, long)} because the index must be treated as unsigned.
+         * The custom {@code readLegacy} method therefore provides the correct conversion logic.
+         *
+         * @see #replacementOf()
+         * @since 25.1
+         */
+        String replacementMethod() default "";
     }
 
     /**
@@ -275,7 +429,7 @@ public @interface GenerateLibrary {
     boolean defaultExportLookupEnabled() default false;
 
     /**
-     * Allows the use of {@link DynamicDispatchLibrary} with this library. By default dynamic
+     * Allows the use of {@link DynamicDispatchLibrary} with this library. By default, dynamic
      * dispatch is enabled. If this flag is set to <code>false</code> then the
      * {@link DynamicDispatchLibrary#dispatch(Object) dispatch} method will not be used for this
      * library. Only default exports and exports declared with the receiver type will be used

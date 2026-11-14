@@ -24,20 +24,24 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.nodes.FieldLocationIdentity;
+import com.oracle.svm.jvmci.shared.meta.SharedField;
 
-import com.oracle.svm.core.meta.SharedField;
-
+import jdk.graal.compiler.nodes.FieldLocationIdentity;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 public class SubstrateFieldLocationIdentity extends FieldLocationIdentity {
 
-    public SubstrateFieldLocationIdentity(ResolvedJavaField field) {
-        super(field);
+    public SubstrateFieldLocationIdentity(ResolvedJavaField field, boolean immutable) {
+        super(field, immutable);
+    }
+
+    public SubstrateFieldLocationIdentity(FieldLocationIdentity identity) {
+        super(identity.getField(), identity.isImmutable());
     }
 
     @Override
     public boolean isImmutable() {
-        return getField() instanceof SharedField && !((SharedField) getField()).isWritten();
+        /* We can also treat a field as immutable if the analysis determines it is never written. */
+        return super.isImmutable() || (getField() instanceof SharedField sField && !sField.isWritten());
     }
 }

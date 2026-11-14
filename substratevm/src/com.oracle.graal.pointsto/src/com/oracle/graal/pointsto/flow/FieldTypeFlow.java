@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,44 +28,33 @@ import static jdk.vm.ci.common.JVMCIError.shouldNotReachHere;
 
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
-import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.context.object.AnalysisObject;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
-import jdk.vm.ci.meta.JavaKind;
-
-public class FieldTypeFlow extends TypeFlow<AnalysisField> {
+public class FieldTypeFlow extends TypeFlow<AnalysisField> implements GlobalFlow {
 
     private static final AtomicReferenceFieldUpdater<FieldTypeFlow, FieldFilterTypeFlow> FILTER_FLOW_UPDATER = AtomicReferenceFieldUpdater.newUpdater(FieldTypeFlow.class, FieldFilterTypeFlow.class,
                     "filterFlow");
 
-    private static TypeState initialFieldState(AnalysisField field) {
-        if (field.getJavaKind() == JavaKind.Object && field.canBeNull()) {
-            /*
-             * All object type instance fields of a new object can be null. Instance fields are null
-             * in the time between the new-instance and the first write to a field. This is even
-             * true for non-null final fields because even final fields are null until they are
-             * initialized in a constructor.
-             */
-            return TypeState.forNull();
-        }
-        return TypeState.forEmpty();
-    }
-
     /** The holder of the field flow (null for static fields). */
-    private AnalysisObject object;
+    private final AnalysisObject object;
 
     /** A filter flow used for unsafe writes. */
     private volatile FieldFilterTypeFlow filterFlow;
 
     public FieldTypeFlow(AnalysisField field, AnalysisType type) {
-        super(field, type, initialFieldState(field));
+        this(field, type, null);
     }
 
+    /**
+     * Stores the effective value bound after dropping unchecked interface constraints. The field's
+     * original declaration remains available through {@link AnalysisField#getType()}.
+     */
     public FieldTypeFlow(AnalysisField field, AnalysisType type, AnalysisObject object) {
-        this(field, type);
+        super(field, dropUncheckedInterfaceBound(type), TypeState.forEmpty());
         this.object = object;
     }
 
@@ -74,27 +63,38 @@ public class FieldTypeFlow extends TypeFlow<AnalysisField> {
     }
 
     @Override
-    public TypeFlow<AnalysisField> copy(BigBang bb, MethodFlowsGraph methodFlows) {
+    public TypeFlow<AnalysisField> copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows) {
         // return this field flow
         throw shouldNotReachHere("The field flow should not be cloned. Use Load/StoreFieldTypeFlow.");
     }
 
     @Override
-    public boolean canSaturate() {
-        return false;
+    public boolean canSaturate(PointsToAnalysis bb) {
+        /*
+         * Object fields with a closed effective value bound retain finite type information. A
+         * saturated input is replaced with all instantiated types assignable to that bound.
+         */
+        return !bb.getExtensionPolicy().isTypeClosed(declaredType);
     }
 
     @Override
-    protected void onInputSaturated(BigBang bb, TypeFlow<?> input) {
-        /*
-         * When a field store is saturated conservativelly assume that the field state can contain
-         * any subtype of its declared type.
-         */
-        getDeclaredType().getTypeFlow(bb, true).addUse(bb, this);
+    protected void onInputSaturated(PointsToAnalysis bb, TypeFlow<?> input) {
+        /* The field input, which is usually a field-store, is saturated. */
+        if (bb.getExtensionPolicy().isTypeClosed(declaredType)) {
+            /*
+             * Recover all instantiated types under the effective bound, or any primitive value.
+             * The effective bound drops unchecked interface constraints from the declaration.
+             * A saturated reference input does not establish an additional array-element write.
+             */
+            source.injectFieldValueBound();
+        } else {
+            /* Otherwise, propagate saturation stamp through the field flow. */
+            super.onInputSaturated(bb, input);
+        }
     }
 
-    /** The filter flow is used for unsafe writes and initialiazed on demand. */
-    public FieldFilterTypeFlow filterFlow(BigBang bb) {
+    /** The filter flow is used for unsafe writes and initialized on demand. */
+    public FieldFilterTypeFlow filterFlow(PointsToAnalysis bb) {
         assert source.isUnsafeAccessed() : "Filter flow requested for non unsafe accessed field.";
 
         if (filterFlow == null) {
@@ -113,7 +113,7 @@ public class FieldTypeFlow extends TypeFlow<AnalysisField> {
 
     @Override
     public String toString() {
-        return "FieldFlow<" + source.format("%h.%n") + "\n" + getState() + ">";
+        return "FieldFlow<" + source.format("%h.%n") + System.lineSeparator() + getStateDescription() + ">";
     }
 
 }

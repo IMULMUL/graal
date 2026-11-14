@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,112 +25,232 @@
 package com.oracle.svm.configure.config;
 
 import java.io.IOException;
-import java.io.Reader;
-import java.net.URI;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.LinkedHashSet;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
 
-import com.oracle.svm.core.configure.ConfigurationFiles;
-import com.oracle.svm.core.configure.ConfigurationParser;
-import com.oracle.svm.core.configure.ProxyConfigurationParser;
-import com.oracle.svm.core.configure.ReflectionConfigurationParser;
-import com.oracle.svm.core.configure.ResourceConfigurationParser;
-import com.oracle.svm.core.configure.SerializationConfigurationParser;
+import com.oracle.svm.configure.ConfigurationBase;
+import com.oracle.svm.configure.ConfigurationFile;
+import com.oracle.svm.configure.config.conditional.ConditionalConfigurationPredicate;
+
+import jdk.graal.compiler.util.json.JsonPrettyWriter;
+import jdk.graal.compiler.util.json.JsonPrintable;
+import jdk.graal.compiler.util.json.JsonWriter;
 
 public class ConfigurationSet {
-    public static final Function<IOException, Exception> FAIL_ON_EXCEPTION = e -> e;
-
-    private final Set<URI> jniConfigPaths = new LinkedHashSet<>();
-    private final Set<URI> reflectConfigPaths = new LinkedHashSet<>();
-    private final Set<URI> proxyConfigPaths = new LinkedHashSet<>();
-    private final Set<URI> resourceConfigPaths = new LinkedHashSet<>();
-    private final Set<URI> serializationConfigPaths = new LinkedHashSet<>();
-
-    public void addDirectory(Path path) {
-        jniConfigPaths.add(path.resolve(ConfigurationFiles.JNI_NAME).toUri());
-        reflectConfigPaths.add(path.resolve(ConfigurationFiles.REFLECTION_NAME).toUri());
-        proxyConfigPaths.add(path.resolve(ConfigurationFiles.DYNAMIC_PROXY_NAME).toUri());
-        resourceConfigPaths.add(path.resolve(ConfigurationFiles.RESOURCES_NAME).toUri());
-        serializationConfigPaths.add(path.resolve(ConfigurationFiles.SERIALIZATION_NAME).toUri());
+    @FunctionalInterface
+    private interface Mutator {
+        <T extends ConfigurationBase<T, ?>> T apply(T first, T other);
     }
 
-    public boolean isEmpty() {
-        return jniConfigPaths.isEmpty() && reflectConfigPaths.isEmpty() && proxyConfigPaths.isEmpty() && resourceConfigPaths.isEmpty() && serializationConfigPaths.isEmpty();
+    private final TypeConfiguration reflectionConfiguration;
+    private final ResourceConfiguration resourceConfiguration;
+    private final ProxyConfiguration proxyConfiguration;
+    private final SerializationConfiguration serializationConfiguration;
+    private final PredefinedClassesConfiguration predefinedClassesConfiguration;
+    private final ForeignConfiguration foreignConfiguration;
+
+    public ConfigurationSet(TypeConfiguration reflectionConfiguration, ResourceConfiguration resourceConfiguration, ProxyConfiguration proxyConfiguration,
+                    SerializationConfiguration serializationConfiguration, PredefinedClassesConfiguration predefinedClassesConfiguration, ForeignConfiguration foreignConfiguration) {
+        this.reflectionConfiguration = reflectionConfiguration;
+        this.resourceConfiguration = resourceConfiguration;
+        this.proxyConfiguration = proxyConfiguration;
+        this.serializationConfiguration = serializationConfiguration;
+        this.predefinedClassesConfiguration = predefinedClassesConfiguration;
+        this.foreignConfiguration = foreignConfiguration;
     }
 
-    public Set<URI> getJniConfigPaths() {
-        return jniConfigPaths;
+    public ConfigurationSet(ConfigurationSet other) {
+        this(other.reflectionConfiguration.copy(), other.resourceConfiguration.copy(), other.proxyConfiguration.copy(), other.serializationConfiguration.copy(),
+                        other.predefinedClassesConfiguration.copy(), other.foreignConfiguration.copy());
     }
 
-    public Set<URI> getReflectConfigPaths() {
-        return reflectConfigPaths;
+    @SuppressWarnings("unchecked")
+    public ConfigurationSet() {
+        this(new TypeConfiguration(), new ResourceConfiguration(), new ProxyConfiguration(), new SerializationConfiguration(),
+                        new PredefinedClassesConfiguration(Collections.emptyList(), _ -> false), new ForeignConfiguration());
     }
 
-    public Set<URI> getProxyConfigPaths() {
-        return proxyConfigPaths;
+    private ConfigurationSet mutate(ConfigurationSet other, Mutator mutator) {
+        TypeConfiguration reflectionConfig = mutator.apply(this.reflectionConfiguration, other.reflectionConfiguration);
+        ResourceConfiguration resourceConfig = mutator.apply(this.resourceConfiguration, other.resourceConfiguration);
+        ProxyConfiguration proxyConfig = mutator.apply(this.proxyConfiguration, other.proxyConfiguration);
+        SerializationConfiguration serializationConfig = mutator.apply(this.serializationConfiguration, other.serializationConfiguration);
+        PredefinedClassesConfiguration predefinedClassesConfig = mutator.apply(this.predefinedClassesConfiguration, other.predefinedClassesConfiguration);
+        ForeignConfiguration foreignConfig = mutator.apply(this.foreignConfiguration, other.foreignConfiguration);
+        return new ConfigurationSet(reflectionConfig, resourceConfig, proxyConfig, serializationConfig, predefinedClassesConfig, foreignConfig);
     }
 
-    public Set<URI> getResourceConfigPaths() {
-        return resourceConfigPaths;
+    public ConfigurationSet copyAndMerge(ConfigurationSet other) {
+        return mutate(other, ConfigurationBase::copyAndMerge);
     }
 
-    public Set<URI> getSerializationConfigPaths() {
-        return serializationConfigPaths;
+    public ConfigurationSet copyAndSubtract(ConfigurationSet other) {
+        return mutate(other, ConfigurationBase::copyAndSubtract);
     }
 
-    public TypeConfiguration loadJniConfig(Function<IOException, Exception> exceptionHandler) throws Exception {
-        return loadTypeConfig(jniConfigPaths, exceptionHandler);
+    public ConfigurationSet copyAndIntersectWith(ConfigurationSet other) {
+        return mutate(other, ConfigurationBase::copyAndIntersect);
     }
 
-    public TypeConfiguration loadReflectConfig(Function<IOException, Exception> exceptionHandler) throws Exception {
-        return loadTypeConfig(reflectConfigPaths, exceptionHandler);
+    public ConfigurationSet filter(ConditionalConfigurationPredicate filter) {
+        TypeConfiguration reflectionConfig = this.reflectionConfiguration.copyAndFilter(filter);
+        ResourceConfiguration resourceConfig = this.resourceConfiguration.copyAndFilter(filter);
+        ProxyConfiguration proxyConfig = this.proxyConfiguration.copyAndFilter(filter);
+        SerializationConfiguration serializationConfig = this.serializationConfiguration.copyAndFilter(filter);
+        PredefinedClassesConfiguration predefinedClassesConfig = this.predefinedClassesConfiguration.copyAndFilter(filter);
+        ForeignConfiguration foreignConfig = this.foreignConfiguration.copyAndFilter(filter);
+        return new ConfigurationSet(reflectionConfig, resourceConfig, proxyConfig, serializationConfig, predefinedClassesConfig, foreignConfig);
     }
 
-    public ProxyConfiguration loadProxyConfig(Function<IOException, Exception> exceptionHandler) throws Exception {
-        ProxyConfiguration proxyConfiguration = new ProxyConfiguration();
-        loadConfig(proxyConfigPaths, new ProxyConfigurationParser(types -> proxyConfiguration.add(Arrays.asList(types))), exceptionHandler);
-        return proxyConfiguration;
+    public TypeConfiguration getReflectionConfiguration() {
+        return reflectionConfiguration;
     }
 
-    public ResourceConfiguration loadResourceConfig(Function<IOException, Exception> exceptionHandler) throws Exception {
-        ResourceConfiguration resourceConfiguration = new ResourceConfiguration();
-        loadConfig(resourceConfigPaths, new ResourceConfigurationParser(new ResourceConfiguration.ParserAdapter(resourceConfiguration)), exceptionHandler);
+    public ResourceConfiguration getResourceConfiguration() {
         return resourceConfiguration;
     }
 
-    public SerializationConfiguration loadSerializationConfig(Function<IOException, Exception> exceptionHandler) throws Exception {
-        SerializationConfiguration serializationConfiguration = new SerializationConfiguration();
-        loadConfig(serializationConfigPaths, new SerializationConfigurationParser(
-                        (targetSerializationClass, customTargetConstructorClass) -> serializationConfiguration.add(targetSerializationClass, customTargetConstructorClass)),
-                        exceptionHandler);
+    public ProxyConfiguration getProxyConfiguration() {
+        return proxyConfiguration;
+    }
+
+    public SerializationConfiguration getSerializationConfiguration() {
         return serializationConfiguration;
     }
 
-    private static TypeConfiguration loadTypeConfig(Collection<URI> uris, Function<IOException, Exception> exceptionHandler) throws Exception {
-        TypeConfiguration configuration = new TypeConfiguration();
-        loadConfig(uris, new ReflectionConfigurationParser<>(new ParserConfigurationAdapter(configuration)), exceptionHandler);
-        return configuration;
+    public PredefinedClassesConfiguration getPredefinedClassesConfiguration() {
+        return predefinedClassesConfiguration;
     }
 
-    private static void loadConfig(Collection<URI> configPaths, ConfigurationParser configurationParser, Function<IOException, Exception> exceptionHandler) throws Exception {
-        for (URI path : configPaths) {
-            try (Reader reader = Files.newBufferedReader(Paths.get(path))) {
-                configurationParser.parseAndRegister(reader);
-            } catch (IOException ioe) {
-                Exception e = ioe;
-                if (exceptionHandler != null) {
-                    e = exceptionHandler.apply(ioe);
-                }
-                if (e != null) {
-                    throw e;
+    public ForeignConfiguration getForeignConfiguration() {
+        return foreignConfiguration;
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T extends ConfigurationBase<T, ?>> T getConfiguration(ConfigurationFile configurationFile) {
+        switch (configurationFile) {
+            case DYNAMIC_PROXY:
+                return (T) proxyConfiguration;
+            case RESOURCES:
+                return (T) resourceConfiguration;
+            case REFLECTION:
+            case JNI:
+                return (T) reflectionConfiguration;
+            case SERIALIZATION:
+                return (T) serializationConfiguration;
+            case PREDEFINED_CLASSES_NAME:
+                return (T) predefinedClassesConfiguration;
+            case FOREIGN:
+                return (T) foreignConfiguration;
+            default:
+                throw new IllegalArgumentException("Unsupported configuration in configuration container: " + configurationFile);
+        }
+    }
+
+    public static List<Path> writeConfiguration(Function<ConfigurationFile, Path> configFilePathResolver, Function<ConfigurationFile, JsonPrintable> configSupplier) throws IOException {
+        return writeConfigurationToAllPaths(cf -> Collections.singleton(configFilePathResolver.apply(cf)), configSupplier);
+    }
+
+    public static List<Path> writeConfigurationToAllPaths(Function<ConfigurationFile, Set<Path>> configFilePathResolver, Function<ConfigurationFile, JsonPrintable> configSupplier) throws IOException {
+        List<Path> writtenFiles = new ArrayList<>();
+        ConfigurationFile reachabilityMetadataFile = ConfigurationFile.REACHABILITY_METADATA;
+        for (Path path : resolveConfigurationPaths(configFilePathResolver, reachabilityMetadataFile)) {
+            writtenFiles.add(path);
+            JsonWriter writer = new JsonPrettyWriter(path);
+            boolean first = true;
+            for (ConfigurationFile configFile : ConfigurationFile.agentGeneratedFiles()) {
+                JsonPrintable configuration = configSupplier.apply(configFile);
+                if (configuration instanceof ConfigurationBase<?, ?> configurationBase && !configurationBase.supportsCombinedFile()) {
+                    if (!configurationBase.isEmpty()) {
+                        /* Fallback to legacy printing */
+                        for (Path specificPath : resolveConfigurationPaths(configFilePathResolver, configFile)) {
+                            writtenFiles.add(specificPath);
+                            JsonWriter specificWriter = new JsonWriter(specificPath);
+                            configurationBase.printLegacyJson(specificWriter);
+                            specificWriter.newline();
+                            specificWriter.close();
+                        }
+                    }
+                } else {
+                    if (configuration instanceof ConfigurationBase<?, ?> configurationBase && configurationBase.isEmpty()) {
+                        /* Do not add an empty field when there are no entries */
+                        continue;
+                    }
+                    if (first) {
+                        writer.appendObjectStart();
+                        first = false;
+                    } else {
+                        writer.appendSeparator();
+                    }
+                    printConfigurationToCombinedFile(configSupplier.apply(configFile), configFile, writer);
                 }
             }
+            if (first) {
+                writer.append("{}");
+            } else {
+                writer.appendObjectEnd();
+            }
+            writer.close();
         }
+        return writtenFiles;
+    }
+
+    private static Set<Path> resolveConfigurationPaths(Function<ConfigurationFile, Set<Path>> configFilePathResolver, ConfigurationFile configurationFile) throws IOException {
+        Set<Path> paths;
+        try {
+            paths = configFilePathResolver.apply(configurationFile);
+        } catch (RuntimeException e) {
+            throw new IOException("Could not resolve output path for " + describe(configurationFile) + ": " + e, e);
+        }
+        if (paths == null) {
+            throw new IOException("Path resolver returned null paths for " + describe(configurationFile));
+        }
+        for (Path path : paths) {
+            if (path == null) {
+                throw new IOException("Path resolver returned a null path for " + describe(configurationFile));
+            }
+        }
+        return paths;
+    }
+
+    private static String describe(ConfigurationFile configurationFile) {
+        if (configurationFile == null) {
+            return "<null configuration file>";
+        }
+        return configurationFile + " (name: " + getConfigurationName(configurationFile) + ", file: " + getConfigurationFileName(configurationFile) + ")";
+    }
+
+    private static String getConfigurationName(ConfigurationFile configurationFile) {
+        try {
+            return configurationFile.getName();
+        } catch (RuntimeException e) {
+            return "<error: " + e + ">";
+        }
+    }
+
+    private static String getConfigurationFileName(ConfigurationFile configurationFile) {
+        try {
+            return configurationFile.getFileName();
+        } catch (RuntimeException e) {
+            return "<error: " + e + ">";
+        }
+    }
+
+    public static void printConfigurationToCombinedFile(JsonPrintable config, ConfigurationFile configFile, JsonWriter writer) throws IOException {
+        writer.quote(configFile.getFieldName()).appendFieldSeparator();
+        config.printJson(writer);
+    }
+
+    public List<Path> writeConfiguration(Function<ConfigurationFile, Path> configFilePathResolver) throws IOException {
+        return writeConfiguration(configFilePathResolver, this::getConfiguration);
+    }
+
+    public boolean isEmpty() {
+        return reflectionConfiguration.isEmpty() && resourceConfiguration.isEmpty() && proxyConfiguration.isEmpty() && serializationConfiguration.isEmpty() &&
+                        predefinedClassesConfiguration.isEmpty() && foreignConfiguration.isEmpty();
     }
 }

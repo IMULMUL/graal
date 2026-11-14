@@ -24,61 +24,35 @@
  */
 package com.oracle.svm.hosted.substitute;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Field;
-
-import com.oracle.graal.pointsto.infrastructure.OriginalFieldProvider;
-import com.oracle.svm.core.meta.ReadableJavaField;
-import com.oracle.svm.hosted.c.GraalAccess;
+import com.oracle.svm.util.AnnotatedWrapper;
+import com.oracle.svm.util.OriginalFieldProvider;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
+import jdk.vm.ci.meta.annotation.Annotated;
 
-public class SubstitutionField implements ReadableJavaField, OriginalFieldProvider {
+public class SubstitutionField implements ResolvedJavaField, OriginalFieldProvider, AnnotatedWrapper {
 
     private final ResolvedJavaField original;
     private final ResolvedJavaField annotated;
 
     /**
      * This field is used in the {@link com.oracle.svm.hosted.SubstitutionReportFeature} class to
-     * determine {@link SubstitutionMethod} objects which correspond to annotated substitutions.
+     * determine {@link SubstitutionMethod} objects are user-defined substitutions (from the
+     * classpath).
      */
-    private final boolean isUserSubstitution;
+    private final boolean userSubstitution;
 
-    public SubstitutionField(ResolvedJavaField original, ResolvedJavaField annotated, boolean isUserSubstitution) {
+    public SubstitutionField(ResolvedJavaField original, ResolvedJavaField annotated, boolean userSubstitution) {
         this.original = original;
         this.annotated = annotated;
-        this.isUserSubstitution = isUserSubstitution;
-    }
-
-    @Override
-    public boolean allowConstantFolding() {
-        return true;
-    }
-
-    @Override
-    public boolean injectFinalForRuntimeCompilation() {
-        return false;
-    }
-
-    @Override
-    public JavaConstant readValue(JavaConstant receiver) {
-        /* First try reading the value using the original field. */
-        JavaConstant value = ReadableJavaField.readFieldValue(GraalAccess.getOriginalProviders().getConstantReflection(), original, receiver);
-        if (value == null) {
-            /*
-             * If the original field didn't yield a value, try reading using the annotated field.
-             * The value can be null only if the receiver doesn't contain the field.
-             */
-            value = ReadableJavaField.readFieldValue(GraalAccess.getOriginalProviders().getConstantReflection(), annotated, receiver);
-        }
-        return value;
+        this.userSubstitution = userSubstitution;
     }
 
     public boolean isUserSubstitution() {
-        return isUserSubstitution;
+        return userSubstitution;
     }
 
     public ResolvedJavaField getOriginal() {
@@ -125,22 +99,17 @@ public class SubstitutionField implements ReadableJavaField, OriginalFieldProvid
     }
 
     @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return annotated.getAnnotation(annotationClass);
+    public Annotated getWrappedAnnotated() {
+        return annotated;
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return annotated.getAnnotations();
+    public ResolvedJavaField unwrapTowardsOriginalField() {
+        return original;
     }
 
     @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return annotated.getDeclaredAnnotations();
-    }
-
-    @Override
-    public Field getJavaField() {
-        return OriginalFieldProvider.getJavaField(GraalAccess.getOriginalSnippetReflection(), original);
+    public JavaConstant getConstantValue() {
+        return original.getConstantValue();
     }
 }

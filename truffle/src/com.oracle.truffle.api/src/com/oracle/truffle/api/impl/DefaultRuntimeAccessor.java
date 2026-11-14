@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,15 +40,28 @@
  */
 package com.oracle.truffle.api.impl;
 
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionValues;
+import org.graalvm.polyglot.Engine;
+import org.graalvm.polyglot.SandboxPolicy;
 
+import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.TruffleLogger;
+import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameInstance;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.BlockNode;
 import com.oracle.truffle.api.nodes.BlockNode.ElementExecutor;
+import com.oracle.truffle.api.nodes.BytecodeOSRNode;
+import com.oracle.truffle.api.nodes.DirectCallNode;
+import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 
@@ -60,9 +73,9 @@ final class DefaultRuntimeAccessor extends Accessor {
     static final SourceSupport SOURCE = ACCESSOR.sourceSupport();
     static final InstrumentSupport INSTRUMENT = ACCESSOR.instrumentSupport();
     static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
-    static final JDKSupport JDK = ACCESSOR.jdkSupport();
     static final EngineSupport ENGINE = ACCESSOR.engineSupport();
     static final InteropSupport INTEROP = ACCESSOR.interopSupport();
+    static final FrameSupport FRAME = ACCESSOR.framesSupport();
 
     private DefaultRuntimeAccessor() {
     }
@@ -71,6 +84,52 @@ final class DefaultRuntimeAccessor extends Accessor {
 
         DefaultRuntimeSupport(Object permission) {
             super(permission);
+        }
+
+        @Override
+        public RuntimeCallTarget newCallTarget(CallTarget sourceCallTarget, RootNode rootNode) {
+            return new DefaultCallTarget(rootNode);
+        }
+
+        @Override
+        public long getCallTargetId(CallTarget target) {
+            if (target instanceof DefaultCallTarget) {
+                return ((DefaultCallTarget) target).id;
+            } else {
+                return 0;
+            }
+        }
+
+        @Override
+        public boolean isLegacyCompilerOption(String key) {
+            return false;
+        }
+
+        @Override
+        public boolean isLoaded(CallTarget callTarget) {
+            return ((DefaultCallTarget) callTarget).isLoaded();
+        }
+
+        @Override
+        public int getBytecodeIndex(FrameInstance frameInstance, Frame frame) {
+            return ((DefaultTruffleRuntime.DefaultFrameInstance) frameInstance).getBytecodeIndex(frame);
+        }
+
+        @Override
+        public DirectCallNode createDirectCallNode(CallTarget target) {
+            return new DefaultDirectCallNode(target);
+        }
+
+        @Override
+        public IndirectCallNode createIndirectCallNode() {
+            return new DefaultIndirectCallNode();
+        }
+
+        @Override
+        public void notifyOnLoad(CallTarget callTarget) {
+            DefaultCallTarget target = (DefaultCallTarget) callTarget;
+            DefaultRuntimeAccessor.INSTRUMENT.onLoad(target.getRootNode());
+            target.setLoaded();
         }
 
         @Override
@@ -84,14 +143,45 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public OptionDescriptors getEngineOptionDescriptors() {
+        public boolean pollBytecodeOSRBackEdge(BytecodeOSRNode osrNode) {
+            return false;
+        }
+
+        @Override
+        public boolean pollBytecodeOSRBackEdge(BytecodeOSRNode osrNode, int count) {
+            return false;
+        }
+
+        @Override
+        public Object tryBytecodeOSR(BytecodeOSRNode osrNode, long target, Object interpreterState, Runnable beforeTransfer, VirtualFrame parentFrame) {
+            return null;
+        }
+
+        @Override
+        public void onOSRNodeReplaced(BytecodeOSRNode osrNode, Node oldNode, Node newNode, CharSequence reason) {
+            // do nothing
+        }
+
+        @Override
+        public void transferOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target, long bytecodeTarget, Object targetMetadata) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void restoreOSRFrame(BytecodeOSRNode osrNode, Frame source, Frame target) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public OptionDescriptors getRuntimeOptionDescriptors() {
             return OptionDescriptors.EMPTY;
         }
 
         @Override
         public boolean isGuestCallStackFrame(StackTraceElement e) {
             String methodName = e.getMethodName();
-            return (methodName.equals(DefaultCallTarget.CALL_BOUNDARY_METHOD)) && e.getClassName().equals(DefaultCallTarget.class.getName());
+            String className = e.getClassName();
+            return className.equals(DefaultCallTarget.class.getName()) && methodName.equals(DefaultCallTarget.CALL_BOUNDARY_METHOD);
         }
 
         @Override
@@ -105,23 +195,23 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
+        public Assumption createAlwaysValidAssumption() {
+            return DefaultAssumption.createAlwaysValid();
+        }
+
+        @Override
         public void onEngineClosed(Object runtimeData) {
 
         }
 
         @Override
-        public String getSavedProperty(String key) {
-            return System.getProperty(key);
-        }
-
-        @Override
         public Object callInlined(Node callNode, CallTarget target, Object... arguments) {
-            return ((DefaultCallTarget) target).callDirectOrIndirect(callNode, arguments);
+            return ((DefaultCallTarget) target).call(callNode, arguments);
         }
 
         @Override
         public Object callProfiled(CallTarget target, Object... arguments) {
-            return ((DefaultCallTarget) target).call(arguments);
+            return ((DefaultCallTarget) target).call(null, arguments);
         }
 
         @Override
@@ -130,7 +220,7 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public void flushCompileQueue(Object runtimeData) {
+        public void shutdownCompilationForEngine(Object runtimeData) {
             // default runtime has no compile queue.
         }
 
@@ -141,16 +231,11 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public boolean inFirstTier() {
-            return false;
-        }
-
-        @Override
         public void reportPolymorphicSpecialize(Node source) {
         }
 
         @Override
-        public Object createRuntimeData(OptionValues options, Function<String, TruffleLogger> loggerFactory) {
+        public Object createRuntimeData(Object engine, OptionValues engineOptions, Function<String, TruffleLogger> loggerFactory, SandboxPolicy sandboxPolicy) {
             return null;
         }
 
@@ -170,13 +255,28 @@ final class DefaultRuntimeAccessor extends Accessor {
         }
 
         @Override
-        public void onEnginePatch(Object runtimeData, OptionValues options, Function<String, TruffleLogger> loggerFactory) {
+        public void onEnginePatch(Object runtimeData, OptionValues runtimeOptions, Function<String, TruffleLogger> loggerFactory, SandboxPolicy sandboxPolicy) {
+
+        }
+
+        @Override
+        public void onEnginePatchSuccess(Object runtimeData) {
 
         }
 
         @Override
         public boolean onEngineClosing(Object runtimeData) {
             return false;
+        }
+
+        @Override
+        public boolean onStoreCache(Object runtimeData, Path targetPath, long cancelledWord) {
+            throw new UnsupportedOperationException("Persisting an engine is not supported with the Truffle fallback runtime. It is only supported on native-image hosts.");
+        }
+
+        @Override
+        public ByteBuffer persistCache(Object runtimeData, Engine.CancellationCallback callback) {
+            throw new UnsupportedOperationException("Persisting an engine is not supported with the Truffle fallback runtime. It is only supported on native-image hosts.");
         }
 
         @Override
@@ -209,15 +309,35 @@ final class DefaultRuntimeAccessor extends Accessor {
 
         @SuppressWarnings("unused")
         @Override
-        public Object[] getNonPrimitiveResolvedFields(Class<?> type) {
+        public int[] getFieldOffsets(Class<?> type, boolean includePrimitive, boolean includeSuperclasses) {
             throw new UnsupportedOperationException();
         }
 
-        @SuppressWarnings("unused")
         @Override
-        public Object getFieldValue(Object resolvedJavaField, Object obj) {
+        public AbstractFastThreadLocal getContextThreadLocal() {
+            return DefaultContextThreadLocal.SINGLETON;
+        }
+
+        @Override
+        public <T> ThreadLocal<T> createTerminatingThreadLocal(Supplier<T> initialValue, Consumer<T> onThreadTermination) {
+            return DefaultTruffleRuntime.createTerminatingThreadLocal(initialValue, onThreadTermination);
+        }
+
+        @Override
+        public void initializeInterpreterCallStackHeadRoom(Object engineData, long interpreterCallStackHeadRoom) {
             throw new UnsupportedOperationException();
         }
+
+        @Override
+        public boolean supportsHeapMemoryLimits() {
+            return false;
+        }
+
+        @Override
+        public long getStackOverflowLimit() {
+            return DefaultTruffleRuntime.getStackOverflowLimit();
+        }
+
     }
 
 }

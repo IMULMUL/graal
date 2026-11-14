@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,75 +22,85 @@
  */
 package com.oracle.truffle.espresso.nodes;
 
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.Frame;
-import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.frame.MaterializedFrame;
+import com.oracle.truffle.api.instrumentation.ProbeNode;
 import com.oracle.truffle.api.instrumentation.StandardTags;
 import com.oracle.truffle.api.instrumentation.Tag;
+import com.oracle.truffle.api.interop.NodeLibrary;
+import com.oracle.truffle.api.library.ExportLibrary;
+import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
-import com.oracle.truffle.espresso.impl.Method;
-import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
 
 /**
  * Node that simulates espresso statements for debugging support.
  */
-public final class EspressoStatementNode extends EspressoInstrumentableNode {
+@ExportLibrary(NodeLibrary.class)
+public final class EspressoStatementNode extends EspressoInstrumentableNode implements BciProvider {
 
-    private final int startBci;
-    private final int lineNumber;
+    @Child private volatile ProbeNode eagerProbe;
+    private final SourceSection sourceSection;
 
-    EspressoStatementNode(int startBci, int lineNumber) {
-        this.lineNumber = lineNumber;
-        this.startBci = startBci;
-    }
-
-    @Override
-    public Object execute(VirtualFrame frame) {
-        return StaticObject.NULL;
+    EspressoStatementNode(SourceSection section) {
+        this.sourceSection = section;
     }
 
     @Override
     public SourceSection getSourceSection() {
-        Source s = getBytecodesNode().getSource();
-        if (s != null) {
-            return s.createSection(lineNumber);
-        } else {
-            // TODO should this really happen? If there is a line number table
-            // shouldn't there also be a source file?
-            return null;
-        }
+        return sourceSection;
     }
 
+    @Override
+    public int getBci(Frame frame) {
+        return EspressoFrame.getBCI(frame);
+    }
+
+    @Override
+    public ProbeNode findProbe() {
+        ProbeNode p = this.eagerProbe;
+        if (p == null) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            this.eagerProbe = p = insert(createProbe(getSourceSection()));
+        }
+        CompilerAsserts.partialEvaluationConstant(p);
+        return p;
+    }
+
+    @Override
     public boolean hasTag(Class<? extends Tag> tag) {
         return tag == StandardTags.StatementTag.class;
     }
 
-    public BytecodeNode getBytecodesNode() {
-        // parent is normally the BytecodeNode.InstrumentationSupport
-        // parents parent is normally the BytecodeNode
-        Node parent = getParent();
+    @Override
+    public WrapperNode createWrapper(ProbeNode probe) {
+        throw new UnsupportedOperationException();
+    }
 
-        while (parent instanceof WrapperNode || parent instanceof BytecodeNode.InstrumentationSupport) {
+    private BytecodeNode getBytecodeNode() {
+        Node parent = getParent();
+        while (!(parent instanceof BytecodeNode) && parent != null) {
             parent = parent.getParent();
         }
-        assert !(parent instanceof WrapperNode);
         return (BytecodeNode) parent;
     }
 
-    @Override
-    public int getCurrentBCI(@SuppressWarnings("unused") Frame frame) {
-        return startBci;
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public boolean hasScope(@SuppressWarnings("unused") Frame frame) {
+        return true;
     }
 
-    @Override
-    public Method getMethod() {
-        return getBytecodesNode().getMethod();
+    @ExportMessage
+    public Object getScope(Frame frame, boolean nodeEnter) {
+        return getScopeSlowPath(frame != null ? frame.materialize() : null, nodeEnter);
     }
 
-    @Override
-    public EspressoContext getContext() {
-        return getBytecodesNode().getContext();
+    @TruffleBoundary
+    private Object getScopeSlowPath(MaterializedFrame frame, boolean nodeEnter) {
+        return getBytecodeNode().getScope(frame, nodeEnter);
     }
 }

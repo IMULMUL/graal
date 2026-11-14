@@ -24,10 +24,11 @@
  */
 package com.oracle.svm.core.meta;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.Uninterruptible;
+import com.oracle.svm.shared.util.VMError;
 
+import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
@@ -37,13 +38,19 @@ public final class DirectSubstrateObjectConstant extends SubstrateObjectConstant
     /** The raw object wrapped by this constant. */
     private final Object object;
 
-    DirectSubstrateObjectConstant(Object object, boolean compressed) {
+    /**
+     * The identity hash code for this constant. It may or may not be the same as of the identity
+     * hashcode of the object. When the constant is used during image build the value is provided
+     * via {@link ConstantReflectionProvider}. When used for run time JIT compilation the initial
+     * value is 0, and it is computed lazily.
+     */
+    private int identityHashCode;
+
+    DirectSubstrateObjectConstant(Object object, boolean compressed, int identityHashCode) {
         super(compressed);
         this.object = object;
+        this.identityHashCode = identityHashCode;
         assert object != null;
-        if (SubstrateUtil.isInLibgraal()) {
-            throw new InternalError();
-        }
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -59,23 +66,27 @@ public final class DirectSubstrateObjectConstant extends SubstrateObjectConstant
     @Override
     public SubstrateObjectConstant compress() {
         assert !compressed;
-        return new DirectSubstrateObjectConstant(object, true);
+        return new DirectSubstrateObjectConstant(object, true, identityHashCode);
     }
 
     @Override
     public SubstrateObjectConstant uncompress() {
         assert compressed;
-        return new DirectSubstrateObjectConstant(object, false);
+        return new DirectSubstrateObjectConstant(object, false, identityHashCode);
     }
 
     @Override
     public int getIdentityHashCode() {
-        return computeIdentityHashCode(object);
+        if (identityHashCode == 0) {
+            VMError.guarantee(!SubstrateUtil.HOSTED);
+            identityHashCode = computeIdentityHashCode(object);
+        }
+        return identityHashCode;
     }
 
     @Override
     public String toValueString() {
-        Object obj = KnownIntrinsics.convertUnknownValue(object, Object.class);
+        Object obj = object;
         if (obj instanceof String) {
             return (String) obj;
         }

@@ -24,29 +24,32 @@
  */
 package com.oracle.svm.hosted.lambda;
 
-import org.graalvm.compiler.java.LambdaUtils;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+
+import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.graal.pointsto.meta.AnalysisType;
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.graal.GraalFeature;
+import com.oracle.graal.pointsto.meta.BaseLayerType;
+import com.oracle.svm.shared.util.SubstrateUtil;
+import com.oracle.svm.shared.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.hosted.FeatureImpl.AfterAnalysisAccessImpl;
 import com.oracle.svm.hosted.FeatureImpl.DuringSetupAccessImpl;
+
+import jdk.graal.compiler.java.LambdaUtils;
+import org.graalvm.collections.EconomicSet;
 
 /**
  * @see LambdaProxyRenamingSubstitutionProcessor
  */
-@AutomaticFeature
-final class StableLambdaProxyNameFeature implements GraalFeature {
-
+@AutomaticallyRegisteredFeature
+public final class StableLambdaProxyNameFeature implements InternalFeature {
     @Override
     public void duringSetup(DuringSetupAccess a) {
         DuringSetupAccessImpl access = (DuringSetupAccessImpl) a;
-        LambdaProxyRenamingSubstitutionProcessor lSubst = new LambdaProxyRenamingSubstitutionProcessor(access.getBigBang());
-        access.registerSubstitutionProcessor(lSubst);
+        LambdaProxyRenamingSubstitutionProcessor substitutionProcessor = new LambdaProxyRenamingSubstitutionProcessor();
+        ImageSingletons.add(LambdaProxyRenamingSubstitutionProcessor.class, substitutionProcessor);
+        access.registerSubstitutionProcessor(substitutionProcessor);
     }
 
     @Override
@@ -59,15 +62,15 @@ final class StableLambdaProxyNameFeature implements GraalFeature {
             throw new AssertionError("Expensive check: should only run with assertions enabled.");
         }
         /* There should be no random lambda names visible to the analysis. */
-        if (types.stream().anyMatch(LambdaUtils::isLambdaType)) {
+        if (types.stream().anyMatch(type -> LambdaUtils.isLambdaType(type) && type.getWrapped().getClass() != LambdaSubstitutionType.class && type.getWrapped().getClass() != BaseLayerType.class)) {
             throw new AssertionError("All lambda proxies should be substituted.");
         }
 
         /* Lambda names should be unique. */
-        Set<String> lambdaNames = new HashSet<>();
+        EconomicSet<String> lambdaNames = EconomicSet.create();
         types.stream()
                         .map(AnalysisType::getName)
-                        .filter(x -> x.contains("$$Lambda$"))
+                        .filter(LambdaUtils::isLambdaClassName)
                         .forEach(name -> {
                             if (lambdaNames.contains(name)) {
                                 throw new AssertionError("Duplicate lambda name: " + name);

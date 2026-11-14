@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,50 +24,45 @@
  */
 package com.oracle.svm.core.posix.darwin;
 
-import org.graalvm.nativeimage.ImageSingletons;
-import org.graalvm.nativeimage.PinnedObject;
-import org.graalvm.nativeimage.StackValue;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.impl.ProcessPropertiesSupport;
-import org.graalvm.word.WordFactory;
+import org.graalvm.word.impl.Word;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
+import com.oracle.svm.shared.singletons.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.guest.staging.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.handles.PrimitiveArrayView;
 import com.oracle.svm.core.posix.PosixProcessPropertiesSupport;
 import com.oracle.svm.core.posix.headers.darwin.DarwinDyld;
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.RuntimeAccessOnly;
+import com.oracle.svm.shared.singletons.traits.BuiltinTraits.SingleLayer;
+import com.oracle.svm.shared.singletons.traits.SingletonLayeredInstallationKind.InitialLayerOnly;
+import com.oracle.svm.shared.singletons.traits.SingletonTraits;
+import com.oracle.svm.shared.util.VMError;
 
+@AutomaticallyRegisteredImageSingleton(ProcessPropertiesSupport.class)
+@SingletonTraits(access = RuntimeAccessOnly.class, layeredCallbacks = SingleLayer.class, layeredInstallationKind = InitialLayerOnly.class)
 public class DarwinProcessPropertiesSupport extends PosixProcessPropertiesSupport {
 
     @Override
     public String getExecutableName() {
         /* Find out how long the executable path is. */
-        final CIntPointer sizePointer = StackValue.get(CIntPointer.class);
+        final CIntPointer sizePointer = UnsafeStackValue.get(CIntPointer.class);
         sizePointer.write(0);
-        if (DarwinDyld._NSGetExecutablePath(WordFactory.nullPointer(), sizePointer) != -1) {
+        if (DarwinDyld._NSGetExecutablePath(Word.nullPointer(), sizePointer) != -1) {
             VMError.shouldNotReachHere("DarwinProcessPropertiesSupport.getExecutableName: Executable path length is 0?");
         }
         /* Allocate a correctly-sized buffer and ask again. */
         final byte[] byteBuffer = new byte[sizePointer.read()];
-        try (PinnedObject pinnedBuffer = PinnedObject.create(byteBuffer)) {
-            final CCharPointer bufferPointer = pinnedBuffer.addressOfArrayElement(0);
+        try (PrimitiveArrayView refBuffer = PrimitiveArrayView.createForReadingAndWriting(byteBuffer)) {
+            final CCharPointer bufferPointer = refBuffer.addressOfArrayElement(0);
             if (DarwinDyld._NSGetExecutablePath(bufferPointer, sizePointer) == -1) {
                 /* Failure to find executable path. */
                 return null;
             }
             final String executableString = CTypeConversion.toJavaString(bufferPointer);
             return realpath(executableString);
-        }
-    }
-
-    @AutomaticFeature
-    public static class ImagePropertiesFeature implements Feature {
-
-        @Override
-        public void afterRegistration(AfterRegistrationAccess access) {
-            ImageSingletons.add(ProcessPropertiesSupport.class, new DarwinProcessPropertiesSupport());
         }
     }
 }
